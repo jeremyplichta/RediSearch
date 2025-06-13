@@ -1386,6 +1386,20 @@
                 ]
               },
               {
+                "name": "get_num_or",
+                "token": "get_num_or",
+                "type": "function",
+                "summary": "Gets the value of a number field if it exists, otherwise returns the default value",
+                "arguments": [
+                  {
+                    "token": "field"
+                  },
+                  {
+                    "token": "default"
+                  }
+                ]
+              }
+              {
                 "name": "log",
                 "token": "log",
                 "type": "function",

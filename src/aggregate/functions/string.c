@@ -276,6 +276,20 @@ int func_exists(ExprEval *ctx, RSValue *argv, size_t argc, RSValue *result) {
   return EXPR_EVAL_OK;
 }
 
+int func_get_num_or(ExprEval *ctx, RSValue *argv, size_t argc, RSValue *result) {
+  double numResult;
+  if (argv[0].t != RSValue_Null) {
+    RSValue_ToNumber(argv, &numResult);
+  } else {
+    RSValue_ToNumber(&argv[1], &numResult);
+    QueryError_ClearError(ctx->err);
+  }
+
+  result->t = RSValue_Number;
+  result->numval = numResult;
+  return EXPR_EVAL_OK;
+}
+
 static int stringfunc_startswith(ExprEval *ctx, RSValue *argv, size_t argc, RSValue *result) {
   VALIDATE_ARG_ISSTRING("startswith", argv, 0);
   VALIDATE_ARG_ISSTRING("startswith", argv, 1);
@@ -340,6 +354,7 @@ void RegisterStringFunctions() {
   RSFunctionRegistry_RegisterFunction("to_number", func_to_number, RSValue_Number, 1, 1);
   RSFunctionRegistry_RegisterFunction("to_str", func_to_str, RSValue_String, 1, 1);
   RSFunctionRegistry_RegisterFunction("exists", func_exists, RSValue_Number, 1, 1);
+  RSFunctionRegistry_RegisterFunction("get_num_or", func_get_num_or, RSValue_Number, 2, 2);
   RSFunctionRegistry_RegisterFunction("startswith", stringfunc_startswith, RSValue_Number, 2, 2);
   RSFunctionRegistry_RegisterFunction("contains", stringfunc_contains, RSValue_Number, 2, 2);
   RSFunctionRegistry_RegisterFunction("strlen", stringfunc_strlen, RSValue_Number, 1, 1);

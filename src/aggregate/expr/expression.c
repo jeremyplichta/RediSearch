@@ -20,6 +20,7 @@ static void setReferenceValue(RSValue *dst, RSValue *src) {
 }
 
 extern int func_exists(ExprEval *ctx, RSValue *argv, size_t argc, RSValue *result);
+extern int func_get_num_or(ExprEval *ctx, RSValue *argv, size_t argc, RSValue *result);
 
 static int evalFunc(ExprEval *eval, const RSFunctionExpr *f, RSValue *result) {
   int rc = EXPR_EVAL_ERR;
@@ -33,7 +34,7 @@ static int evalFunc(ExprEval *eval, const RSFunctionExpr *f, RSValue *result) {
     args[ii] = (RSValue)RSVALUE_STATIC;
     int internalRes = evalInternal(eval, f->args->args[ii], &args[ii]);
     if (internalRes == EXPR_EVAL_ERR ||
-        (internalRes == EXPR_EVAL_NULL && f->Call != func_exists)) {
+        (internalRes == EXPR_EVAL_NULL && f->Call != func_exists && f->Call != func_get_num_or)) {
       goto cleanup;
     }
     nusedargs++;
