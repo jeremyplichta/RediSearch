@@ -40,6 +40,8 @@ typedef struct {
 // Callback must not call back into key-index APIs (non-reentrant contract).
 typedef int (*KeyIndexIterCb)(const char *key, size_t keyLen, void *ctx);
 
+// Key index is a module-global singleton service because Redis module events,
+// timers, and scans are process-global and share one keyspace view.
 int KeyIndex_Init(void);
 void KeyIndex_Shutdown(void);
 void KeyIndex_SetEnabled(bool enabled);
@@ -54,6 +56,8 @@ void KeyIndex_QueueRename(RedisModuleString *from, RedisModuleString *to);
 int KeyIndex_IterPrefix(const char *prefix, size_t len, KeyIndexIterCb cb, void *ctx);
 void KeyIndex_RecordFallback(void);
 void KeyIndex_GetStats(KeyIndexStats *stats);
+// Debug-only fault injection hook. Production command paths reach this only via
+// the FT.DEBUG gate in debug_commands (debugCommandsEnabled()).
 void KeyIndex_DebugTriggerNextIterError(void);
 
 #ifdef __cplusplus

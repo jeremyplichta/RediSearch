@@ -242,7 +242,10 @@ static size_t KeyIndex_ClearQueueLocked(void) {
 }
 
 static size_t KeyIndex_ClearDeferredLocked(void) {
+  // Drain deferred list with acq_rel so nodes published by lock-free producers
+  // (release CAS) are fully visible before free/apply under the mutex.
   KeyIndexOp *op = atomic_exchange_explicit(&g_keyIndex.deferredHead, NULL, memory_order_acq_rel);
+  // Publish depth reset after head reset; readers use acquire loads.
   atomic_store_explicit(&g_keyIndex.deferredDepth, 0, memory_order_release);
   return KeyIndex_FreeOpList(op);
 }
@@ -334,8 +337,13 @@ static void KeyIndex_DrainQueueLocked(size_t maxOps) {
   uint64_t drainBudgetNs = g_keyIndex.state == KEY_INDEX_STATE_READY
                                ? KEY_INDEX_DRAIN_BUDGET_READY_NS
                                : KEY_INDEX_DRAIN_BUDGET_WARMING_NS;
-  KeyIndexOp *deferred = atomic_exchange_explicit(&g_keyIndex.deferredHead, NULL, memory_order_acq_rel);
-  size_t deferredDepth = atomic_exchange_explicit(&g_keyIndex.deferredDepth, 0, memory_order_acq_rel);
+  // Acquire deferred ops atomically and detach in one step; pairs with enqueue
+  // CAS release to observe fully initialized op nodes.
+  KeyIndexOp *deferred =
+      atomic_exchange_explicit(&g_keyIndex.deferredHead, NULL, memory_order_acq_rel);
+  // Keep depth and head in sync for lock-free producers/consumers.
+  size_t deferredDepth =
+      atomic_exchange_explicit(&g_keyIndex.deferredDepth, 0, memory_order_acq_rel);
   if (deferred) {
     KeyIndexOp *orderedHead = NULL;
     KeyIndexOp *orderedTail = NULL;
@@ -408,6 +416,8 @@ static void KeyIndex_DrainQueueLocked(size_t maxOps) {
   if (g_keyIndex.state == KEY_INDEX_STATE_WARMING &&
       g_keyIndex.scanCursor == NULL &&
       g_keyIndex.queueDepth == 0 &&
+      // Acquire ensures we observe producers that published deferred ops before
+      // transitioning to ready.
       atomic_load_explicit(&g_keyIndex.deferredDepth, memory_order_acquire) == 0) {
     g_keyIndex.state = KEY_INDEX_STATE_READY;
   }
@@ -445,17 +455,29 @@ static bool KeyIndex_DupRedisKey(RedisModuleString *key, char **dst, size_t *dst
   return true;
 }
 
+static void KeyIndex_RecordDroppedUpdateOnOom(void) {
+  if (!g_keyIndex.initialized) {
+    return;
+  }
+  pthread_mutex_lock(&g_keyIndex.lock);
+  g_keyIndex.stats.droppedUpdates++;
+  pthread_mutex_unlock(&g_keyIndex.lock);
+}
+
 static void KeyIndex_EnqueueOp(KeyIndexOp *op) {
   if (!op) {
     return;
   }
 
+  // Acquire pairs with disable's release store so we reject once shutdown or
+  // disable starts and avoid publishing into deferred/main queues.
   if (!atomic_load_explicit(&g_keyIndex.acceptsUpdates, memory_order_acquire)) {
     KeyIndex_FreeOp(op);
     return;
   }
 
   if (pthread_mutex_trylock(&g_keyIndex.lock) != 0) {
+    // Re-check after lock miss: disable may have raced after first load.
     if (!atomic_load_explicit(&g_keyIndex.acceptsUpdates, memory_order_acquire)) {
       KeyIndex_FreeOp(op);
       return;
@@ -465,7 +487,10 @@ static void KeyIndex_EnqueueOp(KeyIndexOp *op) {
     do {
       op->next = head;
     } while (!atomic_compare_exchange_weak_explicit(
+        // Release publishes op->next/key fields; acquire on failure refreshes
+        // head for the retry loop and preserves lock-free stack integrity.
         &g_keyIndex.deferredHead, &head, op, memory_order_acq_rel, memory_order_acquire));
+    // Depth is advisory; acq_rel keeps ordering with head publication/drain.
     atomic_fetch_add_explicit(&g_keyIndex.deferredDepth, 1, memory_order_acq_rel);
     return;
   }
@@ -528,6 +553,8 @@ static void KeyIndex_RunWarmupStep(RedisModuleCtx *ctx) {
     return;
   }
   if (g_keyIndex.queueDepth == 0 &&
+      // Acquire load observes lock-free deferred producers before raising scan
+      // throughput on the "idle" path.
       atomic_load_explicit(&g_keyIndex.deferredDepth, memory_order_acquire) == 0) {
     scanStepsPerTick = KEY_INDEX_SCAN_STEPS_IDLE_PER_TICK;
   }
@@ -553,6 +580,7 @@ static void KeyIndex_RunWarmupStep(RedisModuleCtx *ctx) {
       g_keyIndex.stats.bootstrapDurationMs = (nowNs - g_keyIndex.bootstrapStartNs) / 1000000ULL;
     }
     if (g_keyIndex.queueDepth == 0 &&
+        // Acquire prevents ready transition while deferred producers are pending.
         atomic_load_explicit(&g_keyIndex.deferredDepth, memory_order_acquire) == 0) {
       g_keyIndex.state = KEY_INDEX_STATE_READY;
     }
@@ -584,6 +612,7 @@ static void KeyIndex_TimerCallback(RedisModuleCtx *ctx, void *privdata) {
   pthread_mutex_lock(&g_keyIndex.lock);
   if (g_keyIndex.enabled &&
       (g_keyIndex.queueDepth > 0 ||
+       // Acquire sees concurrent deferred enqueues before deciding timer idleness.
        atomic_load_explicit(&g_keyIndex.deferredDepth, memory_order_acquire) > 0 ||
        g_keyIndex.state == KEY_INDEX_STATE_WARMING)) {
     KeyIndex_ScheduleTimerLocked();
@@ -596,6 +625,8 @@ static void KeyIndex_EnableLocked(void) {
     return;
   }
   g_keyIndex.enabled = true;
+  // Release publish: enqueue-side acquire load observes acceptance only after
+  // enabled/state transitions for this generation are visible.
   atomic_store_explicit(&g_keyIndex.acceptsUpdates, true, memory_order_release);
   KeyIndex_ClearQueueLocked();
   KeyIndex_ClearDeferredLocked();
@@ -606,6 +637,7 @@ static void KeyIndex_EnableLocked(void) {
 }
 
 static void KeyIndex_DisableLocked(void) {
+  // Release publish: enqueue-side acquire load rejects new ops after disable.
   atomic_store_explicit(&g_keyIndex.acceptsUpdates, false, memory_order_release);
   g_keyIndex.enabled = false;
   g_keyIndex.state = KEY_INDEX_STATE_OFF;
@@ -711,6 +743,7 @@ const char *KeyIndex_StateToString(KeyIndexState state) {
 void KeyIndex_QueueUpsert(RedisModuleString *key) {
   KeyIndexOp *op = rm_calloc(1, sizeof(*op));
   if (!op) {
+    KeyIndex_RecordDroppedUpdateOnOom();
     return;
   }
   if (!KeyIndex_DupRedisKey(key, &op->key, &op->keyLen)) {
@@ -724,6 +757,7 @@ void KeyIndex_QueueUpsert(RedisModuleString *key) {
 void KeyIndex_QueueRemove(RedisModuleString *key) {
   KeyIndexOp *op = rm_calloc(1, sizeof(*op));
   if (!op) {
+    KeyIndex_RecordDroppedUpdateOnOom();
     return;
   }
   if (!KeyIndex_DupRedisKey(key, &op->key, &op->keyLen)) {
@@ -740,6 +774,7 @@ void KeyIndex_QueueRename(RedisModuleString *from, RedisModuleString *to) {
   }
   KeyIndexOp *op = rm_calloc(1, sizeof(*op));
   if (!op) {
+    KeyIndex_RecordDroppedUpdateOnOom();
     return;
   }
   op->type = KEY_INDEX_OP_RENAME;
