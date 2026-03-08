@@ -139,7 +139,10 @@ def test_async_indexing_with_key_index_enabled(env):
     for i in range(total_docs):
         env.assertEqual(conn.execute_command('HSET', f'{key_prefix}:{i}', 'name', f'value{i}'), 1)
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    try:
+        env.assertEqual(env.cmd('CONFIG', 'SET', 'search-key-index', 'yes'), 'OK')
+    except redis_exceptions.ResponseError:
+        env.assertEqual(env.cmd('CONFIG', 'SET', 'search.search-key-index', 'yes'), 'OK')
     env.expect(
         'FT.CREATE', idx,
         'ON', 'HASH',

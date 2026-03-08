@@ -36,7 +36,10 @@ def oom_pseudo_enterprise_config(env):
 @skip(cluster=True, redis_less_than='7.9.227')
 def test_oom_flow_with_key_index_enabled(env):
   oom_test_config(env)
-  env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+  try:
+      env.assertEqual(env.cmd('CONFIG', 'SET', 'search-key-index', 'yes'), 'OK')
+  except redis_exceptions.ResponseError:
+      env.assertEqual(env.cmd('CONFIG', 'SET', 'search.search-key-index', 'yes'), 'OK')
 
   num_docs = 500
   for i in range(num_docs):
