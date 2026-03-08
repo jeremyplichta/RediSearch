@@ -68,6 +68,16 @@ def _wait_for_key_index_queue_drained(env, idx, timeout=45):
     wait_for_condition(_check, 'waiting for key index queue to drain', timeout=timeout)
 
 
+def _wait_for_key_index_off_and_queue_empty(env, idx, timeout=30):
+    def _check():
+        info = _key_index_info(env, idx)
+        queue_depth = int(info['key_index_update_queue_depth'])
+        state = info['key_index_state']
+        return state == 'off' and queue_depth == 0, {'state': state, 'queue_depth': queue_depth}
+
+    wait_for_condition(_check, 'waiting for key index to be off with an empty queue', timeout=timeout)
+
+
 def _wait_for_fallback_count_at_least(env, idx, expected_min, timeout=30):
     def _check():
         current = _key_index_fallback_count(env, idx)
@@ -251,3 +261,86 @@ def test_key_index_iter_error_fallback_increments_once(env):
 
     after = _key_index_fallback_count(env, 'idx_iter_err')
     env.assertEqual(after - before, 1)
+
+
+@skip(cluster=True, redis_less_than='7.9.227')
+def test_key_index_rapid_enable_disable_cycles_remain_consistent(env):
+    base_docs = 200
+    docs_per_cycle = 40
+    cycles = 4
+    prefix = 'ki:toggle:'
+
+    _seed_hash_docs(env, prefix, base_docs)
+    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'PREFIX', '1', prefix, 'SCHEMA', 'name', 'TEXT').ok()
+    waitForIndex(env, 'idx')
+    _wait_for_key_index_off_and_queue_empty(env, 'idx')
+
+    conn = getConnectionByEnv(env)
+    next_doc_id = base_docs
+    fallback_counter = _key_index_fallback_count(env, 'idx')
+
+    for _ in range(cycles):
+        env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+        _wait_for_key_index_state(env, 'idx', {'warming', 'ready'})
+        env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
+        _wait_for_key_index_queue_drained(env, 'idx')
+
+        current_fallback_counter = _key_index_fallback_count(env, 'idx')
+        env.assertGreaterEqual(current_fallback_counter, fallback_counter)
+        fallback_counter = current_fallback_counter
+
+        for _ in range(docs_per_cycle // 2):
+            env.assertEqual(conn.execute_command('HSET', f'{prefix}{next_doc_id}', 'name', f'name{next_doc_id}'), 1)
+            next_doc_id += 1
+
+        env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+        _wait_for_key_index_off_and_queue_empty(env, 'idx')
+
+        for _ in range(docs_per_cycle // 2):
+            env.assertEqual(conn.execute_command('HSET', f'{prefix}{next_doc_id}', 'name', f'name{next_doc_id}'), 1)
+            next_doc_id += 1
+
+    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
+    _wait_for_key_index_queue_drained(env, 'idx')
+
+    expected_total_docs = base_docs + docs_per_cycle * cycles
+    env.assertEqual(next_doc_id, expected_total_docs)
+    env.assertEqual(int(index_info(env, 'idx')['num_docs']), expected_total_docs)
+    env.assertEqual(env.cmd('FT.SEARCH', 'idx', '*', 'NOCONTENT', 'LIMIT', 0, 0)[0], expected_total_docs)
+
+
+@skip(cluster=True, redis_less_than='7.9.227')
+def test_key_index_queue_depth_stays_empty_while_disabled_and_recovers_after_reenable(env):
+    initial_docs = 160
+    docs_while_disabled = 120
+    prefix = 'ki:disabled:'
+
+    _seed_hash_docs(env, prefix, initial_docs)
+    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'PREFIX', '1', prefix, 'SCHEMA', 'name', 'TEXT').ok()
+    waitForIndex(env, 'idx')
+    env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
+    _wait_for_key_index_queue_drained(env, 'idx')
+    baseline_fallback_count = _key_index_fallback_count(env, 'idx')
+
+    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _wait_for_key_index_off_and_queue_empty(env, 'idx')
+
+    conn = getConnectionByEnv(env)
+    for i in range(initial_docs, initial_docs + docs_while_disabled):
+        env.assertEqual(conn.execute_command('HSET', f'{prefix}{i}', 'name', f'name{i}'), 1)
+
+    info_off = _key_index_info(env, 'idx')
+    env.assertEqual(info_off['key_index_state'], 'off')
+    env.assertEqual(int(info_off['key_index_update_queue_depth']), 0)
+
+    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
+    _wait_for_key_index_queue_drained(env, 'idx')
+
+    expected_total_docs = initial_docs + docs_while_disabled
+    env.assertEqual(int(index_info(env, 'idx')['num_docs']), expected_total_docs)
+    env.assertEqual(env.cmd('FT.SEARCH', 'idx', '*', 'NOCONTENT', 'LIMIT', 0, 0)[0], expected_total_docs)
+    env.assertGreaterEqual(_key_index_fallback_count(env, 'idx'), baseline_fallback_count)
