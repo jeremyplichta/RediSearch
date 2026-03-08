@@ -203,6 +203,8 @@ typedef struct {
   uint32_t trimmingStateCheckDelayMS;
   // Simulate working under Flex conditions. This is used for testing only.
   bool simulateInFlex;
+  // Enable optional module-owned key index for faster prefix scans.
+  bool keyIndexEnabled;
 } RSConfig;
 
 typedef enum {
@@ -333,6 +335,7 @@ char *getRedisConfigValue(RedisModuleCtx *ctx, const char* confName);
 #define DEFAULT_MIN_TRIM_DELAY 2000  // 2 seconds in milliseconds
 #define DEFAULT_MAX_TRIM_DELAY 5000  // 5 seconds in milliseconds
 #define DEFAULT_TRIMMING_STATE_CHECK_DELAY 100 // 0.1 seconds in milliseconds (We check the trimming state every 0.1 seconds, between MIN_TRIM_DELAY and MAX_TRIM_DELAY)
+#define DEFAULT_KEY_INDEX_ENABLED 0
 
 // default configuration
 #define RS_DEFAULT_CONFIG {                                                    \
@@ -387,11 +390,13 @@ char *getRedisConfigValue(RedisModuleCtx *ctx, const char* confName);
     .maxTrimDelayMS = DEFAULT_MAX_TRIM_DELAY,                                    \
     .trimmingStateCheckDelayMS = DEFAULT_TRIMMING_STATE_CHECK_DELAY,            \
     .simulateInFlex = false,           \
+    .keyIndexEnabled = DEFAULT_KEY_INDEX_ENABLED,                                \
   }
 
 #define REDIS_ARRAY_LIMIT 7
 #define NO_REPLY_DEPTH_LIMIT 0x00060020
 #define RM_SCAN_KEY_API_FIX 0x00060006
+#define RM_CONFIG_UNPREFIXED_API_FIX 0x00080000
 
 static inline int isFeatureSupported(int feature) {
   return feature <= RSGlobalConfig.serverVersion;

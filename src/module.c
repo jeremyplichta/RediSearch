@@ -79,6 +79,7 @@
 #include "asm_state_machine.h"
 #include "search_disk_utils.h"
 #include "config.h"
+#include "key_index.h"
 #ifdef ENABLE_ASSERT
 #include <unistd.h>  // for usleep in coordinator reduce pause
 #endif
@@ -1185,6 +1186,14 @@ int RegisterRestoreIfNxCommands(RedisModuleCtx *ctx, RedisModuleCommand *restore
 
   const char *schema_flags = IsEnterprise() ? "write "CMD_PROXY_FILTERED : "write "CMD_INTERNAL;
   rc = RedisModule_CreateSubcommand(restoreCmd, "SCHEMA", RestoreSchema, schema_flags, 0, 0, 0);
+  if (rc != REDISMODULE_OK && !IsEnterprise()) {
+    rc = RedisModule_CreateSubcommand(restoreCmd, "SCHEMA", RestoreSchema, "write", 0, 0, 0);
+    if (rc == REDISMODULE_OK) {
+      RedisModule_Log(ctx, "notice",
+                      "Registered internal subcommand %s|SCHEMA without `%s` flag for runtime compatibility",
+                      RS_RESTORE_IF_NX, CMD_INTERNAL);
+    }
+  }
   if (rc != REDISMODULE_OK) return rc;
 
   return REDISMODULE_OK;
@@ -1199,9 +1208,9 @@ int RegisterRestoreIfNxCommands(RedisModuleCtx *ctx, RedisModuleCommand *restore
   }
 
 Version supportedVersion = {
-    .majorVersion = 8,
-    .minorVersion = 3,
-    .patchVersion = 200,
+    .majorVersion = 7,
+    .minorVersion = 4,
+    .patchVersion = 0,
 };
 
 static void GetRedisVersion(RedisModuleCtx *ctx) {
@@ -1374,8 +1383,25 @@ static RedisModuleCommand *CreateCommandWithAcl(RedisModuleCtx *ctx, const char 
     rm_asprintf(&categories, strcmp(aclCategories, "") != 0 ? "%s %s" : "%.0s%s", aclCategories, SEARCH_ACL_CATEGORY);
   }
 
-  if (RedisModule_CreateCommand(ctx, name, handler, internalFlags, position.firstkey, position.lastkey, position.keystep) == REDISMODULE_ERR) {
-    RedisModule_Log(ctx, "warning", "Could not create command: %s", name);
+  int createCmdRc = RedisModule_CreateCommand(ctx, name, handler, internalFlags,
+                                              position.firstkey, position.lastkey,
+                                              position.keystep);
+  if (createCmdRc == REDISMODULE_ERR && internalCommand && !IsEnterprise()) {
+    // Redis OSS 7.4.x rejects the `internal` flag. Retry with base flags.
+    createCmdRc = RedisModule_CreateCommand(ctx, name, handler, flags,
+                                            position.firstkey, position.lastkey,
+                                            position.keystep);
+    if (createCmdRc == REDISMODULE_OK) {
+      RedisModule_Log(ctx, "notice",
+                      "Registered internal command %s without `%s` flag for runtime compatibility",
+                      name, CMD_INTERNAL);
+    }
+  }
+
+  if (createCmdRc == REDISMODULE_ERR) {
+    RedisModule_Log(ctx, "warning",
+                    "Could not create command: %s (flags: %s, internal: %d, errno: %d)",
+                    name, internalFlags, (int)internalCommand, errno);
     goto cleanup;
   }
 
@@ -1778,6 +1804,8 @@ void RediSearch_CleanupModule(void) {
     return;
   }
   invoked = 1;
+
+  KeyIndex_Shutdown();
 
   // First free all indexes
   Indexes_Free(specDict_g, false);
@@ -4477,18 +4505,38 @@ static bool checkClusterEnabled(RedisModuleCtx *ctx) {
 int ConfigCommand(RedisModuleCtx *ctx, RedisModuleString **argv, int argc);
 
 static int RediSearch_InitModuleConfig(RedisModuleCtx *ctx, RedisModuleString **argv, int argc, int isClusterEnabled) {
-  // register the module configuration with redis, use loaded values from command line as defaults
-  if (RegisterModuleConfig_Local(ctx) == REDISMODULE_ERR) {
-    RedisModule_Log(ctx, "warning", "Error registering module configuration");
-    return REDISMODULE_ERR;
-  }
-  if (isClusterEnabled || clusterConfig.type == ClusterType_RedisLabs) {
-    // Register module configuration parameters for cluster
-    RM_TRY_F(RegisterClusterModuleConfig, ctx);
-  }
+  const bool hasLoadConfigsApi = RedisModule_LoadConfigs != NULL;
+  const bool hasLoadDefaultConfigsApi = RedisModule_LoadDefaultConfigs != NULL;
+  bool loadConfigsAlreadyApplied = false;
 
-  // Load default values
-  RM_TRY_F(RedisModule_LoadDefaultConfigs, ctx);
+  if (hasLoadConfigsApi) {
+    // Register module configs when Redis exposes the full load API contract.
+    if (RegisterModuleConfig_Local(ctx) == REDISMODULE_ERR) {
+      RedisModule_Log(ctx, "warning", "Error registering module configuration");
+      return REDISMODULE_ERR;
+    }
+    if (isClusterEnabled || clusterConfig.type == ClusterType_RedisLabs) {
+      // Register module configuration parameters for cluster
+      RM_TRY_F(RegisterClusterModuleConfig, ctx);
+    }
+
+    if (hasLoadDefaultConfigsApi) {
+      // Newer Redis runtimes expose explicit default-load API.
+      RM_TRY_F(RedisModule_LoadDefaultConfigs, ctx);
+    } else {
+      RedisModule_Log(ctx, "notice",
+                      "Redis version does not expose RedisModule_LoadDefaultConfigs; "
+                      "continuing with RedisModule_LoadConfigs compatibility path");
+      // Old runtimes use LoadConfigs for both defaults and redis.conf/MODULE LOADEX CONFIG values.
+      // Apply it before module ARGS so module ARGS preserve historical behavior on these runtimes.
+      RM_TRY_F(RedisModule_LoadConfigs, ctx);
+      loadConfigsAlreadyApplied = true;
+    }
+  } else {
+    RedisModule_Log(ctx, "notice",
+                    "Redis version does not expose RedisModule_LoadConfigs; "
+                    "skipping module config API registration and using MODULE LOAD args + FT.CONFIG only");
+  }
 
   char *err = NULL;
   // Read module configuration from module ARGS
@@ -4497,8 +4545,16 @@ static int RediSearch_InitModuleConfig(RedisModuleCtx *ctx, RedisModuleString **
     rm_free(err);
     return REDISMODULE_ERR;
   }
-  // Apply configuration redis has loaded from the configuration file
-  RM_TRY_F(RedisModule_LoadConfigs, ctx);
+
+  if (hasLoadConfigsApi && !loadConfigsAlreadyApplied) {
+    // Apply configuration values Redis loaded from redis.conf / CONFIG SET.
+    RM_TRY_F(RedisModule_LoadConfigs, ctx);
+  }
+
+  if (!hasLoadDefaultConfigsApi && RSGlobalConfig.defaultScorer == NULL) {
+    // Keep a defensive default for older runtimes where default string setters may be skipped.
+    RSGlobalConfig.defaultScorer = rm_strdup(DEFAULT_SCORER_NAME);
+  }
   return REDISMODULE_OK;
 }
 
@@ -4629,6 +4685,8 @@ RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 }
 
 int RedisModule_OnUnload(RedisModuleCtx *ctx) {
+  KeyIndex_Shutdown();
+
   if (config_ext_load) {
     RedisModule_FreeString(ctx, config_ext_load);
     config_ext_load = NULL;

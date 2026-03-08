@@ -24,6 +24,8 @@ extern RedisModuleCtx *RSDummyContext;
 #define CEIL_DIV(a, b) ((a + b - 1) / b)
 #define MAX_SEARCH_IO_THREADS (1 << 8)
 #define CONFIG_FROM_RSCONFIG(c) ((SearchClusterConfig *)(c)->chainedConfig)
+#define RS_CONFIG_UNPREFIXED \
+  (isFeatureSupported(RM_CONFIG_UNPREFIXED_API_FIX) ? REDISMODULE_CONFIG_UNPREFIXED : 0)
 
 static SearchClusterConfig* getOrCreateRealConfig(RSConfig *config){
   if(!CONFIG_FROM_RSCONFIG(config)){
@@ -313,7 +315,7 @@ int RegisterClusterModuleConfig(RedisModuleCtx *ctx) {
   RM_TRY(
     RedisModule_RegisterNumericConfig(
       ctx, "search-threads", COORDINATOR_POOL_DEFAULT_SIZE,
-      REDISMODULE_CONFIG_IMMUTABLE | REDISMODULE_CONFIG_UNPREFIXED, 1,
+      REDISMODULE_CONFIG_IMMUTABLE | RS_CONFIG_UNPREFIXED, 1,
       LLONG_MAX, get_search_threads, set_search_threads, NULL,
       (void*)&RSGlobalConfig
     )
@@ -322,7 +324,7 @@ int RegisterClusterModuleConfig(RedisModuleCtx *ctx) {
   RM_TRY(
     RedisModule_RegisterNumericConfig(
       ctx, "search-io-threads", COORDINATOR_IO_THREADS_DEFAULT_SIZE,
-      REDISMODULE_CONFIG_IMMUTABLE | REDISMODULE_CONFIG_UNPREFIXED, 1,
+      REDISMODULE_CONFIG_IMMUTABLE | RS_CONFIG_UNPREFIXED, 1,
       MAX_SEARCH_IO_THREADS, get_search_io_threads, set_search_io_threads, NULL,
       (void*)&RSGlobalConfig
     )
@@ -331,7 +333,7 @@ int RegisterClusterModuleConfig(RedisModuleCtx *ctx) {
   RM_TRY(
     RedisModule_RegisterNumericConfig (
       ctx, "search-topology-validation-timeout", DEFAULT_TOPOLOGY_VALIDATION_TIMEOUT,
-      REDISMODULE_CONFIG_UNPREFIXED, 0, LLONG_MAX,
+      RS_CONFIG_UNPREFIXED, 0, LLONG_MAX,
       get_topology_validation_timeout, set_topology_validation_timeout, NULL,
       (void*)&RSGlobalConfig
     )
@@ -340,7 +342,7 @@ int RegisterClusterModuleConfig(RedisModuleCtx *ctx) {
   RM_TRY(
     RedisModule_RegisterNumericConfig (
       ctx, "search-cursor-reply-threshold", DEFAULT_CURSOR_REPLY_THRESHOLD,
-      REDISMODULE_CONFIG_UNPREFIXED, 1, LLONG_MAX,
+      RS_CONFIG_UNPREFIXED, 1, LLONG_MAX,
       get_cursor_reply_threshold, set_cursor_reply_threshold, NULL,
       (void*)&RSGlobalConfig
     )
@@ -349,7 +351,7 @@ int RegisterClusterModuleConfig(RedisModuleCtx *ctx) {
   RM_TRY(
     RedisModule_RegisterNumericConfig (
       ctx, "search-conn-per-shard", DEFAULT_CONN_PER_SHARD,
-      REDISMODULE_CONFIG_UNPREFIXED, 0, UINT32_MAX,
+      RS_CONFIG_UNPREFIXED, 0, UINT32_MAX,
       get_conn_per_shard, set_conn_per_shard, NULL,
       (void*)&RSGlobalConfig
     )

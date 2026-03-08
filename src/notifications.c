@@ -14,6 +14,7 @@
 #include "rdb.h"
 #include "module.h"
 #include "util/workers.h"
+#include "key_index.h"
 #include "dictionary.h"
 #include "slot_ranges.h"
 #include "asm_state_machine.h"
@@ -21,6 +22,10 @@
 #include "cursor.h"
 
 #define JSON_LEN 5 // length of string "json."
+#define CONFIG_ALIAS_PREFIX "search-"
+#define CONFIG_ALIAS_PREFIX_LEN (sizeof(CONFIG_ALIAS_PREFIX) - 1)
+#define CONFIG_RUNTIME_PREFIX "search."
+#define CONFIG_RUNTIME_PREFIX_LEN (sizeof(CONFIG_RUNTIME_PREFIX) - 1)
 RedisModuleString *global_RenameFromKey = NULL;
 extern RedisModuleCtx *RSDummyContext;
 RedisModuleString **hashFields = NULL;
@@ -59,6 +64,20 @@ static void freeHashFields() {
     }
     rm_free(hashFields);
     hashFields = NULL;
+  }
+}
+
+static void clearPendingRenameFromKey(void) {
+  if (global_RenameFromKey) {
+    RedisModule_FreeString(RSDummyContext, global_RenameFromKey);
+    global_RenameFromKey = NULL;
+  }
+}
+
+static void setPendingRenameFromKey(RedisModuleString *key) {
+  clearPendingRenameFromKey();
+  if (key) {
+    global_RenameFromKey = RedisModule_HoldString(RSDummyContext, key);
   }
 }
 
@@ -145,11 +164,16 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
     else redisCommand = _null_cmd;
   }
 
+  if (redisCommand != rename_from_cmd && redisCommand != rename_to_cmd) {
+    clearPendingRenameFromKey();
+  }
+
   switch (redisCommand) {
     case loaded_cmd:
       // on loaded event the key is stack allocated so to use it to load the
       // document we must copy it
       if (!IS_SST_RDB_IN_PROCESS(ctx)) {
+        KeyIndex_QueueUpsert(key);
         key = RedisModule_CreateStringFromString(ctx, key);
         Indexes_UpdateMatchingWithSchemaRules(ctx, key, getDocTypeFromString(key), hashFields); //TODO: avoid getDocTypeFromString ?
         RedisModule_FreeString(ctx, key);
@@ -164,6 +188,7 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
     case hdel_cmd:
     case hexpired_cmd:
       if (!IS_SST_RDB_IN_PROCESS(ctx)) {
+        KeyIndex_QueueUpsert(key);
         Indexes_UpdateMatchingWithSchemaRules(ctx, key, DocumentType_Hash, hashFields);
       }
 
@@ -178,6 +203,7 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
     case hpersist_cmd:
     case restore_cmd:
     case copy_to_cmd:
+      KeyIndex_QueueUpsert(key);
       Indexes_UpdateMatchingWithSchemaRules(ctx, key, getDocTypeFromString(key), hashFields);
       break;
 
@@ -187,6 +213,7 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
     case key_trimmed_cmd:
     case expired_cmd:
     case evicted_cmd:
+      KeyIndex_QueueRemove(key);
       Indexes_DeleteMatchingWithSchemaRules(ctx, key, hashFields);
       break;
 
@@ -201,21 +228,32 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
       if (kType == DocumentType_Unsupported) {
         // in crdt empty key means that key was deleted
         // TODO:FIX
+        KeyIndex_QueueRemove(key);
         Indexes_DeleteMatchingWithSchemaRules(ctx, key, hashFields);
       } else {
         // todo: here we will open the key again, we can optimize it by
         //       somehow passing the key pointer
+        KeyIndex_QueueUpsert(key);
         Indexes_UpdateMatchingWithSchemaRules(ctx, key, kType, hashFields);
       }
       break;
 
     case rename_from_cmd:
-      // Notification rename_to is called right after rename_from so this is safe.
-      global_RenameFromKey = key;
+      // Track the source key for the paired rename_to event.
+      setPendingRenameFromKey(key);
       break;
 
     case rename_to_cmd:
-      Indexes_ReplaceMatchingWithSchemaRules(ctx, global_RenameFromKey, key);
+      if (global_RenameFromKey) {
+        KeyIndex_QueueRename(global_RenameFromKey, key);
+        Indexes_ReplaceMatchingWithSchemaRules(ctx, global_RenameFromKey, key);
+        clearPendingRenameFromKey();
+      } else {
+        // Unsupported/out-of-order stream: rename_to arrived without rename_from.
+        // Fall back to update semantics to preserve correctness.
+        KeyIndex_QueueUpsert(key);
+        Indexes_UpdateMatchingWithSchemaRules(ctx, key, getDocTypeFromString(key), hashFields);
+      }
       break;
   }
 
@@ -236,6 +274,7 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
         !strcmp(event + JSON_LEN, "arrpop") ||
         !strcmp(event + JSON_LEN, "arrtrim") ||
         !strcmp(event + JSON_LEN, "toggle")) {
+      KeyIndex_QueueUpsert(key);
       // update index
       Indexes_UpdateMatchingWithSchemaRules(ctx, key, DocumentType_Json, hashFields);
     }
@@ -248,7 +287,56 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
 
 /*****************************************************************************/
 
+static void RewriteLegacyConfigAliases(RedisModuleCommandFilterCtx *filter) {
+  if (isFeatureSupported(RM_CONFIG_UNPREFIXED_API_FIX)) {
+    return;
+  }
+
+  int numArgs = RedisModule_CommandFilterArgsCount(filter);
+  if (numArgs < 3) {
+    return;
+  }
+
+  size_t len = 0;
+  const RedisModuleString *cmd = RedisModule_CommandFilterArgGet(filter, 0);
+  const char *cmdStr = RedisModule_StringPtrLen(cmd, &len);
+  if (!cmdStr || strcasecmp(cmdStr, "CONFIG")) {
+    return;
+  }
+
+  const RedisModuleString *subCmd = RedisModule_CommandFilterArgGet(filter, 1);
+  const char *subCmdStr = RedisModule_StringPtrLen(subCmd, &len);
+  if (!subCmdStr || (strcasecmp(subCmdStr, "GET") && strcasecmp(subCmdStr, "SET"))) {
+    return;
+  }
+
+  const RedisModuleString *configName = RedisModule_CommandFilterArgGet(filter, 2);
+  const char *configNameStr = RedisModule_StringPtrLen(configName, &len);
+  if (!configNameStr) {
+    return;
+  }
+
+  // Old Redis runtimes require module-prefixed config keys (search.<name>).
+  // Accept legacy unprefixed aliases (search-*) and rewrite them at command-filter time.
+  if (len < CONFIG_ALIAS_PREFIX_LEN ||
+      strncasecmp(configNameStr, CONFIG_ALIAS_PREFIX, CONFIG_ALIAS_PREFIX_LEN) != 0 ||
+      (len > CONFIG_RUNTIME_PREFIX_LEN &&
+       strncasecmp(configNameStr, CONFIG_RUNTIME_PREFIX, CONFIG_RUNTIME_PREFIX_LEN) == 0)) {
+    return;
+  }
+
+  RedisModuleString *runtimeConfigName = RedisModule_CreateStringPrintf(
+      RSDummyContext, "%s%.*s", CONFIG_RUNTIME_PREFIX, (int)len, configNameStr);
+  if (!runtimeConfigName) {
+    return;
+  }
+
+  RedisModule_CommandFilterArgReplace(filter, 2, runtimeConfigName);
+}
+
 void CommandFilterCallback(RedisModuleCommandFilterCtx *filter) {
+  RewriteLegacyConfigAliases(filter);
+
   size_t len;
   const RedisModuleString *cmd = RedisModule_CommandFilterArgGet(filter, 0);
   const char *cmdStr = RedisModule_StringPtrLen(cmd, &len);
@@ -586,7 +674,7 @@ void Initialize_ServerEventNotifications(RedisModuleCtx *ctx) {
 }
 
 void Initialize_CommandFilter(RedisModuleCtx *ctx) {
-  if (RSGlobalConfig.filterCommands) {
+  if (RSGlobalConfig.filterCommands || !isFeatureSupported(RM_CONFIG_UNPREFIXED_API_FIX)) {
     RedisModule_RegisterCommandFilter(ctx, CommandFilterCallback, 0);
   }
 }

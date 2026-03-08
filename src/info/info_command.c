@@ -21,6 +21,7 @@
 #include "field_spec_info.h"
 #include "info/info_redis/threads/current_thread.h"
 #include "obfuscation/obfuscation_api.h"
+#include "key_index.h"
 
 static void renderIndexOptions(RedisModule_Reply *reply, const IndexSpec *sp) {
 
@@ -289,6 +290,15 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
   IndexesScanner *scanner = global_spec_scanner ? global_spec_scanner : sp->scanner;
   double percent_indexed = IndexesScanner_IndexedPercent(sctx->redisCtx, scanner, sp);
   REPLY_KVNUM("percent_indexed", percent_indexed);
+
+  KeyIndexStats keyIndexStats = {0};
+  KeyIndex_GetStats(&keyIndexStats);
+  REPLY_KVSTR("key_index_state", KeyIndex_StateToString(keyIndexStats.state));
+  REPLY_KVINT("key_index_num_entries", (long long)keyIndexStats.numEntries);
+  REPLY_KVINT("key_index_update_queue_depth", (long long)keyIndexStats.queueDepth);
+  REPLY_KVINT("key_index_fallback_count", (long long)keyIndexStats.fallbackCount);
+  REPLY_KVINT("key_index_bootstrap_duration_ms", (long long)keyIndexStats.bootstrapDurationMs);
+  REPLY_KVINT("key_index_snapshot_peak_bytes", (long long)keyIndexStats.snapshotPeakBytes);
 
   REPLY_KVINT("number_of_uses", sp->counter);
 

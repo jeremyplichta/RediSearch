@@ -33,6 +33,34 @@ def oom_pseudo_enterprise_config(env):
   # Set the pause time to 1 second so we can test the retry
   env.expect('FT.CONFIG', 'SET', '_BG_INDEX_OOM_PAUSE_TIME', '1').ok()
 
+@skip(cluster=True, redis_less_than='7.9.227')
+def test_oom_flow_with_key_index_enabled(env):
+  oom_test_config(env)
+  env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+
+  num_docs = 500
+  for i in range(num_docs):
+      env.expect('HSET', f'ki:oom:{i}', 'name', f'name{i}').equal(1)
+
+  env.expect(bgScanCommand(), 'SET_PAUSE_ON_OOM', 'true').ok()
+  env.expect(bgScanCommand(), 'SET_PAUSE_ON_SCANNED_DOCS', num_docs//5).ok()
+
+  env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'PREFIX', '1', 'ki:oom:', 'SCHEMA', 'name', 'TEXT').ok()
+  waitForIndexPauseScan(env, 'idx')
+
+  set_tight_maxmemory_for_oom(env, 0.85)
+  env.expect(bgScanCommand(), 'SET_BG_INDEX_RESUME').ok()
+  waitForIndexStatus(env, 'PAUSED_ON_OOM', 'idx')
+  env.expect(bgScanCommand(), 'SET_BG_INDEX_RESUME').ok()
+  waitForIndexFinishScan(env, 'idx')
+
+  error_dict = get_index_errors_dict(env, idx='idx')
+  env.assertEqual(error_dict[bgIndexingStatusStr], OOMfailureStr)
+
+  info = index_info(env, 'idx')
+  env.assertContains('key_index_state', info)
+  env.assertContains(info['key_index_state'], ['warming', 'ready', 'error', 'off'])
+
 @skip(cluster=True)
 def test_stop_background_indexing_on_low_mem(env):
   oom_test_config(env)

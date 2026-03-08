@@ -34,6 +34,7 @@
 #include "iterators/inverted_index_iterator.h"
 #include "search_disk.h"
 #include "ext/debug_scorers.h"
+#include "key_index.h"
 
 DebugCTX globalDebugCtx = {0};
 
@@ -2410,6 +2411,22 @@ DEBUG_COMMAND(RegisterTestScorers) {
   }
 }
 
+/**
+ * FT.DEBUG KEY_INDEX_TRIGGER_ITER_ERR
+ * Force the next key-index prefix iteration to return REDISMODULE_ERR.
+ * Used to deterministically validate fallback accounting.
+ */
+DEBUG_COMMAND(KeyIndexTriggerIterErr) {
+  if (!debugCommandsEnabled(ctx)) {
+    return RedisModule_ReplyWithError(ctx, NODEBUG_ERR);
+  }
+  if (argc != 2) {
+    return RedisModule_WrongArity(ctx);
+  }
+  KeyIndex_DebugTriggerNextIterError();
+  return RedisModule_ReplyWithSimpleString(ctx, "OK");
+}
+
 DebugCommandType commands[] = {{"DUMP_INVIDX", DumpInvertedIndex}, // Print all the inverted index entries.
                                {"DUMP_NUMIDX", DumpNumericIndex}, // Print all the headers (optional) + entries of the numeric tree.
                                {"DUMP_NUMIDXTREE", DumpNumericIndexTree}, // Print tree general info, all leaves + nodes + stats
@@ -2455,6 +2472,7 @@ DebugCommandType commands[] = {{"DUMP_INVIDX", DumpInvertedIndex}, // Print all 
                                {"DUMP_DELETED_IDS", DumpDeletedIds},
                                {"DISK_IO_CONTROL", DiskIOControl},
                                {"REGISTER_TEST_SCORERS", RegisterTestScorers}, // Register test scorers
+                               {"KEY_INDEX_TRIGGER_ITER_ERR", KeyIndexTriggerIterErr},
                                /**
                                 * The following commands are for debugging distributed search/aggregation.
                                 */

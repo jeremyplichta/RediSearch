@@ -10,6 +10,7 @@
 
 #include <math.h>
 #include <ctype.h>
+#include <limits.h>
 
 #include "triemap.h"
 #include "util/logging.h"
@@ -47,6 +48,7 @@
 #include "util/redis_mem_info.h"
 #include "search_disk.h"
 #include "search_disk_utils.h"
+#include "key_index.h"
 
 #define INITIAL_DOC_TABLE_SIZE 1000
 
@@ -2779,6 +2781,212 @@ static void Indexes_ScanProc(RedisModuleCtx *ctx, RedisModuleString *keyname, Re
   ++scanner->scannedKeys;
 }
 
+typedef enum {
+  KEY_INDEX_SCAN_RESULT_DONE = 0,
+  KEY_INDEX_SCAN_RESULT_FALLBACK = 1,
+  KEY_INDEX_SCAN_RESULT_CANCELLED = 2,
+} KeyIndexScanResult;
+
+typedef struct {
+  RedisModuleCtx *ctx;
+  IndexesScanner *scanner;
+  TrieMap *dedupe;
+  bool iteratorAborted;
+  size_t keysSinceYield;
+} KeyIndexIterCtx;
+
+#define KEY_INDEX_ITER_YIELD_INTERVAL 64
+
+static int Indexes_KeyIndexMaybeYield(KeyIndexIterCtx *iterCtx) {
+  iterCtx->keysSinceYield++;
+  if (iterCtx->keysSinceYield < KEY_INDEX_ITER_YIELD_INTERVAL) {
+    return REDISMODULE_OK;
+  }
+
+  iterCtx->keysSinceYield = 0;
+  RedisModule_ThreadSafeContextUnlock(iterCtx->ctx);
+  sched_yield();
+  RedisModule_ThreadSafeContextLock(iterCtx->ctx);
+
+  if (iterCtx->scanner->cancelled || iterCtx->scanner->scanFailedOnOOM) {
+    iterCtx->iteratorAborted = true;
+    return REDISMODULE_ERR;
+  }
+  return REDISMODULE_OK;
+}
+
+static int Indexes_KeyIndexIterCb(const char *key, size_t keyLen, void *ctx) {
+  KeyIndexIterCtx *iterCtx = ctx;
+  if (!iterCtx || !iterCtx->ctx || !iterCtx->scanner) {
+    return REDISMODULE_ERR;
+  }
+
+  if (iterCtx->scanner->cancelled || iterCtx->iteratorAborted) {
+    return REDISMODULE_ERR;
+  }
+
+  if (keyLen > UINT16_MAX) {
+    iterCtx->iteratorAborted = true;
+    return REDISMODULE_ERR;
+  }
+
+  if (Indexes_KeyIndexMaybeYield(iterCtx) != REDISMODULE_OK) {
+    return REDISMODULE_ERR;
+  }
+
+  if (iterCtx->dedupe &&
+      TrieMap_Add(iterCtx->dedupe, key, (tm_len_t)keyLen, NULL, NULL) == 0) {
+    return REDISMODULE_OK;
+  }
+
+  RedisModuleString *keyname = RedisModule_CreateString(iterCtx->ctx, key, keyLen);
+  if (!keyname) {
+    iterCtx->iteratorAborted = true;
+    return REDISMODULE_ERR;
+  }
+
+  if (iterCtx->scanner->isDebug) {
+    DebugIndexes_ScanProc(iterCtx->ctx, keyname, NULL, (DebugIndexesScanner *)iterCtx->scanner);
+  } else {
+    Indexes_ScanProc(iterCtx->ctx, keyname, NULL, iterCtx->scanner);
+  }
+  RedisModule_FreeString(iterCtx->ctx, keyname);
+
+  if (iterCtx->scanner->scanFailedOnOOM || iterCtx->scanner->cancelled) {
+    iterCtx->iteratorAborted = true;
+    return REDISMODULE_ERR;
+  }
+
+  return REDISMODULE_OK;
+}
+
+static KeyIndexScanResult Indexes_TryScanWithKeyIndex(RedisModuleCtx *ctx, IndexesScanner *scanner,
+                                                      const char **fallbackReason,
+                                                      bool *fallbackAlreadyRecorded) {
+  RS_LOG_ASSERT(fallbackReason, "fallback reason out param must not be null");
+  RS_LOG_ASSERT(fallbackAlreadyRecorded, "fallback accounting out param must not be null");
+
+  *fallbackReason = NULL;
+  *fallbackAlreadyRecorded = false;
+
+  if (scanner->global) {
+    *fallbackReason = "global scan path";
+    return KEY_INDEX_SCAN_RESULT_FALLBACK;
+  }
+
+  if (globalDebugCtx.debugMode || scanner->isDebug) {
+    *fallbackReason = "debug scanner mode";
+    return KEY_INDEX_SCAN_RESULT_FALLBACK;
+  }
+
+  if (!KeyIndex_IsEnabled()) {
+    *fallbackReason = "key index disabled";
+    return KEY_INDEX_SCAN_RESULT_FALLBACK;
+  }
+
+  KeyIndexState state = KeyIndex_GetState();
+  switch (state) {
+    case KEY_INDEX_STATE_READY:
+      break;
+    case KEY_INDEX_STATE_OFF:
+      *fallbackReason = "key index state off";
+      return KEY_INDEX_SCAN_RESULT_FALLBACK;
+    case KEY_INDEX_STATE_WARMING:
+      *fallbackReason = "key index state warming/stale";
+      return KEY_INDEX_SCAN_RESULT_FALLBACK;
+    case KEY_INDEX_STATE_ERROR:
+      *fallbackReason = "key index state error";
+      return KEY_INDEX_SCAN_RESULT_FALLBACK;
+    default:
+      *fallbackReason = "key index unavailable";
+      return KEY_INDEX_SCAN_RESULT_FALLBACK;
+  }
+
+  StrongRef runRef = IndexSpecRef_Promote(scanner->spec_ref);
+  IndexSpec *sp = StrongRef_Get(runRef);
+  if (!sp) {
+    scanner->cancelled = true;
+    return KEY_INDEX_SCAN_RESULT_CANCELLED;
+  }
+
+  if (!sp->rule || !sp->rule->prefixes || array_len(sp->rule->prefixes) == 0) {
+    *fallbackReason = "unsupported prefix patterns";
+    IndexSpecRef_Release(runRef);
+    return KEY_INDEX_SCAN_RESULT_FALLBACK;
+  }
+
+  const int numPrefixes = array_len(sp->rule->prefixes);
+  TrieMap *dedupe = NULL;
+  if (numPrefixes > 1) {
+    dedupe = NewTrieMap();
+    if (!dedupe) {
+      *fallbackReason = "dedupe allocation failure";
+      IndexSpecRef_Release(runRef);
+      return KEY_INDEX_SCAN_RESULT_FALLBACK;
+    }
+  }
+
+  KeyIndexIterCtx iterCtx = {
+    .ctx = ctx,
+    .scanner = scanner,
+    .dedupe = dedupe,
+    .iteratorAborted = false,
+  };
+
+  for (int i = 0; i < numPrefixes; ++i) {
+    size_t prefixLen = 0;
+    const char *prefix = HiddenUnicodeString_GetUnsafe(sp->rule->prefixes[i], &prefixLen);
+    if (!prefix || prefixLen == 0 || prefixLen > UINT16_MAX) {
+      *fallbackReason = "unsupported prefix patterns";
+      TrieMap_Free(dedupe, NULL);
+      IndexSpecRef_Release(runRef);
+      return KEY_INDEX_SCAN_RESULT_FALLBACK;
+    }
+
+    int iterRc = KeyIndex_IterPrefix(prefix, prefixLen, Indexes_KeyIndexIterCb, &iterCtx);
+    if (scanner->cancelled && !scanner->scanFailedOnOOM) {
+      TrieMap_Free(dedupe, NULL);
+      IndexSpecRef_Release(runRef);
+      return KEY_INDEX_SCAN_RESULT_CANCELLED;
+    }
+    if (iterCtx.iteratorAborted) {
+      *fallbackReason = "iterator failure";
+      TrieMap_Free(dedupe, NULL);
+      IndexSpecRef_Release(runRef);
+      return KEY_INDEX_SCAN_RESULT_FALLBACK;
+    }
+    if (iterRc != REDISMODULE_OK) {
+      *fallbackReason = "iterator failure";
+      // KeyIndex_IterPrefix error paths may already account for this fallback.
+      // Signal the caller to avoid a second increment for the same FT.CREATE attempt.
+      *fallbackAlreadyRecorded = true;
+      TrieMap_Free(dedupe, NULL);
+      IndexSpecRef_Release(runRef);
+      return KEY_INDEX_SCAN_RESULT_FALLBACK;
+    }
+  }
+
+  TrieMap_Free(dedupe, NULL);
+  IndexSpecRef_Release(runRef);
+  return KEY_INDEX_SCAN_RESULT_DONE;
+}
+
+static void Indexes_RecordKeyIndexFallback(RedisModuleCtx *ctx, IndexesScanner *scanner, const char *reason,
+                                           bool alreadyRecorded) {
+  // Integration owns fallback accounting for non-iterator failure reasons.
+  // Iterator failures can be pre-accounted by KeyIndex_IterPrefix internals.
+  if (!alreadyRecorded) {
+    KeyIndex_RecordFallback();
+  }
+
+  if (scanner->global) {
+    RedisModule_Log(ctx, "notice", "Key-index FT.CREATE fallback: %s", reason);
+  } else {
+    RedisModule_Log(ctx, "notice", "Scanning index %s in background: key-index fallback (%s)",
+                    scanner->spec_name_for_logs, reason);
+  }
+}
+
 //---------------------------------------------------------------------------------------------
 // Define for neater code, first argument is the debug scanner flag field , second is the status code
 #define IF_DEBUG_PAUSE_CHECK(scanner, ctx, status_bool, status_code) \
@@ -2807,8 +3015,9 @@ static void Indexes_ScanAndReindexTask(IndexesScanner *scanner) {
 
   size_t counter = 0;
   RedisModuleScanCB scanner_func = (RedisModuleScanCB)Indexes_ScanProc;
-  if (globalDebugCtx.debugMode) {
-    // If we are in debug mode, we need to use the debug scanner function
+  if (scanner->isDebug) {
+    // Use scanner-local debug mode so async scans keep consistent lifecycle behavior
+    // even if global debug settings change after scan creation.
     scanner_func = (RedisModuleScanCB)DebugIndexes_ScanProc;
 
     // If background indexing paused, wait until it is resumed
@@ -2820,7 +3029,30 @@ static void Indexes_ScanAndReindexTask(IndexesScanner *scanner) {
     RedisModule_ThreadSafeContextLock(ctx);
   }
 
-  while (RedisModule_Scan(ctx, cursor, scanner_func, scanner)) {
+  const char *fallbackReason = NULL;
+  bool fallbackAlreadyRecorded = false;
+  KeyIndexScanResult keyIndexResult = Indexes_TryScanWithKeyIndex(ctx, scanner, &fallbackReason,
+                                                                  &fallbackAlreadyRecorded);
+  if (keyIndexResult == KEY_INDEX_SCAN_RESULT_CANCELLED) {
+    if (scanner->global) {
+      RedisModule_Log(ctx, "notice", "Scanning indexes in background: cancelled (scanned=%ld)",
+                      scanner->scannedKeys);
+    } else {
+      RedisModule_Log(ctx, "notice", "Scanning index %s in background: cancelled (scanned=%ld)",
+                      scanner->spec_name_for_logs, scanner->scannedKeys);
+    }
+    goto end;
+  }
+
+  if (keyIndexResult == KEY_INDEX_SCAN_RESULT_FALLBACK) {
+    if (!fallbackReason) {
+      fallbackReason = "unknown reason";
+    }
+    Indexes_RecordKeyIndexFallback(ctx, scanner, fallbackReason, fallbackAlreadyRecorded);
+  }
+
+  while (keyIndexResult == KEY_INDEX_SCAN_RESULT_FALLBACK &&
+         RedisModule_Scan(ctx, cursor, scanner_func, scanner)) {
     RedisModule_ThreadSafeContextUnlock(ctx);
     counter++;
     if (counter % RSGlobalConfig.numBGIndexingIterationsBeforeSleep == 0) {
