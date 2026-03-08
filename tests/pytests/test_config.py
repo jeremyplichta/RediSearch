@@ -1476,20 +1476,32 @@ def testUnprefixedKeyIndexConfigParity(env):
     if env.env == 'existing-env':
         env.skip()
 
-    def assert_unprefixed_get(expected_value):
-        res = env.cmd('CONFIG', 'GET', 'search-key-index')
+    accepted_config_names = ['search-key-index', 'search.search-key-index']
+
+    def _resolve_key_index_config_name():
+        for name in accepted_config_names:
+            res = env.cmd('CONFIG', 'GET', name)
+            if len(res) == 2 and res[0] in accepted_config_names:
+                return res[0]
+        env.fail(f'Could not resolve key-index CONFIG name from: {accepted_config_names}')
+        return None  # for linters
+
+    key_index_config_name = _resolve_key_index_config_name()
+
+    def assert_key_index_get(expected_value):
+        res = env.cmd('CONFIG', 'GET', key_index_config_name)
         env.assertEqual(len(res), 2, message=f'Unexpected CONFIG GET response: {res}')
-        env.assertContains(res[0], ['search-key-index', 'search.search-key-index'])
+        env.assertContains(res[0], accepted_config_names)
         env.assertEqual(res[1], expected_value)
 
-    assert_unprefixed_get('no')
+    assert_key_index_get('no')
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
-    assert_unprefixed_get('yes')
+    env.expect('CONFIG', 'SET', key_index_config_name, 'yes').ok()
+    assert_key_index_get('yes')
     env.expect(config_cmd(), 'GET', 'KEY_INDEX').equal([['KEY_INDEX', 'true']])
 
     env.expect(config_cmd(), 'SET', 'KEY_INDEX', 'false').ok()
-    assert_unprefixed_get('no')
+    assert_key_index_get('no')
     env.expect(config_cmd(), 'GET', 'KEY_INDEX').equal([['KEY_INDEX', 'false']])
 
 @skip(cluster=True, redis_less_than='7.9.227')
