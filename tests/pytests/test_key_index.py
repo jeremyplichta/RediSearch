@@ -1,6 +1,28 @@
 from common import *
 
 
+def _assert_status_ok(status_reply, command='command'):
+    if status_reply not in ('OK', True):
+        raise AssertionError(f"{command} expected status reply 'OK' or True, got {status_reply!r}")
+
+
+def _set_key_index_config(env, enabled):
+    value = 'yes' if enabled else 'no'
+    conn = getConnectionByEnv(env)
+    last_error = None
+    for config_name in ('search-key-index', 'search.search-key-index'):
+        try:
+            _assert_status_ok(
+                conn.execute_command('CONFIG', 'SET', config_name, value),
+                f'CONFIG SET {config_name} {value}'
+            )
+            return
+        except Exception as error:
+            last_error = error
+
+    raise AssertionError(f'Failed to set key-index config to {value}') from last_error
+
+
 def _seed_hash_docs(env, prefix, count):
     conn = getConnectionByEnv(env)
     for i in range(count):
@@ -10,7 +32,7 @@ def _seed_hash_docs(env, prefix, count):
 def _seed_string_keys(env, prefix, count):
     conn = getConnectionByEnv(env)
     for i in range(count):
-        env.assertEqual(conn.execute_command('SET', f'{prefix}{i}', f'v{i}'), 'OK')
+        _assert_status_ok(conn.execute_command('SET', f'{prefix}{i}', f'v{i}'), 'SET')
 
 
 def _key_index_info(env, idx='idx'):
@@ -35,7 +57,10 @@ def _trigger_key_index_iter_error(env):
     conn = getConnectionByEnv(env)
     for debug_command in ['FT.DEBUG', '_FT.DEBUG']:
         try:
-            env.assertEqual(conn.execute_command(debug_command, 'KEY_INDEX_TRIGGER_ITER_ERR'), 'OK')
+            _assert_status_ok(
+                conn.execute_command(debug_command, 'KEY_INDEX_TRIGGER_ITER_ERR'),
+                f'{debug_command} KEY_INDEX_TRIGGER_ITER_ERR'
+            )
             return debug_command
         except Exception:
             continue
@@ -89,7 +114,7 @@ def _wait_for_fallback_count_at_least(env, idx, expected_min, timeout=30):
 @skip(cluster=True, redis_less_than='7.9.227')
 def test_key_index_info_fields_and_state_transition(env):
     _seed_hash_docs(env, 'ki:state:', 200)
-    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _set_key_index_config(env, False)
     env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'PREFIX', '1', 'ki:state:', 'SCHEMA', 'name', 'TEXT').ok()
     waitForIndex(env, 'idx')
 
@@ -101,7 +126,7 @@ def test_key_index_info_fields_and_state_transition(env):
     env.assertGreaterEqual(int(info['key_index_bootstrap_duration_ms']), 0)
     env.assertGreaterEqual(int(info['key_index_snapshot_peak_bytes']), 0)
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    _set_key_index_config(env, True)
     env.assertContains(_wait_for_key_index_state(env, 'idx', {'warming', 'ready'}), ['warming', 'ready'])
     env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
 
@@ -115,7 +140,7 @@ def test_key_index_overlapping_prefixes_are_deduped(env):
     total_docs = 300
     _seed_hash_docs(env, 'ki:dup:item:', total_docs)
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _set_key_index_config(env, False)
     env.expect(
         'FT.CREATE', 'idx_probe',
         'ON', 'HASH',
@@ -124,7 +149,7 @@ def test_key_index_overlapping_prefixes_are_deduped(env):
     ).ok()
     waitForIndex(env, 'idx_probe')
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    _set_key_index_config(env, True)
     env.assertEqual(_wait_for_key_index_state(env, 'idx_probe', {'ready'}), 'ready')
     baseline_fallback_count = _key_index_fallback_count(env, 'idx_probe')
 
@@ -149,7 +174,7 @@ def test_key_index_fallback_counter_increments_while_warming(env):
     _seed_hash_docs(env, 'ki:warming:doc:', indexed_docs)
     _seed_string_keys(env, 'ki:warming:noise:', noise_keys)
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _set_key_index_config(env, False)
     env.expect(
         'FT.CREATE', 'idx_probe',
         'ON', 'HASH',
@@ -159,7 +184,7 @@ def test_key_index_fallback_counter_increments_while_warming(env):
     waitForIndex(env, 'idx_probe')
 
     baseline_fallback_count = _key_index_fallback_count(env, 'idx_probe')
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    _set_key_index_config(env, True)
     env.assertEqual(_wait_for_key_index_state(env, 'idx_probe', {'warming'}), 'warming')
 
     env.expect(
@@ -184,7 +209,7 @@ def test_key_index_rename_pair_and_destination_fallback_semantics(env):
     dst_only_prefix = 'ki:rename:dst_only:'
     _seed_hash_docs(env, src_prefix, total_docs)
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _set_key_index_config(env, False)
     env.expect(
         'FT.CREATE', 'idx_probe',
         'ON', 'HASH',
@@ -193,12 +218,12 @@ def test_key_index_rename_pair_and_destination_fallback_semantics(env):
     ).ok()
     waitForIndex(env, 'idx_probe')
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    _set_key_index_config(env, True)
     env.assertEqual(_wait_for_key_index_state(env, 'idx_probe', {'ready'}), 'ready')
 
     conn = getConnectionByEnv(env)
     for i in range(total_docs):
-        env.assertEqual(conn.execute_command('RENAME', f'{src_prefix}{i}', f'{dst_prefix}{i}'), 'OK')
+        _assert_status_ok(conn.execute_command('RENAME', f'{src_prefix}{i}', f'{dst_prefix}{i}'), 'RENAME')
 
     # Destination-only upsert mirrors the out-of-order rename_to fallback semantics.
     for i in range(total_docs):
@@ -226,7 +251,7 @@ def test_key_index_fallback_counter_increments_when_disabled(env):
     total_docs = 250
     _seed_hash_docs(env, 'ki:fallback:', total_docs)
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _set_key_index_config(env, False)
     env.expect(
         'FT.CREATE', 'idx',
         'ON', 'HASH',
@@ -246,11 +271,11 @@ def test_key_index_iter_error_fallback_increments_once(env):
     prefix = 'ki:itererr:'
     _seed_hash_docs(env, prefix, total_docs)
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _set_key_index_config(env, False)
     env.expect('FT.CREATE', 'idx_probe', 'ON', 'HASH', 'PREFIX', '1', prefix, 'SCHEMA', 'name', 'TEXT').ok()
     waitForIndex(env, 'idx_probe')
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    _set_key_index_config(env, True)
     env.assertEqual(_wait_for_key_index_state(env, 'idx_probe', {'ready'}), 'ready')
     before = _key_index_fallback_count(env, 'idx_probe')
 
@@ -271,7 +296,7 @@ def test_key_index_rapid_enable_disable_cycles_remain_consistent(env):
     prefix = 'ki:toggle:'
 
     _seed_hash_docs(env, prefix, base_docs)
-    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _set_key_index_config(env, False)
     env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'PREFIX', '1', prefix, 'SCHEMA', 'name', 'TEXT').ok()
     waitForIndex(env, 'idx')
     _wait_for_key_index_off_and_queue_empty(env, 'idx')
@@ -281,7 +306,7 @@ def test_key_index_rapid_enable_disable_cycles_remain_consistent(env):
     fallback_counter = _key_index_fallback_count(env, 'idx')
 
     for _ in range(cycles):
-        env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+        _set_key_index_config(env, True)
         _wait_for_key_index_state(env, 'idx', {'warming', 'ready'})
         env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
         _wait_for_key_index_queue_drained(env, 'idx')
@@ -294,14 +319,14 @@ def test_key_index_rapid_enable_disable_cycles_remain_consistent(env):
             env.assertEqual(conn.execute_command('HSET', f'{prefix}{next_doc_id}', 'name', f'name{next_doc_id}'), 1)
             next_doc_id += 1
 
-        env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+        _set_key_index_config(env, False)
         _wait_for_key_index_off_and_queue_empty(env, 'idx')
 
         for _ in range(docs_per_cycle // 2):
             env.assertEqual(conn.execute_command('HSET', f'{prefix}{next_doc_id}', 'name', f'name{next_doc_id}'), 1)
             next_doc_id += 1
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    _set_key_index_config(env, True)
     env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
     _wait_for_key_index_queue_drained(env, 'idx')
 
@@ -318,14 +343,14 @@ def test_key_index_queue_depth_stays_empty_while_disabled_and_recovers_after_ree
     prefix = 'ki:disabled:'
 
     _seed_hash_docs(env, prefix, initial_docs)
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    _set_key_index_config(env, True)
     env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'PREFIX', '1', prefix, 'SCHEMA', 'name', 'TEXT').ok()
     waitForIndex(env, 'idx')
     env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
     _wait_for_key_index_queue_drained(env, 'idx')
     baseline_fallback_count = _key_index_fallback_count(env, 'idx')
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'no').ok()
+    _set_key_index_config(env, False)
     _wait_for_key_index_off_and_queue_empty(env, 'idx')
 
     conn = getConnectionByEnv(env)
@@ -336,7 +361,7 @@ def test_key_index_queue_depth_stays_empty_while_disabled_and_recovers_after_ree
     env.assertEqual(info_off['key_index_state'], 'off')
     env.assertEqual(int(info_off['key_index_update_queue_depth']), 0)
 
-    env.expect('CONFIG', 'SET', 'search-key-index', 'yes').ok()
+    _set_key_index_config(env, True)
     env.assertEqual(_wait_for_key_index_state(env, 'idx', {'ready'}), 'ready')
     _wait_for_key_index_queue_drained(env, 'idx')
 
