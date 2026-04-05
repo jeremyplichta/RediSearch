@@ -33,6 +33,8 @@ void FieldsGlobalStats_UpdateStats(FieldSpec *fs, int toAdd) {
     RSGlobalStats.fieldsStats.numVectorFields += toAdd;
     if (fs->vectorOpts.vecSimParams.algo == VecSimAlgo_BF)
       RSGlobalStats.fieldsStats.numVectorFieldsFlat += toAdd;
+    else if (fs->vectorOpts.vecSimParams.algo == VecSimAlgo_TQ)
+      RSGlobalStats.fieldsStats.numVectorFieldsTqFlat += toAdd;
     else if (fs->vectorOpts.vecSimParams.algo == VecSimAlgo_TIERED) {
       if (fs->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_HNSWLIB)
         RSGlobalStats.fieldsStats.numVectorFieldsHNSW += toAdd;

@@ -285,6 +285,10 @@ int JSON_StoreSingleVectorInDocField(FieldSpec *fs, RedisJSON arr, struct Docume
       type = params->algoParams.bfParams.type;
       dim = params->algoParams.bfParams.dim;
       break;
+    case VecSimAlgo_TQ:
+      type = params->algoParams.tqFlatParams.type;
+      dim = params->algoParams.tqFlatParams.dim;
+      break;
     case VecSimAlgo_SVS:
       type = params->algoParams.svsParams.type;
       dim = params->algoParams.svsParams.dim;
@@ -345,12 +349,16 @@ switch (params->algo) {
       dim = params->algoParams.bfParams.dim;
       multi = params->algoParams.bfParams.multi;
       break;
+    case VecSimAlgo_TQ:
+      type = params->algoParams.tqFlatParams.type;
+      dim = params->algoParams.tqFlatParams.dim;
+      multi = params->algoParams.tqFlatParams.multi;
+      break;
     case VecSimAlgo_SVS:
       type = params->algoParams.svsParams.type;
       dim = params->algoParams.svsParams.dim;
       multi = params->algoParams.svsParams.multi;
       break;
-  break;
     default: goto fail;
   }
 

@@ -213,6 +213,15 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
         REPLY_KVSTR("data_type", VecSimType_ToString(algo_params.bfParams.type));
         REPLY_KVINT("dim", algo_params.bfParams.dim);
         REPLY_KVSTR("distance_metric", VecSimMetric_ToString(algo_params.bfParams.metric));
+      } else if (field_algo == VecSimAlgo_TQ) {
+        REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(field_algo));
+        REPLY_KVSTR("data_type", VecSimType_ToString(algo_params.tqFlatParams.type));
+        REPLY_KVINT("dim", algo_params.tqFlatParams.dim);
+        REPLY_KVSTR("distance_metric", VecSimMetric_ToString(algo_params.tqFlatParams.metric));
+        REPLY_KVINT("bits", algo_params.tqFlatParams.bits);
+        REPLY_KVINT("projections", algo_params.tqFlatParams.projections);
+        REPLY_KVINT("seed", algo_params.tqFlatParams.seed);
+        REPLY_KVSTR("rotation", algo_params.tqFlatParams.useRotation ? "ON" : "OFF");
       }
     }
     if (has_map) {

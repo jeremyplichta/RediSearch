@@ -697,6 +697,23 @@ static int parseVectorField_GetQuantBits(ArgsCursor *ac, VecSimSvsQuantBits *qua
   return AC_OK;
 }
 
+static int parseVectorField_GetRotation(ArgsCursor *ac, bool *useRotation) {
+  const char *rotationStr;
+  size_t len;
+  int rc;
+  if ((rc = AC_GetString(ac, &rotationStr, &len, 0)) != AC_OK) {
+    return rc;
+  }
+  if (STR_EQCASE(rotationStr, len, VECSIM_ROTATION_ON)) {
+    *useRotation = true;
+  } else if (STR_EQCASE(rotationStr, len, VECSIM_ROTATION_OFF)) {
+    *useRotation = false;
+  } else {
+    return AC_ERR_ENOENT;
+  }
+  return AC_OK;
+}
+
 // memoryLimit / 10 - default is 10% of global memory limit
 #define ACTUAL_MEMORY_LIMIT ((memoryLimit == 0) ? SIZE_MAX : memoryLimit)
 #define BLOCK_MEMORY_LIMIT ((RSGlobalConfig.vssMaxResize) ? RSGlobalConfig.vssMaxResize : ACTUAL_MEMORY_LIMIT / 10)
@@ -742,6 +759,36 @@ static int parseVectorField_validate_flat(VecSimParams *params, QueryError *stat
   return 1;
 }
 
+static int parseVectorField_validate_tq(VecSimParams *params, QueryError *status) {
+  if (params->algoParams.tqFlatParams.type != VecSimType_FLOAT32) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ-FLAT only supports FLOAT32 vectors");
+    return 0;
+  }
+  if (params->algoParams.tqFlatParams.multi) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ-FLAT does not support multi-value vectors");
+    return 0;
+  }
+
+  size_t elementSize = VecSimIndex_EstimateElementSize(params);
+  size_t maxBlockSize = BLOCK_MEMORY_LIMIT / elementSize;
+  params->algoParams.tqFlatParams.blockSize = MIN(DEFAULT_BLOCK_SIZE, maxBlockSize);
+  if (params->algoParams.tqFlatParams.blockSize == 0) {
+    QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_LIMIT, "Vector index element size",
+      " %zu exceeded maximum size allowed by server limit which is %zu", elementSize, maxBlockSize);
+    return 0;
+  }
+
+  size_t index_size_estimation = VecSimIndex_EstimateInitialSize(params);
+  index_size_estimation += elementSize * params->algoParams.tqFlatParams.blockSize;
+
+  RedisModule_Log(RSDummyContext, REDISMODULE_LOGLEVEL_NOTICE,
+    "Creating vector index of type TQ-FLAT. Required memory for a block of %zu vectors: %zuB",
+    params->algoParams.tqFlatParams.blockSize, index_size_estimation);
+  return 1;
+}
+
 static int parseVectorField_validate_svs(VecSimParams *params, QueryError *status) {
   size_t elementSize = VecSimIndex_EstimateElementSize(params);
   // Calculating max block size (in # of vectors), according to memory limits
@@ -770,6 +817,8 @@ int VecSimIndex_validate_params(RedisModuleCtx *ctx, VecSimParams *params, Query
     valid = parseVectorField_validate_hnsw(params, status);
   } else if (VecSimAlgo_BF == params->algo) {
     valid = parseVectorField_validate_flat(params, status);
+  } else if (VecSimAlgo_TQ == params->algo) {
+    valid = parseVectorField_validate_tq(params, status);
   } else if (VecSimAlgo_SVS == params->algo) {
     valid = parseVectorField_validate_svs(params, status);
   } else if (VecSimAlgo_TIERED == params->algo) {
@@ -1005,6 +1054,121 @@ static int parseVectorField_flat(FieldSpec *fs, VecSimParams *params, ArgsCursor
   fs->vectorOpts.expBlobSize = params->algoParams.bfParams.dim * VecSimType_sizeof(params->algoParams.bfParams.type);
 
   return parseVectorField_validate_flat(&fs->vectorOpts.vecSimParams, status);
+}
+
+static int parseVectorField_tq(FieldSpec *fs, VecSimParams *params, ArgsCursor *ac, QueryError *status) {
+  int rc;
+
+  bool mandtype = false;
+  bool mandsize = false;
+  bool mandmetric = false;
+
+  size_t expNumParam, numParam = 0;
+  if ((rc = AC_GetSize(ac, &expNumParam, 0)) != AC_OK) {
+    QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS, "Bad arguments",
+                                  " for vector similarity number of parameters: %s",
+                                  AC_Strerror(rc));
+    return 0;
+  } else if (expNumParam % 2) {
+    QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS,
+      "Bad number of arguments for vector similarity index",
+      ": got %d but expected even number as algorithm parameters (should be submitted as named arguments)",
+      expNumParam);
+    return 0;
+  } else {
+    expNumParam /= 2;
+  }
+
+  while (expNumParam > numParam && !AC_IsAtEnd(ac)) {
+    if (AC_AdvanceIfMatch(ac, VECSIM_TYPE)) {
+      if ((rc = parseVectorField_GetType(ac, &params->algoParams.tqFlatParams.type)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_TYPE), rc);
+        return 0;
+      }
+      mandtype = true;
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_DIM)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqFlatParams.dim, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_DIM), rc);
+        return 0;
+      }
+      mandsize = true;
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_DISTANCE_METRIC)) {
+      if ((rc = parseVectorField_GetMetric(ac, &params->algoParams.tqFlatParams.metric)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_DISTANCE_METRIC), rc);
+        return 0;
+      }
+      mandmetric = true;
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_INITIAL_CAP)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqFlatParams.initialCapacity, 0)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_INITIAL_CAP), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_BLOCKSIZE)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqFlatParams.blockSize, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_BLOCKSIZE), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_BITS)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqFlatParams.bits, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_BITS), rc);
+        return 0;
+      }
+      if (params->algoParams.tqFlatParams.bits < 2 || params->algoParams.tqFlatParams.bits > 16) {
+        QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                            "TQ-FLAT BITS must be between 2 and 16");
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_PROJECTIONS)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqFlatParams.projections, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_PROJECTIONS), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_SEED)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqFlatParams.seed, 0)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_SEED), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_ROTATION)) {
+      if ((rc = parseVectorField_GetRotation(ac, &params->algoParams.tqFlatParams.useRotation)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ, VECSIM_ROTATION), rc);
+        return 0;
+      }
+    } else {
+      QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS, "Bad arguments for algorithm",
+                                    " %s: %s", VECSIM_ALGORITHM_TQ, AC_GetStringNC(ac, NULL));
+      return 0;
+    }
+    numParam++;
+  }
+  if (expNumParam > numParam) {
+    QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                                     "Expected %d parameters but got %d", expNumParam * 2,
+                                     numParam * 2);
+    return 0;
+  }
+  if (!mandtype) {
+    VECSIM_ERR_MANDATORY(status, VECSIM_ALGORITHM_TQ, VECSIM_TYPE);
+    return 0;
+  }
+  if (!mandsize) {
+    VECSIM_ERR_MANDATORY(status, VECSIM_ALGORITHM_TQ, VECSIM_DIM);
+    return 0;
+  }
+  if (!mandmetric) {
+    VECSIM_ERR_MANDATORY(status, VECSIM_ALGORITHM_TQ, VECSIM_DISTANCE_METRIC);
+    return 0;
+  }
+  if (params->algoParams.tqFlatParams.bits == 0) {
+    params->algoParams.tqFlatParams.bits = 8;
+  }
+  if (params->algoParams.tqFlatParams.projections == 0) {
+    params->algoParams.tqFlatParams.projections = MAX(1, params->algoParams.tqFlatParams.dim / 2);
+  }
+
+  fs->vectorOpts.expBlobSize =
+      params->algoParams.tqFlatParams.dim * VecSimType_sizeof(params->algoParams.tqFlatParams.type);
+
+  return parseVectorField_validate_tq(params, status);
 }
 
 static int parseVectorField_svs(FieldSpec *fs, TieredIndexParams *tieredParams, ArgsCursor *ac, QueryError *status) {
@@ -1276,6 +1440,23 @@ static int parseVectorField(IndexSpec *sp, StrongRef sp_ref, FieldSpec *fs, Args
     fs->vectorOpts.vecSimParams.algoParams.bfParams.blockSize = 0;
     fs->vectorOpts.vecSimParams.algoParams.bfParams.multi = multi;
     result = parseVectorField_flat(fs, &fs->vectorOpts.vecSimParams, ac, status);
+  } else if (STR_EQCASE(algStr, len, VECSIM_ALGORITHM_TQ)) {
+    if (isSpecOnDiskForValidation(sp)) {
+      QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_INVAL,
+        "Disk index does not support TQ-FLAT algorithm");
+      rm_free(logCtx);
+      fs->vectorOpts.vecSimParams.logCtx = NULL;
+      return 0;
+    }
+    fs->vectorOpts.vecSimParams.algo = VecSimAlgo_TQ;
+    fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.initialCapacity = SIZE_MAX;
+    fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.blockSize = 0;
+    fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.bits = 8;
+    fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.projections = 0;
+    fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.seed = 7;
+    fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.useRotation = true;
+    fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.multi = multi;
+    result = parseVectorField_tq(fs, &fs->vectorOpts.vecSimParams, ac, status);
   } else if (STR_EQCASE(algStr, len, VECSIM_ALGORITHM_HNSW)) {
     fs->vectorOpts.vecSimParams.algo = VecSimAlgo_TIERED;
     VecSim_TieredParams_Init(&fs->vectorOpts.vecSimParams.algoParams.tieredParams, sp_ref);
@@ -2656,6 +2837,8 @@ static int FieldSpec_RdbLoad(RedisModuleIO *rdb, FieldSpec *f, StrongRef sp_ref,
       case VecSimAlgo_BF:
         f->vectorOpts.expBlobSize = f->vectorOpts.vecSimParams.algoParams.bfParams.dim * VecSimType_sizeof(f->vectorOpts.vecSimParams.algoParams.bfParams.type);
         break;
+      case VecSimAlgo_TQ:
+        goto fail;  // tq-flat is not supported in old encvers
       case VecSimAlgo_TIERED:
         if (f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_HNSWLIB) {
           f->vectorOpts.expBlobSize = f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algoParams.hnswParams.dim * VecSimType_sizeof(f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algoParams.hnswParams.type);
