@@ -119,6 +119,10 @@ def testRDBCompatibility_vecsim():
 def testRDBCompatibility_tq_flat():
     env = Env(moduleArgs='DEFAULT_DIALECT 2 MIN_OPERATION_WORKERS 0')
     conn = env.getConnection()
+    index_name = 'idx_tq_rdb_compat'
+    doc_ids = ['tq:rdbcompat:doc:1', 'tq:rdbcompat:doc:2']
+
+    env.cmd('FLUSHALL')
 
     params = [
         'TYPE', 'FLOAT32',
@@ -130,20 +134,21 @@ def testRDBCompatibility_tq_flat():
         'ROTATION', 'ON',
     ]
 
-    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', len(params), *params).ok()
-    conn.execute_command('HSET', 'doc:1', 'v', np.array([0.0, 0.0], dtype=np.float32).tobytes())
-    conn.execute_command('HSET', 'doc:2', 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
+    env.expect('FT.CREATE', index_name, 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', len(params), *params).ok()
+    conn.execute_command('HSET', doc_ids[0], 'v', np.array([0.0, 0.0], dtype=np.float32).tobytes())
+    conn.execute_command('HSET', doc_ids[1], 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
+    waitForIndex(env, index_name)
 
-    before = env.cmd('FT.SEARCH', 'idx', '*=>[KNN 2 @v $blob AS dist]',
+    before = env.cmd('FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
                      'PARAMS', '2', 'blob', np.array([0.0, 0.0], dtype=np.float32).tobytes(),
                      'SORTBY', 'dist', 'RETURN', '1', 'dist', 'DIALECT', '2')
-    env.assertEqual(before[1], 'doc:1')
-    env.assertEqual(before[3], 'doc:2')
+    env.assertEqual(before[1], doc_ids[0])
+    env.assertEqual(before[3], doc_ids[1])
 
     env.restartAndReload()
-    waitForIndex(env, 'idx')
+    waitForIndex(env, index_name)
 
-    info = to_dict(env.cmd('FT.INFO', 'idx'))
+    info = to_dict(env.cmd('FT.INFO', index_name))
     attr = to_dict(info['attributes'][0])
     env.assertEqual(attr['algorithm'], 'TQ-FLAT')
     env.assertEqual(attr['bits'], 8)
@@ -151,8 +156,8 @@ def testRDBCompatibility_tq_flat():
     env.assertEqual(attr['seed'], 7)
     env.assertEqual(attr['rotation'], 'ON')
 
-    after = env.cmd('FT.SEARCH', 'idx', '*=>[KNN 2 @v $blob AS dist]',
+    after = env.cmd('FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
                     'PARAMS', '2', 'blob', np.array([0.0, 0.0], dtype=np.float32).tobytes(),
                     'SORTBY', 'dist', 'RETURN', '1', 'dist', 'DIALECT', '2')
-    env.assertEqual(after[1], 'doc:1')
-    env.assertEqual(after[3], 'doc:2')
+    env.assertEqual(after[1], doc_ids[0])
+    env.assertEqual(after[3], doc_ids[1])

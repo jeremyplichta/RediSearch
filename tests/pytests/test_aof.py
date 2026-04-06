@@ -57,6 +57,7 @@ def testAofTqFlatRoundTrip():
     env.cmd('FT.CREATE', index_name, 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', len(params), *params)
     conn.execute_command('HSET', doc_ids[0], 'v', np.array([0.0, 0.0], dtype=np.float32).tobytes())
     conn.execute_command('HSET', doc_ids[1], 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
+    waitForIndex(env, index_name)
 
     before = env.cmd(
         'FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
