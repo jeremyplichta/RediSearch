@@ -1,5 +1,6 @@
 from RLTest import Env
 import random
+import numpy as np
 from includes import *
 from common import getConnectionByEnv, waitForIndex, toSortedFlatList
 
@@ -34,6 +35,59 @@ def testRawAof():
     if env.env == 'existing-env':
         env.skip()
     aofTestCommon(env, lambda: env.broadcast('debug', 'loadaof'))
+
+
+def testAofTqFlatRoundTrip():
+    env = Env(useAof=True, moduleArgs='DEFAULT_DIALECT 2')
+    conn = getConnectionByEnv(env)
+    index_name = 'idx_tq_aof'
+    doc_ids = ['tq:aof:doc:1', 'tq:aof:doc:2']
+
+    env.cmd('FLUSHALL')
+
+    params = [
+        'TYPE', 'FLOAT32',
+        'DIM', 2,
+        'DISTANCE_METRIC', 'L2',
+        'BITS', 8,
+        'PROJECTIONS', 4,
+        'SEED', 7,
+        'ROTATION', 'ON',
+    ]
+    env.cmd('FT.CREATE', index_name, 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', len(params), *params)
+    conn.execute_command('HSET', doc_ids[0], 'v', np.array([0.0, 0.0], dtype=np.float32).tobytes())
+    conn.execute_command('HSET', doc_ids[1], 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
+
+    before = env.cmd(
+        'FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
+        'PARAMS', '2', 'blob', np.array([0.0, 0.0], dtype=np.float32).tobytes(),
+        'SORTBY', 'dist',
+        'RETURN', '1', 'dist',
+        'DIALECT', '2',
+    )
+    env.assertEqual(before[1], doc_ids[0])
+    env.assertEqual(before[3], doc_ids[1])
+
+    env.restartAndReload()
+    waitForIndex(env, index_name)
+
+    info = to_dict(env.cmd('FT.INFO', index_name))
+    attr = to_dict(info['attributes'][0])
+    env.assertEqual(attr['algorithm'], 'TQ-FLAT')
+    env.assertEqual(attr['bits'], 8)
+    env.assertEqual(attr['projections'], 4)
+    env.assertEqual(attr['seed'], 7)
+    env.assertEqual(attr['rotation'], 'ON')
+
+    after = env.cmd(
+        'FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
+        'PARAMS', '2', 'blob', np.array([0.0, 0.0], dtype=np.float32).tobytes(),
+        'SORTBY', 'dist',
+        'RETURN', '1', 'dist',
+        'DIALECT', '2',
+    )
+    env.assertEqual(after[1], doc_ids[0])
+    env.assertEqual(after[3], doc_ids[1])
 
 
 def testRewriteAofSortables():

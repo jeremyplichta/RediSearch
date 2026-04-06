@@ -1,5 +1,6 @@
 import os
 import subprocess
+import numpy as np
 from includes import *
 from common import *
 from RLTest import Env
@@ -112,3 +113,46 @@ def testRDBCompatibility_vecsim():
 
         env.cmd('flushall')
         env.assertTrue(env.checkExitCode())
+
+
+@skip(cluster=True)
+def testRDBCompatibility_tq_flat():
+    env = Env(moduleArgs='DEFAULT_DIALECT 2 MIN_OPERATION_WORKERS 0')
+    conn = env.getConnection()
+
+    params = [
+        'TYPE', 'FLOAT32',
+        'DIM', 2,
+        'DISTANCE_METRIC', 'L2',
+        'BITS', 8,
+        'PROJECTIONS', 4,
+        'SEED', 7,
+        'ROTATION', 'ON',
+    ]
+
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', len(params), *params).ok()
+    conn.execute_command('HSET', 'doc:1', 'v', np.array([0.0, 0.0], dtype=np.float32).tobytes())
+    conn.execute_command('HSET', 'doc:2', 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
+
+    before = env.cmd('FT.SEARCH', 'idx', '*=>[KNN 2 @v $blob AS dist]',
+                     'PARAMS', '2', 'blob', np.array([0.0, 0.0], dtype=np.float32).tobytes(),
+                     'SORTBY', 'dist', 'RETURN', '1', 'dist', 'DIALECT', '2')
+    env.assertEqual(before[1], 'doc:1')
+    env.assertEqual(before[3], 'doc:2')
+
+    env.restartAndReload()
+    waitForIndex(env, 'idx')
+
+    info = to_dict(env.cmd('FT.INFO', 'idx'))
+    attr = to_dict(info['attributes'][0])
+    env.assertEqual(attr['algorithm'], 'TQ-FLAT')
+    env.assertEqual(attr['bits'], 8)
+    env.assertEqual(attr['projections'], 4)
+    env.assertEqual(attr['seed'], 7)
+    env.assertEqual(attr['rotation'], 'ON')
+
+    after = env.cmd('FT.SEARCH', 'idx', '*=>[KNN 2 @v $blob AS dist]',
+                    'PARAMS', '2', 'blob', np.array([0.0, 0.0], dtype=np.float32).tobytes(),
+                    'SORTBY', 'dist', 'RETURN', '1', 'dist', 'DIALECT', '2')
+    env.assertEqual(after[1], 'doc:1')
+    env.assertEqual(after[3], 'doc:2')

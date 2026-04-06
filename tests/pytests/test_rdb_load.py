@@ -5,7 +5,9 @@ import threading
 import time
 import signal
 import tempfile
+import numpy as np
 from common import skip, downloadFile, REDISEARCH_CACHE_DIR, debug_cmd
+from common import to_dict, waitForIndex
 from RLTest import Env
 
 @skip(cluster=True)
@@ -98,3 +100,63 @@ def test_rdb_load_no_deadlock():
     assert indices_info, "No indices found after RDB load"
     # If there are indices, verify we can get info about the first one
     test_env.expect('FT.INFO', indices_info[0]).noError()
+
+
+@skip(cluster=True)
+def test_rdb_reload_tq_flat_round_trip():
+    env = Env(moduleArgs='DEFAULT_DIALECT 2')
+    conn = env.getConnection()
+    index_name = 'idx_tq_rdb'
+    doc_ids = ['tq:rdb:doc:1', 'tq:rdb:doc:2', 'tq:rdb:doc:3']
+
+    env.cmd('FLUSHALL')
+
+    params = [
+        'TYPE', 'FLOAT32',
+        'DIM', 2,
+        'DISTANCE_METRIC', 'L2',
+        'BITS', 8,
+        'PROJECTIONS', 4,
+        'SEED', 7,
+        'ROTATION', 'ON',
+    ]
+
+    env.expect('FT.CREATE', index_name, 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', len(params), *params).ok()
+    conn.execute_command('HSET', doc_ids[0], 'v', np.array([0.0, 0.0], dtype=np.float32).tobytes())
+    conn.execute_command('HSET', doc_ids[1], 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
+    conn.execute_command('HSET', doc_ids[2], 'v', np.array([2.0, 0.0], dtype=np.float32).tobytes())
+
+    query = np.array([0.0, 0.0], dtype=np.float32).tobytes()
+    before = env.cmd(
+        'FT.SEARCH', index_name, '*=>[KNN 3 @v $blob AS dist]',
+        'PARAMS', 2, 'blob', query,
+        'SORTBY', 'dist',
+        'RETURN', 1, 'dist',
+        'DIALECT', 2,
+    )
+    env.assertEqual(before[1], doc_ids[0])
+    env.assertEqual(before[3], doc_ids[1])
+    env.assertEqual(before[5], doc_ids[2])
+
+    env.restartAndReload()
+    waitForIndex(env, index_name)
+
+    after = to_dict(env.cmd('FT.INFO', index_name))
+    attr = to_dict(after['attributes'][0])
+    env.assertEqual(attr['algorithm'], 'TQ-FLAT')
+    env.assertEqual(attr['bits'], 8)
+    env.assertEqual(attr['projections'], 4)
+    env.assertEqual(attr['seed'], 7)
+    env.assertEqual(attr['rotation'], 'ON')
+    env.assertEqual(after['num_docs'], 3)
+
+    round_trip = env.cmd(
+        'FT.SEARCH', index_name, '*=>[KNN 3 @v $blob AS dist]',
+        'PARAMS', 2, 'blob', query,
+        'SORTBY', 'dist',
+        'RETURN', 1, 'dist',
+        'DIALECT', 2,
+    )
+    env.assertEqual(round_trip[1], doc_ids[0])
+    env.assertEqual(round_trip[3], doc_ids[1])
+    env.assertEqual(round_trip[5], doc_ids[2])
