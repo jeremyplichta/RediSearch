@@ -13,6 +13,11 @@ from vecsim_utils import *
 '''************* Helper methods for vecsim tests ************'''
 EPSILONS = {'FLOAT32': 1E-6, 'FLOAT64': 1E-9, 'FLOAT16': 1E-2, 'BFLOAT16': 1E-2}
 
+
+def _tq_flat_params(dim=2, metric='L2', bits=8, projections=4, seed=7, rotation='ON'):
+    return ['TYPE', 'FLOAT32', 'DIM', dim, 'DISTANCE_METRIC', metric,
+            'BITS', bits, 'PROJECTIONS', projections, 'SEED', seed, 'ROTATION', rotation]
+
 # Helper method for comparing expected vs. results of KNN query, where the only
 # returned field except for the doc id is the vector distance
 def assert_query_results(env: Env, expected_res, actual_res, error_msg=None, data_type='FLOAT32'):
@@ -137,6 +142,44 @@ def test_sanity_cosine():
 
                     conn.execute_command('FT.DROPINDEX', 'idx', 'DD')
 
+    # TQ-FLAT is outside VECSIM_ALGOS for now, so validate it explicitly on the same cosine path.
+    params = _tq_flat_params(metric='COSINE')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', str(len(params)), *params).ok()
+    conn.execute_command('HSET', 'a', 'v', create_np_array_typed([0.1, 0.1], 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'b', 'v', create_np_array_typed([0.1, 0.2], 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'c', 'v', create_np_array_typed([0.1, 0.3], 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'd', 'v', create_np_array_typed([0.1, 0.4], 'FLOAT32').tobytes())
+
+    query_vec = create_np_array_typed([0.1, 0.1], 'FLOAT32')
+    actual_res = env.expect('FT.SEARCH', 'idx', '*=>[KNN 4 @v $blob AS dist]', 'PARAMS', '2',
+                            'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist').res
+    env.assertGreaterEqual(actual_res[0], 3, message='TQ-FLAT/COSINE')
+    env.assertEqual(actual_res[1], 'a', message='TQ-FLAT/COSINE')
+    env.assertTrue('b' in actual_res, message='TQ-FLAT/COSINE')
+
+    range_dist = spatial.distance.cosine(np.array([0.1, 0.4]), query_vec) + EPSILONS['FLOAT32']
+    actual_res = env.expect('FT.SEARCH', 'idx', f'@v:[VECTOR_RANGE {range_dist} $blob]=>{{$yield_distance_as: dist}}',
+                            'PARAMS', '2', 'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist').res
+    env.assertGreaterEqual(actual_res[0], 1, message='TQ-FLAT/COSINE')
+    env.assertEqual(actual_res[1], 'a', message='TQ-FLAT/COSINE')
+
+    conn.execute_command('HSET', 'b', 'v', create_np_array_typed([0.1, 0.9], 'FLOAT32').tobytes())
+    query_vec = create_np_array_typed([0.1, 0.1], 'FLOAT32')
+    actual_res = env.expect('FT.SEARCH', 'idx', '*=>[KNN 4 @v $blob AS dist]', 'PARAMS', '2',
+                            'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist').res
+    env.assertGreaterEqual(actual_res[0], 3, message='TQ-FLAT/COSINE update')
+    env.assertEqual(actual_res[1], 'a', message='TQ-FLAT/COSINE update')
+    env.assertTrue('b' in actual_res, message='TQ-FLAT/COSINE update')
+
+    conn.execute_command('DEL', 'b')
+    actual_res = env.expect('FT.SEARCH', 'idx', '*=>[KNN 4 @v $blob AS dist]', 'PARAMS', '2',
+                            'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist').res
+    env.assertGreaterEqual(actual_res[0], 3, message='TQ-FLAT/COSINE delete')
+    env.assertEqual(actual_res[1], 'a', message='TQ-FLAT/COSINE delete')
+    env.assertFalse('b' in actual_res, message='TQ-FLAT/COSINE delete')
+
+    conn.execute_command('FT.DROPINDEX', 'idx', 'DD')
+
 
 def test_sanity_l2():
     env = Env(moduleArgs='DEFAULT_DIALECT 2')
@@ -210,6 +253,43 @@ def test_sanity_l2():
 
                 conn.execute_command('FT.DROPINDEX', 'idx', 'DD')
 
+    params = _tq_flat_params(metric='L2')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', str(len(params)), *params).ok()
+    conn.execute_command('HSET', 'a', 'v', create_np_array_typed([0.1, 0.1], 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'b', 'v', create_np_array_typed([0.1, 0.2], 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'c', 'v', create_np_array_typed([0.1, 0.3], 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'd', 'v', create_np_array_typed([0.1, 0.4], 'FLOAT32').tobytes())
+
+    query_vec = create_np_array_typed([0.1, 0.1], 'FLOAT32')
+    actual_res = env.expect('FT.SEARCH', 'idx', '*=>[KNN 4 @v $blob AS dist]', 'PARAMS', '2',
+                            'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist').res
+    env.assertGreaterEqual(actual_res[0], 3, message='TQ-FLAT/L2')
+    env.assertEqual(actual_res[1], 'a', message='TQ-FLAT/L2')
+    env.assertTrue('b' in actual_res, message='TQ-FLAT/L2')
+
+    range_dist = spatial.distance.sqeuclidean(np.array([0.1, 0.4]), query_vec) + EPSILONS['FLOAT32']
+    actual_res = env.expect('FT.SEARCH', 'idx', f'@v:[VECTOR_RANGE {range_dist} $blob]=>{{$yield_distance_as: dist}}',
+                            'PARAMS', '2', 'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist').res
+    env.assertGreaterEqual(actual_res[0], 1, message='TQ-FLAT/L2')
+    env.assertEqual(actual_res[1], 'a', message='TQ-FLAT/L2')
+
+    conn.execute_command('HSET', 'b', 'v', create_np_array_typed([0.1, 0.8], 'FLOAT32').tobytes())
+    query_vec = create_np_array_typed([0.1, 0.1], 'FLOAT32')
+    actual_res = env.expect('FT.SEARCH', 'idx', '*=>[KNN 4 @v $blob AS dist]', 'PARAMS', '2',
+                            'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist').res
+    env.assertGreaterEqual(actual_res[0], 3, message='TQ-FLAT/L2 update')
+    env.assertEqual(actual_res[1], 'a', message='TQ-FLAT/L2 update')
+    env.assertTrue('b' in actual_res, message='TQ-FLAT/L2 update')
+
+    conn.execute_command('DEL', 'b')
+    actual_res = env.expect('FT.SEARCH', 'idx', '*=>[KNN 4 @v $blob AS dist]', 'PARAMS', '2',
+                            'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist').res
+    env.assertGreaterEqual(actual_res[0], 3, message='TQ-FLAT/L2 delete')
+    env.assertEqual(actual_res[1], 'a', message='TQ-FLAT/L2 delete')
+    env.assertFalse('b' in actual_res, message='TQ-FLAT/L2 delete')
+
+    conn.execute_command('FT.DROPINDEX', 'idx', 'DD')
+
 
 def test_sanity_zero_results():
     env = Env(moduleArgs='DEFAULT_DIALECT 2')
@@ -241,6 +321,22 @@ def test_sanity_zero_results():
 
             # End of round cleanup
             conn.execute_command('FT.DROPINDEX', 'idx', 'DD')
+
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '6', 'TYPE', 'FLOAT32',
+               'DIM', dim, 'DISTANCE_METRIC', 'L2', 'n', 'NUMERIC').ok()
+    conn.execute_command('HSET', 'a', 'n', 0xa, 'v', create_np_array_typed(np.random.rand(dim), 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'b', 'n', 0xb, 'v', create_np_array_typed(np.random.rand(dim), 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'c', 'n', 0xc, 'v', create_np_array_typed(np.random.rand(dim), 'FLOAT32').tobytes())
+    conn.execute_command('HSET', 'd', 'n', 0xd, 'v', create_np_array_typed(np.random.rand(dim), 'FLOAT32').tobytes())
+
+    query_vec = create_np_array_typed(np.random.rand(dim), 'FLOAT32')
+    env.expect('FT.SEARCH', 'idx', '*=>[KNN 0 @v $blob AS dist]', 'PARAMS', '2', 'blob', query_vec.tobytes()).equal([0])
+    env.expect('FT.SEARCH', 'idx', '*=>[KNN $K @v $blob AS dist]', 'PARAMS', '4', 'K', 0, 'blob', query_vec.tobytes()).equal([0])
+    env.expect('FT.SEARCH', 'idx', '*=>[KNN 0 @v $blob AS dist]', 'PARAMS', '2', 'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist', 'LIMIT', 0, 10).equal([0])
+    env.expect('FT.SEARCH', 'idx', '@n:[0 10]=>[KNN 0 @v $blob AS dist]', 'PARAMS', '2', 'blob', query_vec.tobytes()).equal([0])
+    env.expect('FT.SEARCH', 'idx', '@n:[0 10]=>[KNN $K @v $blob AS dist]', 'PARAMS', '4', 'K', 0, 'blob', query_vec.tobytes()).equal([0])
+    env.expect('FT.SEARCH', 'idx', '@n:[0 10]=>[KNN 0 @v $blob AS dist]', 'PARAMS', '2', 'blob', query_vec.tobytes(), 'SORTBY', 'dist', 'RETURN', '1', 'dist', 'LIMIT', 0, 10).equal([0])
+    conn.execute_command('FT.DROPINDEX', 'idx', 'DD')
 
 
 def test_del_reuse():
@@ -532,6 +628,20 @@ def test_create_errors():
         .error().contains('Bad arguments for vector similarity FLAT index `INITIAL_CAP`')
     env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'FLAT', '10', 'TYPE', 'FLOAT32', 'DIM', '1024', 'DISTANCE_METRIC', 'IP', 'INITIAL_CAP', '10', 'BLOCK_SIZE', 'str') \
         .error().contains('Bad arguments for vector similarity FLAT index `BLOCK_SIZE`')
+    ## TQ-FLAT algorithm
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT').error().contains('Bad arguments for vector similarity number of parameters')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '6').error().contains('SEARCH_PARSE_ARGS Expected 6 parameters but got 0')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '2', 'SIZE').error().contains('Bad arguments for algorithm TQ-FLAT: SIZE')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '2', 'TYPE').error().contains('Bad arguments for vector similarity TQ-FLAT index `TYPE`')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '4', 'TYPE', 'FLOAT32', 'DIM').error().contains('Expected an argument, but none provided')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '4', 'DIM', '1024', 'DISTANCE_METRIC', 'IP').error().contains('Missing mandatory parameter: cannot create TQ-FLAT index without specifying TYPE argument')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '4', 'TYPE', 'FLOAT32', 'DISTANCE_METRIC', 'IP').error().contains('Missing mandatory parameter: cannot create TQ-FLAT index without specifying DIM argument')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '4', 'TYPE', 'FLOAT32', 'DIM', '1024').error().contains('Missing mandatory parameter: cannot create TQ-FLAT index without specifying DISTANCE_METRIC argument')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '6', 'TYPE', 'FLOAT32', 'DIM', '1024', 'DISTANCE_METRIC').error().contains('Bad arguments for vector similarity TQ-FLAT index `DISTANCE_METRIC`')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '8', 'TYPE', 'FLOAT32', 'DIM', '1024', 'DISTANCE_METRIC', 'IP', 'BITS', '1', 'PROJECTIONS', '64') \
+        .error().contains('TQ-FLAT BITS must be between 2 and 16')
+    env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', '8', 'TYPE', 'FLOAT32', 'DIM', '1024', 'DISTANCE_METRIC', 'IP', 'BITS', '17', 'PROJECTIONS', '64') \
+        .error().contains('TQ-FLAT BITS must be between 2 and 16')
     env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'HNSW', '12', 'TYPE', 'FLOAT32', 'DIM', '1024', 'DISTANCE_METRIC', 'IP', 'INITIAL_CAP', 'str', 'M', '16', 'EF_CONSTRUCTION', '200') \
         .error().contains('Bad arguments for vector similarity HNSW index `INITIAL_CAP`')
     env.expect('FT.CREATE', 'idx', 'SCHEMA', 'v', 'VECTOR', 'HNSW', '12', 'TYPE', 'FLOAT32', 'DIM', '1024', 'DISTANCE_METRIC', 'IP', 'INITIAL_CAP', '100', 'M', 'str', 'EF_CONSTRUCTION', '200') \
@@ -1877,6 +1987,16 @@ def test_create_multi_value_json():
             env.expect('FT.CREATE', 'idx', 'ON', 'JSON', 'SCHEMA', path, 'AS', 'vec', 'VECTOR', algo,
                        '6', 'TYPE', 'FLOAT32', 'DIM', dim, 'DISTANCE_METRIC', 'L2',).ok()
             env.assertEqual(to_dict(env.cmd(debug_cmd(), "VECSIM_INFO", "idx", "vec"))['IS_MULTI_VALUE'], 0, message=f'{algo}, {path}')
+
+    conn.flushall()
+    env.expect('FT.CREATE', 'idx', 'ON', 'JSON', 'SCHEMA', '$.path.to.vec', 'AS', 'vec', 'VECTOR', 'TQ-FLAT',
+               str(len(_tq_flat_params(dim=dim))), *_tq_flat_params(dim=dim)).ok()
+    env.assertEqual(to_dict(env.cmd(debug_cmd(), "VECSIM_INFO", "idx", "vec"))['IS_MULTI_VALUE'], 0, message='TQ-FLAT, single-value JSON path')
+
+    conn.flushall()
+    env.expect('FT.CREATE', 'idx', 'ON', 'JSON', 'SCHEMA', '$.vecs[*]', 'AS', 'vec', 'VECTOR', 'TQ-FLAT',
+               str(len(_tq_flat_params(dim=dim))), *_tq_flat_params(dim=dim)).error().contains(
+                'TQ-FLAT does not support multi-value vectors')
 
 @skip(no_json=True)
 def test_index_multi_value_json():
