@@ -789,6 +789,31 @@ static int parseVectorField_validate_tq(VecSimParams *params, QueryError *status
   return 1;
 }
 
+static int parseVectorField_validate_tq_hnsw(VecSimParams *params, QueryError *status) {
+  if (params->algoParams.tqHnswParams.type != VecSimType_FLOAT32) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ-HNSW only supports FLOAT32 vectors");
+    return 0;
+  }
+
+  size_t elementSize = VecSimIndex_EstimateElementSize(params);
+  size_t maxBlockSize = BLOCK_MEMORY_LIMIT / elementSize;
+  params->algoParams.tqHnswParams.blockSize = MIN(DEFAULT_BLOCK_SIZE, maxBlockSize);
+  if (params->algoParams.tqHnswParams.blockSize == 0) {
+    QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_LIMIT, "Vector index element size",
+      " %zu exceeded maximum size allowed by server limit which is %zu", elementSize, maxBlockSize);
+    return 0;
+  }
+
+  size_t index_size_estimation = VecSimIndex_EstimateInitialSize(params);
+  index_size_estimation += elementSize * params->algoParams.tqHnswParams.blockSize;
+
+  RedisModule_Log(RSDummyContext, REDISMODULE_LOGLEVEL_NOTICE,
+    "Creating vector index of type TQ-HNSW. Required memory for a block of %zu vectors: %zuB",
+    params->algoParams.tqHnswParams.blockSize, index_size_estimation);
+  return 1;
+}
+
 static int parseVectorField_validate_svs(VecSimParams *params, QueryError *status) {
   size_t elementSize = VecSimIndex_EstimateElementSize(params);
   // Calculating max block size (in # of vectors), according to memory limits
@@ -819,6 +844,8 @@ int VecSimIndex_validate_params(RedisModuleCtx *ctx, VecSimParams *params, Query
     valid = parseVectorField_validate_flat(params, status);
   } else if (VecSimAlgo_TQ == params->algo) {
     valid = parseVectorField_validate_tq(params, status);
+  } else if (VecSimAlgo_TQ_HNSW == params->algo) {
+    valid = parseVectorField_validate_tq_hnsw(params, status);
   } else if (VecSimAlgo_SVS == params->algo) {
     valid = parseVectorField_validate_svs(params, status);
   } else if (VecSimAlgo_TIERED == params->algo) {
@@ -1171,6 +1198,141 @@ static int parseVectorField_tq(FieldSpec *fs, VecSimParams *params, ArgsCursor *
   return parseVectorField_validate_tq(params, status);
 }
 
+static int parseVectorField_tq_hnsw(FieldSpec *fs, VecSimParams *params, ArgsCursor *ac, QueryError *status) {
+  int rc;
+
+  bool mandtype = false;
+  bool mandsize = false;
+  bool mandmetric = false;
+
+  size_t expNumParam, numParam = 0;
+  if ((rc = AC_GetSize(ac, &expNumParam, 0)) != AC_OK) {
+    QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS, "Bad arguments",
+                                  " for vector similarity number of parameters: %s",
+                                  AC_Strerror(rc));
+    return 0;
+  } else if (expNumParam % 2) {
+    QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS,
+      "Bad number of arguments for vector similarity index",
+      ": got %d but expected even number as algorithm parameters (should be submitted as named arguments)",
+      expNumParam);
+    return 0;
+  } else {
+    expNumParam /= 2;
+  }
+
+  while (expNumParam > numParam && !AC_IsAtEnd(ac)) {
+    if (AC_AdvanceIfMatch(ac, VECSIM_TYPE)) {
+      if ((rc = parseVectorField_GetType(ac, &params->algoParams.tqHnswParams.type)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_TYPE), rc);
+        return 0;
+      }
+      mandtype = true;
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_DIM)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.dim, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_DIM), rc);
+        return 0;
+      }
+      mandsize = true;
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_DISTANCE_METRIC)) {
+      if ((rc = parseVectorField_GetMetric(ac, &params->algoParams.tqHnswParams.metric)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_DISTANCE_METRIC), rc);
+        return 0;
+      }
+      mandmetric = true;
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_INITIAL_CAP)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.initialCapacity, 0)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_INITIAL_CAP), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_BLOCKSIZE)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.blockSize, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_BLOCKSIZE), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_BITS)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.bits, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_BITS), rc);
+        return 0;
+      }
+      if (params->algoParams.tqHnswParams.bits < 2 || params->algoParams.tqHnswParams.bits > 16) {
+        QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                            "TQ-HNSW BITS must be between 2 and 16");
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_PROJECTIONS)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.projections, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_PROJECTIONS), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_SEED)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.seed, 0)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_SEED), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_ROTATION)) {
+      if ((rc = parseVectorField_GetRotation(ac, &params->algoParams.tqHnswParams.useRotation)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_ROTATION), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_M)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.M, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_M), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_EFCONSTRUCTION)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.efConstruction, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_EFCONSTRUCTION), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_EFRUNTIME)) {
+      if ((rc = AC_GetSize(ac, &params->algoParams.tqHnswParams.efRuntime, AC_F_GE1)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_EFRUNTIME), rc);
+        return 0;
+      }
+    } else if (AC_AdvanceIfMatch(ac, VECSIM_EPSILON)) {
+      if ((rc = AC_GetDouble(ac, &params->algoParams.tqHnswParams.epsilon, AC_F_GE0)) != AC_OK) {
+        QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_TQ_HNSW, VECSIM_EPSILON), rc);
+        return 0;
+      }
+    } else {
+      QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS, "Bad arguments for algorithm",
+                                    " %s: %s", VECSIM_ALGORITHM_TQ_HNSW, AC_GetStringNC(ac, NULL));
+      return 0;
+    }
+    numParam++;
+  }
+  if (expNumParam > numParam) {
+    QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                                     "Expected %d parameters but got %d", expNumParam * 2,
+                                     numParam * 2);
+    return 0;
+  }
+  if (!mandtype) {
+    VECSIM_ERR_MANDATORY(status, VECSIM_ALGORITHM_TQ_HNSW, VECSIM_TYPE);
+    return 0;
+  }
+  if (!mandsize) {
+    VECSIM_ERR_MANDATORY(status, VECSIM_ALGORITHM_TQ_HNSW, VECSIM_DIM);
+    return 0;
+  }
+  if (!mandmetric) {
+    VECSIM_ERR_MANDATORY(status, VECSIM_ALGORITHM_TQ_HNSW, VECSIM_DISTANCE_METRIC);
+    return 0;
+  }
+  if (params->algoParams.tqHnswParams.bits == 0) {
+    params->algoParams.tqHnswParams.bits = 8;
+  }
+  if (params->algoParams.tqHnswParams.projections == 0) {
+    params->algoParams.tqHnswParams.projections = MAX(1, params->algoParams.tqHnswParams.dim / 2);
+  }
+
+  fs->vectorOpts.expBlobSize =
+      params->algoParams.tqHnswParams.dim * VecSimType_sizeof(params->algoParams.tqHnswParams.type);
+
+  return parseVectorField_validate_tq_hnsw(params, status);
+}
+
 static int parseVectorField_svs(FieldSpec *fs, TieredIndexParams *tieredParams, ArgsCursor *ac, QueryError *status) {
   int rc;
 
@@ -1457,6 +1619,27 @@ static int parseVectorField(IndexSpec *sp, StrongRef sp_ref, FieldSpec *fs, Args
     fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.useRotation = true;
     fs->vectorOpts.vecSimParams.algoParams.tqFlatParams.multi = multi;
     result = parseVectorField_tq(fs, &fs->vectorOpts.vecSimParams, ac, status);
+  } else if (STR_EQCASE(algStr, len, VECSIM_ALGORITHM_TQ_HNSW)) {
+    if (isSpecOnDiskForValidation(sp)) {
+      QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_INVAL,
+        "Disk index does not support TQ-HNSW algorithm");
+      rm_free(logCtx);
+      fs->vectorOpts.vecSimParams.logCtx = NULL;
+      return 0;
+    }
+    fs->vectorOpts.vecSimParams.algo = VecSimAlgo_TQ_HNSW;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.initialCapacity = SIZE_MAX;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.blockSize = 0;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.bits = 8;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.projections = 0;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.seed = 7;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.useRotation = true;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.M = HNSW_DEFAULT_M;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.efConstruction = HNSW_DEFAULT_EF_C;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.efRuntime = HNSW_DEFAULT_EF_RT;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.epsilon = HNSW_DEFAULT_EPSILON;
+    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.multi = multi;
+    result = parseVectorField_tq_hnsw(fs, &fs->vectorOpts.vecSimParams, ac, status);
   } else if (STR_EQCASE(algStr, len, VECSIM_ALGORITHM_HNSW)) {
     fs->vectorOpts.vecSimParams.algo = VecSimAlgo_TIERED;
     VecSim_TieredParams_Init(&fs->vectorOpts.vecSimParams.algoParams.tieredParams, sp_ref);
@@ -2838,6 +3021,7 @@ static int FieldSpec_RdbLoad(RedisModuleIO *rdb, FieldSpec *f, StrongRef sp_ref,
         f->vectorOpts.expBlobSize = f->vectorOpts.vecSimParams.algoParams.bfParams.dim * VecSimType_sizeof(f->vectorOpts.vecSimParams.algoParams.bfParams.type);
         break;
       case VecSimAlgo_TQ:
+      case VecSimAlgo_TQ_HNSW:
         goto fail;  // tq-flat is not supported in old encvers
       case VecSimAlgo_TIERED:
         if (f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_HNSWLIB) {

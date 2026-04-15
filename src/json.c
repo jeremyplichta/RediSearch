@@ -286,8 +286,11 @@ int JSON_StoreSingleVectorInDocField(FieldSpec *fs, RedisJSON arr, struct Docume
       dim = params->algoParams.bfParams.dim;
       break;
     case VecSimAlgo_TQ:
-      type = params->algoParams.tqFlatParams.type;
-      dim = params->algoParams.tqFlatParams.dim;
+    case VecSimAlgo_TQ_HNSW:
+      type = params->algo == VecSimAlgo_TQ ? params->algoParams.tqFlatParams.type
+                                           : params->algoParams.tqHnswParams.type;
+      dim = params->algo == VecSimAlgo_TQ ? params->algoParams.tqFlatParams.dim
+                                          : params->algoParams.tqHnswParams.dim;
       break;
     case VecSimAlgo_SVS:
       type = params->algoParams.svsParams.type;
@@ -350,9 +353,13 @@ switch (params->algo) {
       multi = params->algoParams.bfParams.multi;
       break;
     case VecSimAlgo_TQ:
-      type = params->algoParams.tqFlatParams.type;
-      dim = params->algoParams.tqFlatParams.dim;
-      multi = params->algoParams.tqFlatParams.multi;
+    case VecSimAlgo_TQ_HNSW:
+      type = params->algo == VecSimAlgo_TQ ? params->algoParams.tqFlatParams.type
+                                           : params->algoParams.tqHnswParams.type;
+      dim = params->algo == VecSimAlgo_TQ ? params->algoParams.tqFlatParams.dim
+                                          : params->algoParams.tqHnswParams.dim;
+      multi = params->algo == VecSimAlgo_TQ ? params->algoParams.tqFlatParams.multi
+                                            : params->algoParams.tqHnswParams.multi;
       break;
     case VecSimAlgo_SVS:
       type = params->algoParams.svsParams.type;

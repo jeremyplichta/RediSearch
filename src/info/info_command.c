@@ -222,6 +222,19 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
         REPLY_KVINT("projections", algo_params.tqFlatParams.projections);
         REPLY_KVINT("seed", algo_params.tqFlatParams.seed);
         REPLY_KVSTR("rotation", algo_params.tqFlatParams.useRotation ? "ON" : "OFF");
+      } else if (field_algo == VecSimAlgo_TQ_HNSW) {
+        REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(field_algo));
+        REPLY_KVSTR("data_type", VecSimType_ToString(algo_params.tqHnswParams.type));
+        REPLY_KVINT("dim", algo_params.tqHnswParams.dim);
+        REPLY_KVSTR("distance_metric", VecSimMetric_ToString(algo_params.tqHnswParams.metric));
+        REPLY_KVINT("bits", algo_params.tqHnswParams.bits);
+        REPLY_KVINT("projections", algo_params.tqHnswParams.projections);
+        REPLY_KVINT("seed", algo_params.tqHnswParams.seed);
+        REPLY_KVSTR("rotation", algo_params.tqHnswParams.useRotation ? "ON" : "OFF");
+        REPLY_KVINT("M", algo_params.tqHnswParams.M);
+        REPLY_KVINT("ef_construction", algo_params.tqHnswParams.efConstruction);
+        REPLY_KVINT("ef_runtime", algo_params.tqHnswParams.efRuntime);
+        REPLY_KVNUM("epsilon", algo_params.tqHnswParams.epsilon);
       }
     }
     if (has_map) {
