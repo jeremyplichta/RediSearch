@@ -207,6 +207,20 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
               REPLY_KVINT("reduced_dim", svs_params.leanvec_dim);
             }
           }
+        } else if (primary_params->algo == VecSimAlgo_TQ_HNSW) {
+          REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(primary_params->algo));
+          TQHNSWParams tq_hnsw_params = primary_params->algoParams.tqHnswParams;
+          REPLY_KVSTR("data_type", VecSimType_ToString(tq_hnsw_params.type));
+          REPLY_KVINT("dim", tq_hnsw_params.dim);
+          REPLY_KVSTR("distance_metric", VecSimMetric_ToString(tq_hnsw_params.metric));
+          REPLY_KVINT("bits", tq_hnsw_params.bits);
+          REPLY_KVINT("projections", tq_hnsw_params.projections);
+          REPLY_KVINT("seed", tq_hnsw_params.seed);
+          REPLY_KVSTR("rotation", tq_hnsw_params.useRotation ? "ON" : "OFF");
+          REPLY_KVINT("M", tq_hnsw_params.M);
+          REPLY_KVINT("ef_construction", tq_hnsw_params.efConstruction);
+          REPLY_KVINT("ef_runtime", tq_hnsw_params.efRuntime);
+          REPLY_KVNUM("epsilon", tq_hnsw_params.epsilon);
         }
       } else if (field_algo == VecSimAlgo_BF) {
         REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(field_algo));

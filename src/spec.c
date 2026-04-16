@@ -1627,19 +1627,25 @@ static int parseVectorField(IndexSpec *sp, StrongRef sp_ref, FieldSpec *fs, Args
       fs->vectorOpts.vecSimParams.logCtx = NULL;
       return 0;
     }
-    fs->vectorOpts.vecSimParams.algo = VecSimAlgo_TQ_HNSW;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.initialCapacity = SIZE_MAX;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.blockSize = 0;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.bits = 8;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.projections = 0;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.seed = 7;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.useRotation = true;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.M = HNSW_DEFAULT_M;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.efConstruction = HNSW_DEFAULT_EF_C;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.efRuntime = HNSW_DEFAULT_EF_RT;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.epsilon = HNSW_DEFAULT_EPSILON;
-    fs->vectorOpts.vecSimParams.algoParams.tqHnswParams.multi = multi;
-    result = parseVectorField_tq_hnsw(fs, &fs->vectorOpts.vecSimParams, ac, status);
+    fs->vectorOpts.vecSimParams.algo = VecSimAlgo_TIERED;
+    VecSim_TieredParams_Init(&fs->vectorOpts.vecSimParams.algoParams.tieredParams, sp_ref);
+    fs->vectorOpts.vecSimParams.algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold = 0;
+
+    VecSimParams *params = fs->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams;
+    params->algo = VecSimAlgo_TQ_HNSW;
+    params->algoParams.tqHnswParams.initialCapacity = SIZE_MAX;
+    params->algoParams.tqHnswParams.blockSize = 0;
+    params->algoParams.tqHnswParams.bits = 8;
+    params->algoParams.tqHnswParams.projections = 0;
+    params->algoParams.tqHnswParams.seed = 7;
+    params->algoParams.tqHnswParams.useRotation = true;
+    params->algoParams.tqHnswParams.M = HNSW_DEFAULT_M;
+    params->algoParams.tqHnswParams.efConstruction = HNSW_DEFAULT_EF_C;
+    params->algoParams.tqHnswParams.efRuntime = HNSW_DEFAULT_EF_RT;
+    params->algoParams.tqHnswParams.epsilon = HNSW_DEFAULT_EPSILON;
+    params->algoParams.tqHnswParams.multi = multi;
+    params->logCtx = logCtx;
+    result = parseVectorField_tq_hnsw(fs, params, ac, status);
   } else if (STR_EQCASE(algStr, len, VECSIM_ALGORITHM_HNSW)) {
     fs->vectorOpts.vecSimParams.algo = VecSimAlgo_TIERED;
     VecSim_TieredParams_Init(&fs->vectorOpts.vecSimParams.algoParams.tieredParams, sp_ref);

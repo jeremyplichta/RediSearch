@@ -13,6 +13,23 @@ def _tq_schema_params(dim=2, metric="L2", bits=8, projections=4, seed=7, rotatio
     ]
 
 
+def _tq_hnsw_schema_params(dim=2, metric="L2", bits=8, projections=4, seed=7, rotation="ON",
+                           m=16, ef_construction=200, ef_runtime=50):
+    return _tq_schema_params(dim, metric, bits, projections, seed, rotation) + [
+        "M", m,
+        "EF_CONSTRUCTION", ef_construction,
+        "EF_RUNTIME", ef_runtime,
+    ]
+
+
+def _field_stats_by_identifier(info, identifier):
+    for field_stats in info["field statistics"]:
+        field_stats = to_dict(field_stats)
+        if field_stats["identifier"] == identifier:
+            return field_stats
+    raise AssertionError(f"missing field statistics for {identifier}")
+
+
 @skip(no_json=True)
 def test_tq_flat_json_single_and_multi_value():
     env = Env(moduleArgs="DEFAULT_DIALECT 2")
@@ -121,3 +138,70 @@ def test_tq_flat_rejects_non_float32():
     conn.flushall()
     env.expect("FT.CREATE", "idx_tq_reject", "SCHEMA", "v", "VECTOR", "TQ-FLAT", len(params), *params) \
         .error().contains("TQ-FLAT only supports FLOAT32 vectors")
+
+
+def test_tq_hnsw_info_and_knn():
+    env = Env(moduleArgs="DEFAULT_DIALECT 2")
+    conn = getConnectionByEnv(env)
+
+    params = _tq_hnsw_schema_params(metric="COSINE")
+    conn.flushall()
+    env.expect("FT.CREATE", "idx_tq_hnsw_info", "SCHEMA", "v", "VECTOR", "TQ-HNSW", len(params), *params).ok()
+    waitForIndex(env, "idx_tq_hnsw_info")
+
+    info = to_dict(env.executeCommand("FT.INFO", "idx_tq_hnsw_info"))
+    attr = to_dict(info["attributes"][0])
+    env.assertEqual(attr["identifier"], "v")
+    env.assertEqual(attr["type"], "VECTOR")
+    env.assertEqual(attr["algorithm"], "TQ-HNSW")
+    env.assertEqual(attr["data_type"], "FLOAT32")
+    env.assertEqual(attr["dim"], 2)
+    env.assertEqual(attr["distance_metric"], "COSINE")
+    env.assertEqual(attr["bits"], 8)
+    env.assertEqual(attr["projections"], 4)
+    env.assertEqual(attr["seed"], 7)
+    env.assertEqual(attr["rotation"], "ON")
+    env.assertEqual(attr["M"], 16)
+    env.assertEqual(attr["ef_construction"], 200)
+    env.assertEqual(attr["ef_runtime"], 50)
+
+    conn.execute_command("HSET", "doc:1", "v", np.array([1.0, 0.0], dtype=np.float32).tobytes())
+    conn.execute_command("HSET", "doc:2", "v", np.array([0.0, 1.0], dtype=np.float32).tobytes())
+    waitForIndex(env, "idx_tq_hnsw_info")
+
+    query = np.array([1.0, 0.0], dtype=np.float32).tobytes()
+    res = env.cmd(
+        "FT.SEARCH", "idx_tq_hnsw_info", "*=>[KNN 2 @v $blob AS dist]",
+        "PARAMS", "2", "blob", query,
+        "SORTBY", "dist",
+        "RETURN", "1", "dist",
+        "DIALECT", "2",
+    )
+    env.assertEqual(res[0], 2)
+    env.assertEqual(res[1], "doc:1")
+    conn.execute_command("FT.DROPINDEX", "idx_tq_hnsw_info", "DD")
+
+
+def test_tq_hnsw_uses_tiered_flat_buffer():
+    env = Env(moduleArgs="DEFAULT_DIALECT 2 WORKERS 1")
+    conn = getConnectionByEnv(env)
+
+    params = _tq_hnsw_schema_params(dim=256, metric="COSINE", projections=64)
+    conn.flushall()
+    env.expect("FT.CREATE", "idx_tq_hnsw_tiered", "SCHEMA", "v", "VECTOR", "TQ-HNSW", len(params), *params).ok()
+    waitForIndex(env, "idx_tq_hnsw_tiered")
+
+    pipe = conn.pipeline(transaction=False)
+    for i in range(200):
+        vec = np.random.default_rng(i).random(256, dtype=np.float32).tobytes()
+        pipe.execute_command("HSET", f"doc:{i}", "v", vec)
+    pipe.execute()
+
+    info = to_dict(env.executeCommand("FT.INFO", "idx_tq_hnsw_tiered"))
+    field_stats = _field_stats_by_identifier(info, "v")
+    env.assertGreater(field_stats["flat_buffer_size"], 0)
+    env.assertEqual(field_stats["direct_hnsw_insertions"], 0)
+
+    env.assertEqual(info["num_docs"], 200)
+
+    conn.execute_command("FT.DROPINDEX", "idx_tq_hnsw_tiered", "DD")

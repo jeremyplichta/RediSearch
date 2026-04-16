@@ -429,6 +429,22 @@ void VecSim_RdbSave(RedisModuleIO *rdb, VecSimParams *vecsimParams) {
       RedisModule_SaveUnsigned(rdb, primaryParams->efConstruction);
       RedisModule_SaveUnsigned(rdb, primaryParams->efRuntime);
       RedisModule_SaveDouble(rdb, primaryParams->epsilon);
+    } else if (vecsimParams->algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_TQ_HNSW) {
+      RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold);
+      TQHNSWParams *primaryParams = &vecsimParams->algoParams.tieredParams.primaryIndexParams->algoParams.tqHnswParams;
+
+      RedisModule_SaveUnsigned(rdb, primaryParams->type);
+      RedisModule_SaveUnsigned(rdb, primaryParams->dim);
+      RedisModule_SaveUnsigned(rdb, primaryParams->metric);
+      RedisModule_SaveUnsigned(rdb, primaryParams->multi);
+      RedisModule_SaveUnsigned(rdb, primaryParams->bits);
+      RedisModule_SaveUnsigned(rdb, primaryParams->projections);
+      RedisModule_SaveUnsigned(rdb, primaryParams->seed);
+      RedisModule_SaveUnsigned(rdb, primaryParams->useRotation);
+      RedisModule_SaveUnsigned(rdb, primaryParams->M);
+      RedisModule_SaveUnsigned(rdb, primaryParams->efConstruction);
+      RedisModule_SaveUnsigned(rdb, primaryParams->efRuntime);
+      RedisModule_SaveDouble(rdb, primaryParams->epsilon);
     } else if (vecsimParams->algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_SVS) {
       RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tieredParams.specificParams.tieredSVSParams.trainingTriggerThreshold);
       SVSParams *primaryParams = &vecsimParams->algoParams.tieredParams.primaryIndexParams->algoParams.svsParams;
@@ -523,6 +539,21 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
       primaryParams->algoParams.hnswParams.efConstruction = LoadUnsigned_IOError(rdb, goto fail);
       primaryParams->algoParams.hnswParams.efRuntime = LoadUnsigned_IOError(rdb, goto fail);
       primaryParams->algoParams.hnswParams.epsilon = LoadDouble_IOError(rdb, goto fail);
+    } else if (primaryParams->algo == VecSimAlgo_TQ_HNSW) {
+      vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold = LoadUnsigned_IOError(rdb, goto fail);
+
+      primaryParams->algoParams.tqHnswParams.type = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.dim = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.metric = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.multi = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.bits = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.projections = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.seed = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.useRotation = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.M = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.efConstruction = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.efRuntime = LoadUnsigned_IOError(rdb, goto fail);
+      primaryParams->algoParams.tqHnswParams.epsilon = LoadDouble_IOError(rdb, goto fail);
     } else if (primaryParams->algo == VecSimAlgo_SVS) {
       vecsimParams->algoParams.tieredParams.specificParams.tieredSVSParams.trainingTriggerThreshold = LoadUnsigned_IOError(rdb, goto fail);
 
@@ -805,6 +836,9 @@ VecSimMetric getVecSimMetricFromVectorField(const FieldSpec *vectorField) {
       if (primary_params->algo == VecSimAlgo_HNSWLIB) {
         HNSWParams hnsw_params = primary_params->algoParams.hnswParams;
         return hnsw_params.metric;
+      } else if (primary_params->algo == VecSimAlgo_TQ_HNSW) {
+        TQHNSWParams tq_hnsw_params = primary_params->algoParams.tqHnswParams;
+        return tq_hnsw_params.metric;
       } else if (primary_params->algo == VecSimAlgo_SVS) {
         SVSParams svs_params = primary_params->algoParams.svsParams;
         return svs_params.metric;
