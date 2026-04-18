@@ -795,6 +795,11 @@ static int parseVectorField_validate_tq_hnsw(VecSimParams *params, QueryError *s
                         "TQ-HNSW only supports FLOAT32 vectors");
     return 0;
   }
+  if (params->algoParams.tqHnswParams.metric == VecSimMetric_L2) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ-HNSW with DISTANCE_METRIC L2 is not yet supported; use COSINE or IP");
+    return 0;
+  }
 
   size_t elementSize = VecSimIndex_EstimateElementSize(params);
   size_t maxBlockSize = BLOCK_MEMORY_LIMIT / elementSize;
