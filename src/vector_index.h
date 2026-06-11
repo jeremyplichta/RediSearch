@@ -27,6 +27,7 @@
 #define VECSIM_METRIC_COSINE "COSINE"
 
 #define VECSIM_ALGORITHM_BF "FLAT"
+// Internal-only names: TQ indexes are exposed to users as HNSW + COMPRESSION TQ<bits>.
 #define VECSIM_ALGORITHM_TQ "TQ-FLAT"
 #define VECSIM_ALGORITHM_TQ_HNSW "TQ-HNSW"
 #define VECSIM_ALGORITHM_HNSW "HNSW"
@@ -35,12 +36,6 @@
 
 #define VECSIM_INITIAL_CAP "INITIAL_CAP"
 #define VECSIM_BLOCKSIZE "BLOCK_SIZE"
-#define VECSIM_BITS "BITS"
-#define VECSIM_PROJECTIONS "PROJECTIONS"
-#define VECSIM_SEED "SEED"
-#define VECSIM_ROTATION "ROTATION"
-#define VECSIM_ROTATION_ON "ON"
-#define VECSIM_ROTATION_OFF "OFF"
 #define VECSIM_M "M"
 #define VECSIM_EFCONSTRUCTION "EF_CONSTRUCTION"
 #define VECSIM_EFRUNTIME "EF_RUNTIME"
@@ -71,6 +66,9 @@
 #define VECSIM_LVQ_4X8 "LVQ4x8"
 #define VECSIM_LEANVEC_4X8 "LeanVec4x8"
 #define VECSIM_LEANVEC_8X8 "LeanVec8x8"
+#define VECSIM_TQ_2 "TQ2"
+#define VECSIM_TQ_4 "TQ4"
+#define VECSIM_TQ_8 "TQ8"
 #define VECSIM_TRAINING_THRESHOLD "TRAINING_THRESHOLD"
 #define VECSIM_REDUCED_DIM "REDUCE"
 #define VECSIM_RERANK "RERANK"
@@ -173,6 +171,7 @@ const char *VecSimMetric_ToString(VecSimMetric metric);
 const char *VecSimAlgorithm_ToString(VecSimAlgo algo);
 const char *VecSimSearchMode_ToString(VecSearchMode vecsimSearchMode);
 const char *VecSimSvsCompression_ToString(VecSimSvsQuantBits quantBits);
+const char *VecSimTqCompression_ToString(size_t bits);
 const char *VecSimSearchHistory_ToString(VecSimOptionMode option);
 bool VecSim_IsLeanVecCompressionType(VecSimSvsQuantBits quantBits);
 bool isLVQSupported();

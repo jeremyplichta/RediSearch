@@ -116,7 +116,7 @@ def testRDBCompatibility_vecsim():
 
 
 @skip(cluster=True)
-def testRDBCompatibility_tq_flat():
+def testRDBCompatibility_tq():
     env = Env(moduleArgs='DEFAULT_DIALECT 2 MIN_OPERATION_WORKERS 0')
     conn = env.getConnection()
     index_name = 'idx_tq_rdb_compat'
@@ -127,20 +127,18 @@ def testRDBCompatibility_tq_flat():
     params = [
         'TYPE', 'FLOAT32',
         'DIM', 2,
-        'DISTANCE_METRIC', 'L2',
-        'BITS', 8,
-        'PROJECTIONS', 4,
-        'SEED', 7,
-        'ROTATION', 'ON',
+        'DISTANCE_METRIC', 'COSINE',
+        'COMPRESSION', 'TQ8',
     ]
 
-    env.expect('FT.CREATE', index_name, 'SCHEMA', 'v', 'VECTOR', 'TQ-FLAT', len(params), *params).ok()
-    conn.execute_command('HSET', doc_ids[0], 'v', np.array([0.0, 0.0], dtype=np.float32).tobytes())
-    conn.execute_command('HSET', doc_ids[1], 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
+    env.expect('FT.CREATE', index_name, 'SCHEMA', 'v', 'VECTOR', 'HNSW', len(params), *params).ok()
+    conn.execute_command('HSET', doc_ids[0], 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
+    conn.execute_command('HSET', doc_ids[1], 'v', np.array([0.0, 1.0], dtype=np.float32).tobytes())
     waitForIndex(env, index_name)
 
+    query = np.array([1.0, 0.0], dtype=np.float32).tobytes()
     before = env.cmd('FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
-                     'PARAMS', '2', 'blob', np.array([0.0, 0.0], dtype=np.float32).tobytes(),
+                     'PARAMS', '2', 'blob', query,
                      'SORTBY', 'dist', 'RETURN', '1', 'dist', 'DIALECT', '2')
     env.assertEqual(before[1], doc_ids[0])
     env.assertEqual(before[3], doc_ids[1])
@@ -150,14 +148,11 @@ def testRDBCompatibility_tq_flat():
 
     info = to_dict(env.cmd('FT.INFO', index_name))
     attr = to_dict(info['attributes'][0])
-    env.assertEqual(attr['algorithm'], 'TQ-FLAT')
-    env.assertEqual(attr['bits'], 8)
-    env.assertEqual(attr['projections'], 4)
-    env.assertEqual(attr['seed'], 7)
-    env.assertEqual(attr['rotation'], 'ON')
+    env.assertEqual(attr['algorithm'], 'HNSW')
+    env.assertEqual(attr['compression'], 'TQ8')
 
     after = env.cmd('FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
-                    'PARAMS', '2', 'blob', np.array([0.0, 0.0], dtype=np.float32).tobytes(),
+                    'PARAMS', '2', 'blob', query,
                     'SORTBY', 'dist', 'RETURN', '1', 'dist', 'DIALECT', '2')
     env.assertEqual(after[1], doc_ids[0])
     env.assertEqual(after[3], doc_ids[1])

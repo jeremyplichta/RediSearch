@@ -41,7 +41,6 @@ typedef struct {
   size_t numTagFieldsCaseSensitive;
   size_t numVectorFields;
   size_t numVectorFieldsFlat;
-  size_t numVectorFieldsTqFlat;
   size_t numVectorFieldsHNSW;
   size_t numVectorFieldsSvsVamana;
   size_t numVectorFieldsSvsVamanaCompressed;

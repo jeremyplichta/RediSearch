@@ -215,47 +215,22 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
             }
           }
         } else if (primary_params->algo == VecSimAlgo_TQ_HNSW) {
-          REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(primary_params->algo));
+          // TQ-compressed HNSW is exposed to users as an HNSW index with COMPRESSION TQ<bits>;
+          // the remaining TurboQuant internals (projections, rotation, seed) are not reported.
+          REPLY_KVSTR("algorithm", VECSIM_ALGORITHM_HNSW);
           TQHNSWParams tq_hnsw_params = primary_params->algoParams.tqHnswParams;
           REPLY_KVSTR("data_type", VecSimType_ToString(tq_hnsw_params.type));
           REPLY_KVINT("dim", tq_hnsw_params.dim);
           REPLY_KVSTR("distance_metric", VecSimMetric_ToString(tq_hnsw_params.metric));
-          REPLY_KVINT("bits", tq_hnsw_params.bits);
-          REPLY_KVINT("projections", tq_hnsw_params.projections);
-          REPLY_KVINT("seed", tq_hnsw_params.seed);
-          REPLY_KVSTR("rotation", tq_hnsw_params.useRotation ? "ON" : "OFF");
           REPLY_KVINT("M", tq_hnsw_params.M);
           REPLY_KVINT("ef_construction", tq_hnsw_params.efConstruction);
-          REPLY_KVINT("ef_runtime", tq_hnsw_params.efRuntime);
-          REPLY_KVNUM("epsilon", tq_hnsw_params.epsilon);
+          REPLY_KVSTR("compression", VecSimTqCompression_ToString(tq_hnsw_params.bits));
         }
       } else if (field_algo == VecSimAlgo_BF) {
         REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(field_algo));
         REPLY_KVSTR("data_type", VecSimType_ToString(algo_params.bfParams.type));
         REPLY_KVINT("dim", algo_params.bfParams.dim);
         REPLY_KVSTR("distance_metric", VecSimMetric_ToString(algo_params.bfParams.metric));
-      } else if (field_algo == VecSimAlgo_TQ) {
-        REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(field_algo));
-        REPLY_KVSTR("data_type", VecSimType_ToString(algo_params.tqFlatParams.type));
-        REPLY_KVINT("dim", algo_params.tqFlatParams.dim);
-        REPLY_KVSTR("distance_metric", VecSimMetric_ToString(algo_params.tqFlatParams.metric));
-        REPLY_KVINT("bits", algo_params.tqFlatParams.bits);
-        REPLY_KVINT("projections", algo_params.tqFlatParams.projections);
-        REPLY_KVINT("seed", algo_params.tqFlatParams.seed);
-        REPLY_KVSTR("rotation", algo_params.tqFlatParams.useRotation ? "ON" : "OFF");
-      } else if (field_algo == VecSimAlgo_TQ_HNSW) {
-        REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(field_algo));
-        REPLY_KVSTR("data_type", VecSimType_ToString(algo_params.tqHnswParams.type));
-        REPLY_KVINT("dim", algo_params.tqHnswParams.dim);
-        REPLY_KVSTR("distance_metric", VecSimMetric_ToString(algo_params.tqHnswParams.metric));
-        REPLY_KVINT("bits", algo_params.tqHnswParams.bits);
-        REPLY_KVINT("projections", algo_params.tqHnswParams.projections);
-        REPLY_KVINT("seed", algo_params.tqHnswParams.seed);
-        REPLY_KVSTR("rotation", algo_params.tqHnswParams.useRotation ? "ON" : "OFF");
-        REPLY_KVINT("M", algo_params.tqHnswParams.M);
-        REPLY_KVINT("ef_construction", algo_params.tqHnswParams.efConstruction);
-        REPLY_KVINT("ef_runtime", algo_params.tqHnswParams.efRuntime);
-        REPLY_KVNUM("epsilon", algo_params.tqHnswParams.epsilon);
       }
     }
     if (has_map) {

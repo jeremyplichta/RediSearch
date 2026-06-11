@@ -371,6 +371,15 @@ const char *VecSimSvsCompression_ToString(VecSimSvsQuantBits quantBits) {
 
 }
 
+const char *VecSimTqCompression_ToString(size_t bits) {
+  switch (bits) {
+    case 2: return VECSIM_TQ_2;
+    case 4: return VECSIM_TQ_4;
+    case 8: return VECSIM_TQ_8;
+    default: return NULL;
+  }
+}
+
 const char *VecSimSearchHistory_ToString(VecSimOptionMode option) {
     if (option == VecSimOption_ENABLE)
         return VECSIM_USE_SEARCH_HISTORY_ON;
@@ -390,30 +399,6 @@ void VecSim_RdbSave(RedisModuleIO *rdb, VecSimParams *vecsimParams) {
     RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.bfParams.dim);
     RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.bfParams.metric);
     RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.bfParams.multi);
-    break;
-  case VecSimAlgo_TQ:
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqFlatParams.type);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqFlatParams.dim);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqFlatParams.metric);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqFlatParams.multi);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqFlatParams.bits);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqFlatParams.projections);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqFlatParams.seed);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqFlatParams.useRotation);
-    break;
-  case VecSimAlgo_TQ_HNSW:
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.type);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.dim);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.metric);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.multi);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.bits);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.projections);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.seed);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.useRotation);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.M);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.efConstruction);
-    RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tqHnswParams.efRuntime);
-    RedisModule_SaveDouble(rdb, vecsimParams->algoParams.tqHnswParams.epsilon);
     break;
   case VecSimAlgo_TIERED:
     RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tieredParams.primaryIndexParams->algo);
@@ -463,7 +448,9 @@ void VecSim_RdbSave(RedisModuleIO *rdb, VecSimParams *vecsimParams) {
     break;
   case VecSimAlgo_HNSWLIB:
   case VecSimAlgo_SVS:
-    return; // Should not get here anymore.
+  case VecSimAlgo_TQ:
+  case VecSimAlgo_TQ_HNSW:
+    return; // Should not get here anymore. TQ indexes are always wrapped in a tiered index.
   }
 }
 
@@ -497,30 +484,6 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
     vecsimParams->algoParams.bfParams.dim = LoadUnsigned_IOError(rdb, goto fail);
     vecsimParams->algoParams.bfParams.metric = LoadUnsigned_IOError(rdb, goto fail);
     vecsimParams->algoParams.bfParams.multi = LoadUnsigned_IOError(rdb, goto fail);
-    break;
-  case VecSimAlgo_TQ:
-    vecsimParams->algoParams.tqFlatParams.type = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqFlatParams.dim = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqFlatParams.metric = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqFlatParams.multi = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqFlatParams.bits = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqFlatParams.projections = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqFlatParams.seed = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqFlatParams.useRotation = LoadUnsigned_IOError(rdb, goto fail);
-    break;
-  case VecSimAlgo_TQ_HNSW:
-    vecsimParams->algoParams.tqHnswParams.type = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.dim = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.metric = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.multi = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.bits = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.projections = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.seed = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.useRotation = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.M = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.efConstruction = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.efRuntime = LoadUnsigned_IOError(rdb, goto fail);
-    vecsimParams->algoParams.tqHnswParams.epsilon = LoadDouble_IOError(rdb, goto fail);
     break;
   case VecSimAlgo_TIERED:
     VecSim_TieredParams_Init(&vecsimParams->algoParams.tieredParams, sp_ref);
@@ -573,7 +536,9 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
     break;
   case VecSimAlgo_HNSWLIB:
   case VecSimAlgo_SVS:
-    goto fail; // We dont expect to see an HNSW/SVS index without a tiered index
+  case VecSimAlgo_TQ:
+  case VecSimAlgo_TQ_HNSW:
+    goto fail; // We dont expect to see an HNSW/SVS/TQ index without a tiered index
   }
 
   return VecSimIndex_validate_Rdb_parameters(rdb, vecsimParams);
@@ -603,7 +568,7 @@ int VecSim_RdbLoad_v3(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
     break;
   case VecSimAlgo_TQ:
   case VecSimAlgo_TQ_HNSW:
-    goto fail; // TQ-FLAT was added after tiered/RDB v3 support.
+    goto fail; // TQ compression was added after tiered/RDB v3 support.
   case VecSimAlgo_TIERED:
     VecSim_TieredParams_Init(&vecsimParams->algoParams.tieredParams, sp_ref);
     primaryParams = vecsimParams->algoParams.tieredParams.primaryIndexParams;
@@ -853,10 +818,6 @@ VecSimMetric getVecSimMetricFromVectorField(const FieldSpec *vectorField) {
     }
     case VecSimAlgo_BF:
       return algo_params.bfParams.metric;
-    case VecSimAlgo_TQ:
-      return algo_params.tqFlatParams.metric;
-    case VecSimAlgo_TQ_HNSW:
-      return algo_params.tqHnswParams.metric;
     default:
       RS_ABORT_ALWAYS("Unknown algorithm in vector index");
   }
