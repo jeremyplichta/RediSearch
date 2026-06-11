@@ -10,7 +10,7 @@
 #define SRC_FIELD_SPEC_H_
 
 #include "redisearch.h"
-#include "value.h"
+#include "query_error_ffi.h"
 #include "VecSim/vec_sim.h"
 #include "geometry/geometry_types.h"
 #include "info/index_error.h"
@@ -119,7 +119,12 @@ typedef struct FieldSpec {
       // expected size of vector blob.
       size_t expBlobSize;
       VecSimIndex *vecSimIndex;
-      // Disk index params (diskCtx.storage is non-NULL for disk-based indexes)
+      // Disk index params. diskCtx.indexName is non-NULL exactly when the
+      // field is disk-backed; diskCtx.storage is non-NULL only once the
+      // index spec is open and PopulateVectorDiskParams has run. During
+      // SST replication load, FieldSpec_RdbLoad populates indexName early
+      // (before sp->diskSpec exists) so the disk teardown path is selected
+      // even if the load aborts before storage is bound.
       VecSimDiskContext diskCtx;
     } vectorOpts;
     struct {

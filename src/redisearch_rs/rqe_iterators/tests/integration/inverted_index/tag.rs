@@ -9,9 +9,11 @@
 
 //! Tests for the tag inverted index iterator.
 
-use ffi::{IndexFlags_Index_DocIdsOnly, RS_FIELDMASK_ALL, t_docId};
-use inverted_index::{RSIndexResult, doc_ids_only::DocIdsOnly};
+use ffi::IndexFlags_Index_DocIdsOnly;
+use index_result::RSIndexResult;
+use inverted_index::doc_ids_only::DocIdsOnly;
 use query_term::RSQueryTerm;
+use rqe_core::{DocId, RS_FIELDMASK_ALL};
 use rqe_iterators::{IteratorType, NoOpChecker, RQEIterator, inverted_index::Tag};
 use rqe_iterators_test_utils::MockContext;
 
@@ -22,7 +24,7 @@ struct TagBaseTest {
 }
 
 impl TagBaseTest {
-    fn expected_record(doc_id: t_docId) -> RSIndexResult<'static> {
+    fn expected_record(doc_id: DocId) -> RSIndexResult<'static> {
         RSIndexResult::build_term()
             .doc_id(doc_id)
             .field_mask(RS_FIELDMASK_ALL)
@@ -123,7 +125,7 @@ mod not_miri {
     }
 
     impl TagRevalidateTest {
-        fn expected_record(doc_id: t_docId) -> RSIndexResult<'static> {
+        fn expected_record(doc_id: DocId) -> RSIndexResult<'static> {
             RSIndexResult::build_term()
                 .doc_id(doc_id)
                 .field_mask(RS_FIELDMASK_ALL)
@@ -179,15 +181,15 @@ mod not_miri {
         let mut it = test.create_iterator();
 
         // Verify the iterator works normally and read at least one document
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Ok
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Ok);
         assert!(it.read().expect("failed to read").is_some());
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Ok
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Ok);
 
         // Simulate the tag's inverted index being garbage collected and
         // recreated by replacing the TrieMap entry with a new inverted index.
@@ -216,10 +218,10 @@ mod not_miri {
 
         // Revalidate should return Aborted because the tag II no longer
         // points to the same index the reader was created from.
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Aborted
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Aborted);
 
         // SAFETY: `old_ii` was allocated by `NewInvertedIndex_Ex` (via `Box::new`)
         // and has not been freed. We are the sole owner after removing it from the TrieMap.
@@ -246,10 +248,10 @@ mod not_miri {
 
         // Read at least one document so the iterator has a position.
         assert!(it.read().expect("failed to read").is_some());
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Ok
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Ok);
 
         // Save the old II pointer so we can free it after the test.
         let old_ii: *mut inverted_index::opaque::InvertedIndex =
@@ -266,10 +268,10 @@ mod not_miri {
         assert!(old_val.is_some(), "test_tag should exist in the TrieMap");
 
         // `should_abort` sees the tag value is missing and returns true.
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Aborted
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Aborted);
 
         // SAFETY: `old_ii` was allocated by `NewInvertedIndex_Ex` (via `Box::new`)
         // and has not been freed. We are the sole owner after removing it from the TrieMap.

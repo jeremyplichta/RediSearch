@@ -37,13 +37,13 @@ set(LIBUV_BUILD_TESTS OFF CACHE BOOL "Build libuv tests" FORCE)
 set(LIBUV_BUILD_BENCH OFF CACHE BOOL "Build libuv benchmarks" FORCE)
 set(LIBUV_BUILD_SHARED OFF CACHE BOOL "Build shared libuv library" FORCE)
 add_subdirectory(${root}/deps/libuv ${CMAKE_CURRENT_BINARY_DIR}/libuv)
+
 # libuv has const-correctness issues that trigger warnings-as-errors on newer compilers.
-# gcc 16+: -Werror=discarded-qualifiers; clang 21+: -Werror=incompatible-pointer-types-discards-qualifiers.
-# Mirror the compiler guards from the top-level CMakeLists.txt.
-if(HAS_DISCARDED_QUALIFIERS)
+# Turn off flags set in the top-level CMakeLists.txt.
+if(HAS_WNO_ERROR_DISCARDED_QUALIFIERS)
     target_compile_options(uv_a PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wno-error=discarded-qualifiers>)
 endif()
-if(HAS_INCOMPATIBLE_POINTER_TYPES_DISCARDS_QUALIFIERS)
+if(HAS_WNO_ERROR_INCOMPATIBLE_POINTER_TYPES_DISCARDS_QUALIFIERS)
     target_compile_options(uv_a PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wno-error=incompatible-pointer-types-discards-qualifiers>)
 endif()
 
@@ -61,10 +61,8 @@ endif()
 add_subdirectory(geometry)
 add_subdirectory(buffer)
 add_subdirectory(iterators)
-add_subdirectory(wildcard)
 add_subdirectory(index_result)
 add_subdirectory(util/mempool)
-add_subdirectory(util/arr)
 add_subdirectory(util/dict)
 add_subdirectory(util/hash)
 add_subdirectory(coord)
@@ -72,7 +70,7 @@ add_subdirectory(ttl_table)
 
 #----------------------------------------------------------------------------------------------
 # Source files for the core library
-file(GLOB SOURCES
+file(GLOB SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/pipeline/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/aggregate/*.c"
@@ -88,6 +86,8 @@ file(GLOB SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/query_parser/v1/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/query_parser/v2/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/util/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/util/arr/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/wildcard/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/trie/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/info/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/info/info_redis/*.c"
@@ -101,8 +101,7 @@ file(GLOB SOURCES
     "${root}/deps/libnu/*.c"
     "${root}/deps/miniz/*.c"
     "${root}/deps/fast_float/*.c"
-    "${root}/deps/thpool/*.c"
-    "${root}/deps/geohash/*.c")
+    "${root}/deps/thpool/*.c")
 
 #----------------------------------------------------------------------------------------------
 # Create the rscore object library
@@ -114,11 +113,9 @@ endif()
 
 # Collect all object files
 set(FINAL_OBJECTS
-    $<TARGET_OBJECTS:arr>
     $<TARGET_OBJECTS:buffer>
     $<TARGET_OBJECTS:dict>
     $<TARGET_OBJECTS:iterators>
-    $<TARGET_OBJECTS:wildcard>
     $<TARGET_OBJECTS:index_result>
     $<TARGET_OBJECTS:mempool>
     $<TARGET_OBJECTS:rscore>
@@ -276,7 +273,7 @@ if(APPLE)
     # macOS: use libtool to merge static libraries
     add_custom_command(
         OUTPUT ${REDISEARCH_ALL_OUTPUT}
-        COMMAND libtool -static -o ${REDISEARCH_ALL_OUTPUT} ${LIBS_TO_MERGE}
+        COMMAND libtool -static -no_warning_for_no_symbols -o ${REDISEARCH_ALL_OUTPUT} ${LIBS_TO_MERGE}
         DEPENDS ${MERGE_DEPENDS}
         COMMENT "Creating unified libredisearch_all.a with libtool"
         VERBATIM

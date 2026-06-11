@@ -12,6 +12,7 @@
 #include "module.h"
 #include "rmutil/rm_assert.h"
 #include "obfuscation/obfuscation_api.h"
+#include "search_disk.h"
 
 #define MILLISECOND_IN_ONE_SECOND 1000
 #define NANOSECOND_IN_ONE_MILLISECOND 1000000
@@ -118,15 +119,25 @@ static inline timespec timespecFromMilliseconds(int64_t totalMilliseconds) {
   return result;
 }
 
-static inline t_expirationTimePoint getDocExpirationTime(RedisModuleCtx* ctx, RedisModuleKey *openedKey) {
-  t_expirationTimePoint zero = {.tv_sec = 0, .tv_nsec = 0};
+t_expirationTimePoint GetKeyExpirationTime(RedisModuleKey *openedKey) {
   mstime_t totalMilliseconds = RedisModule_GetAbsExpire(openedKey);
   if (totalMilliseconds == REDISMODULE_NO_EXPIRE) {
+    t_expirationTimePoint zero = {.tv_sec = 0, .tv_nsec = 0};
     return zero;
   }
+  return timespecFromMilliseconds(totalMilliseconds);
+}
 
-  t_expirationTimePoint result = timespecFromMilliseconds(totalMilliseconds);
-  return result;
+void Document_LoadHashFieldExpiration(RedisModuleKey *k, const FieldSpec *field,
+                                      size_t ii, arrayof(FieldExpiration) *out) {
+  mstime_t expireAt = REDISMODULE_NO_EXPIRE;
+  RedisModule_HashGet(k, REDISMODULE_HASH_CFIELDS | REDISMODULE_HASH_EXPIRE_TIME,
+                      HiddenString_GetUnsafe(field->fieldPath, NULL), &expireAt, NULL);
+  if (expireAt == REDISMODULE_NO_EXPIRE) {
+    return;
+  }
+  FieldExpiration fx = {.index = (t_fieldIndex)ii, .point = timespecFromMilliseconds(expireAt)};
+  array_ensure_append_1(*out, fx);
 }
 
 int Document_LoadSchemaFieldHash(Document *doc, RedisSearchCtx *sctx, QueryError *status) {
@@ -174,12 +185,7 @@ int Document_LoadSchemaFieldHash(Document *doc, RedisSearchCtx *sctx, QueryError
     }
 
     if (hasExpireTimeOnFields) {
-      mstime_t expireAt = REDISMODULE_NO_EXPIRE;
-      RedisModule_HashGet(k, REDISMODULE_HASH_CFIELDS | REDISMODULE_HASH_EXPIRE_TIME, HiddenString_GetUnsafe(field->fieldPath, NULL), &expireAt, NULL);
-      if (expireAt != REDISMODULE_NO_EXPIRE) {
-        FieldExpiration fieldExpiration = { .index = ii, .point = timespecFromMilliseconds(expireAt)};
-        array_ensure_append_1(doc->fieldExpirations, fieldExpiration);
-      }
+      Document_LoadHashFieldExpiration(k, field, ii, &doc->fieldExpirations);
     }
 
     size_t oix = doc->numFields++;
@@ -191,7 +197,7 @@ int Document_LoadSchemaFieldHash(Document *doc, RedisSearchCtx *sctx, QueryError
   }
 
   if (spec->monitorDocumentExpiration) {
-    doc->docExpirationTime = getDocExpirationTime(sctx->redisCtx, k);
+    doc->docExpirationTime = GetKeyExpirationTime(k);
   }
   rv = REDISMODULE_OK;
 done:
@@ -230,7 +236,7 @@ int Document_LoadSchemaFieldJson(Document *doc, RedisSearchCtx *sctx, QueryError
   }
 
   if (spec->monitorDocumentExpiration) {
-    doc->docExpirationTime = getDocExpirationTime(sctx->redisCtx, k);
+    doc->docExpirationTime = GetKeyExpirationTime(k);
   }
 
   RedisModule_CloseKey(k);
@@ -269,7 +275,7 @@ int Document_LoadSchemaFieldJson(Document *doc, RedisSearchCtx *sctx, QueryError
 
     // on crdt the return value might be the underline value, we must copy it!!!
     // TODO: change `fs->text` to support hash or json not RedisModuleString
-    if (JSON_LoadDocumentField(jsonIter, len, field, &doc->fields[oix], ctx, status) != REDISMODULE_OK) {
+    if (JSON_LoadDocumentField(jsonIter, len, field, &doc->fields[oix], ctx, SearchDisk_IsEnabledForValidation(), status) != REDISMODULE_OK) {
       FieldSpec_AddError(field, QueryError_GetDisplayableError(status, true), QueryError_GetDisplayableError(status, false), doc->docKey);
       char* path = FieldSpec_FormatPath(field, RSGlobalConfig.hideUserDataFromLog);
       RedisModule_Log(ctx, "verbose", "Failed to load value from field %s", path);
@@ -460,6 +466,8 @@ void Document_Clear(Document *d) {
 
 void Document_Free(Document *doc) {
   Document_Clear(doc);
+  array_free(doc->fieldExpirations);
+  doc->fieldExpirations = NULL;
   if (doc->flags & (DOCUMENT_F_OWNREFS | DOCUMENT_F_OWNSTRINGS)) {
     RedisModule_FreeString(RSDummyContext, doc->docKey);
   }

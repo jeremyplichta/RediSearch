@@ -10,20 +10,23 @@
 //! Supporting types for [`OptionalOptimized`].
 //!
 //! This is the optimized variant of the optional iterator. Instead of scanning
-//! all doc IDs from 1 to `maxDocId`, it uses a [`WildcardIterator`] over
+//! all doc IDs from 1 to `maxDocId`, it uses a [wildcard iterator](crate::wildcard) over
 //! `spec.existingDocs` to visit only real document IDs, yielding real or virtual
 //! results accordingly.
 
-use ffi::{RS_FIELDMASK_ALL, t_docId};
-use inverted_index::RSIndexResult;
+use index_result::RSIndexResult;
 
 use crate::{
-    RQEIterator, RQEIteratorError, RQEValidateStatus, SkipToOutcome, maybe_empty::MaybeEmpty,
-    optional::OptionalIterator, wildcard::WildcardIterator,
+    RQEIterator, RQEIteratorError, RQEValidateStatus, SkipToOutcome,
+    maybe_empty::MaybeEmpty,
+    profile_print::{ProfilePrint, ProfilePrintCtx},
+    wildcard::WildcardIterator,
 };
 
+use index_spec::IndexSpecReadGuard;
+use rqe_core::{DocId, RS_FIELDMASK_ALL};
 /// An iterator that emits results for all document IDs present in the index,
-/// driven by a [`WildcardIterator`] over the existing-documents inverted index.
+/// driven by a [wildcard iterator](crate::wildcard) over the existing-documents inverted index.
 ///
 /// For each doc ID that `wcii` yields:
 /// - If the query child also has a hit at that doc ID, a **real** result is
@@ -43,14 +46,14 @@ pub struct OptionalOptimized<'index, W, I> {
     /// Virtual result returned when `wcii` has a doc but `child` does not.
     virt: RSIndexResult<'index>,
     /// Inclusive upper bound (matches C `maxDocId`).
-    max_doc_id: t_docId,
+    max_doc_id: DocId,
     /// Weight applied to real results from `child`.
     weight: f64,
     /// Tracks the doc ID of the last result yielded.
     ///
     /// `0` in the initial state and after [`rewind`](RQEIterator::rewind),
     /// which is treated as virtual. Doc IDs start from 1, so 0 is a safe sentinel.
-    last_doc_id: t_docId,
+    last_doc_id: DocId,
     /// Whether the iterator has reached EOF.
     at_eof: bool,
 }
@@ -65,11 +68,6 @@ where
         self.child.as_ref()
     }
 
-    /// Takes the child iterator out, replacing it with an [`Empty`](crate::Empty) iterator.
-    pub fn take_child(&mut self) -> Option<I> {
-        self.child.take_iterator()
-    }
-
     /// Sets the child iterator.
     pub fn set_child(&mut self, child: I) {
         self.child = MaybeEmpty::new(child);
@@ -82,7 +80,7 @@ where
     /// * `child` — query child iterator that provides real hits.
     /// * `max_doc_id` — inclusive upper bound on doc IDs.
     /// * `weight` — applied to results produced by `child`.
-    pub fn new(wcii: W, child: I, max_doc_id: t_docId, weight: f64) -> Self {
+    pub fn new(wcii: W, child: I, max_doc_id: DocId, weight: f64) -> Self {
         Self {
             wcii,
             child: MaybeEmpty::new(child),
@@ -95,28 +93,6 @@ where
             last_doc_id: 0,
             at_eof: false,
         }
-    }
-}
-
-impl<'index, W> OptionalIterator<'index>
-    for OptionalOptimized<'index, W, Box<dyn RQEIterator<'index> + 'index>>
-where
-    W: WildcardIterator<'index>,
-{
-    fn child(&self) -> Option<&(dyn RQEIterator<'index> + 'index)> {
-        OptionalOptimized::child(self).map(|c| c.as_ref())
-    }
-
-    fn take_child(&mut self) -> Option<Box<dyn RQEIterator<'index> + 'index>> {
-        self.child.take_iterator()
-    }
-
-    fn set_child(&mut self, child: Box<dyn RQEIterator<'index> + 'index>) {
-        self.child = MaybeEmpty::new(child);
-    }
-
-    fn unset_child(&mut self) {
-        panic!("`unset_child` is not supported for this optional iterator variant");
     }
 }
 
@@ -184,7 +160,7 @@ where
 
     fn skip_to(
         &mut self,
-        doc_id: t_docId,
+        doc_id: DocId,
     ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError> {
         debug_assert!(doc_id > self.last_doc_id);
 
@@ -243,7 +219,10 @@ where
         }
     }
 
-    fn revalidate(&mut self) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
+    fn revalidate(
+        &mut self,
+        spec: &IndexSpecReadGuard,
+    ) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
         // Simple enum to avoid holding a borrow through the match.
         enum ValidateOutcome {
             Ok,
@@ -251,7 +230,7 @@ where
         }
 
         // Step 1: Revalidate wcii. If it aborts or is at EOF, we can return immediately.
-        let wcii_outcome = match self.wcii.revalidate()? {
+        let wcii_outcome = match self.wcii.revalidate(spec)? {
             RQEValidateStatus::Ok => ValidateOutcome::Ok,
             RQEValidateStatus::Moved { current: Some(_) } => ValidateOutcome::Moved,
             RQEValidateStatus::Moved { current: None } => {
@@ -269,7 +248,7 @@ where
 
         // Step 2: Revalidate child. If it aborts, replace with an empty iterator.
         // Abort is treated as Moved: child's state changed, so we must re-evaluate.
-        let child_outcome = match self.child.revalidate()? {
+        let child_outcome = match self.child.revalidate(spec)? {
             RQEValidateStatus::Ok => ValidateOutcome::Ok,
             RQEValidateStatus::Moved { .. } => ValidateOutcome::Moved,
             RQEValidateStatus::Aborted => {
@@ -345,7 +324,7 @@ where
     }
 
     #[inline(always)]
-    fn last_doc_id(&self) -> t_docId {
+    fn last_doc_id(&self) -> DocId {
         self.last_doc_id
     }
 
@@ -363,12 +342,8 @@ where
     }
 }
 
-impl<'index> crate::interop::ProfileChildren<'index>
-    for OptionalOptimized<
-        'index,
-        Box<dyn WildcardIterator<'index> + 'index>,
-        crate::c2rust::CRQEIterator,
-    >
+impl<'index, W: WildcardIterator<'index> + 'index> crate::interop::ProfileChildren<'index>
+    for OptionalOptimized<'index, W, crate::c2rust::CRQEIterator>
 {
     fn profile_children(self) -> Self {
         OptionalOptimized {
@@ -380,5 +355,15 @@ impl<'index> crate::interop::ProfileChildren<'index>
             last_doc_id: self.last_doc_id,
             at_eof: self.at_eof,
         }
+    }
+}
+
+impl<'index, W, I> ProfilePrint for OptionalOptimized<'index, W, I>
+where
+    W: crate::WildcardIterator<'index>,
+    I: RQEIterator<'index> + ProfilePrint,
+{
+    fn print_profile(&self, map: &mut redis_reply::MapBuilder<'_>, ctx: &mut ProfilePrintCtx<'_>) {
+        ctx.print_single_child(c"OPTIONAL", self.child(), map);
     }
 }

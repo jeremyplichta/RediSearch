@@ -4,7 +4,7 @@
 #include "vector_normalization.h"
 #include "vector_index.h"
 #include "iterators/hybrid_reader.h"
-#include "iterators_rs.h"
+#include "iterators_ffi.h"
 #include "util/misc.h"
 
 #ifdef __cplusplus
@@ -12,7 +12,9 @@ extern "C" {
 #endif
 
 static ResultProcessor *buildGroupRP(PLN_GroupStep *gstp, RLookup *srclookup,
-                                     const RLookupKey ***loadKeys, QueryError *err) {
+                                     const RLookupKey ***loadKeys, uint32_t reqflags,
+                                     GroupByLimits groupByLimits,
+                                     QueryError *err) {
   arrayof(const char*) properties = PLNGroupStep_GetProperties(gstp);
   size_t nproperties = array_len(properties);
   const RLookupKey *srckeys[nproperties], *dstkeys[nproperties];
@@ -40,13 +42,26 @@ static ResultProcessor *buildGroupRP(PLN_GroupStep *gstp, RLookup *srclookup,
     }
   }
 
-  Grouper *grp = Grouper_New(srckeys, dstkeys, nproperties);
+  Grouper *grp = Grouper_New(srckeys, dstkeys, nproperties, groupByLimits);
 
   size_t nreducers = array_len(gstp->reducers);
   for (size_t ii = 0; ii < nreducers; ++ii) {
     // Build the actual reducer
     PLN_Reducer *pr = gstp->reducers + ii;
-    ReducerOptions options = REDUCEROPTS_INIT(pr->name, &pr->args, srclookup, loadKeys, err, gstp->strictPrefix);
+    const RLookupKey *input_key = NULL;
+    if (pr->inputAlias) {
+      input_key = RLookup_GetKey_Read(srclookup, pr->inputAlias, RLOOKUP_F_HIDDEN);
+      if (!input_key) {
+        Grouper_Free(grp);
+        QueryError_SetWithUserDataFmt(err, QUERY_ERROR_CODE_NO_PROP_KEY,
+                                      "Property not loaded nor in pipeline", ": `%s`",
+                                      pr->inputAlias);
+        return NULL;
+      }
+    }
+    ReducerOptions options = REDUCEROPTS_INIT(pr->name, &pr->args, srclookup, loadKeys, err,
+                                              gstp->strictPrefix, pr->isLocal, input_key,
+                                              reqflags);
     ReducerFactory ff = RDCR_GetFactory(pr->name);
     if (!ff) {
       // No such reducer!
@@ -93,7 +108,9 @@ static ResultProcessor *getGroupRP(Pipeline *pipeline, const AggregationPipeline
   RLookup *lookup = AGPLN_GetLookup(&pipeline->ap, &gstp->base, AGPLN_GETLOOKUP_PREV);
   RLookup *firstLk = AGPLN_GetLookup(&pipeline->ap, &gstp->base, AGPLN_GETLOOKUP_FIRST); // first lookup can load fields from redis
   const RLookupKey **loadKeys = NULL;
-  ResultProcessor *groupRP = buildGroupRP(gstp, lookup, (firstLk == lookup && RLookup_HasIndexSpecCache(firstLk)) ? &loadKeys : NULL, status);
+  ResultProcessor *groupRP = buildGroupRP(
+      gstp, lookup, (firstLk == lookup && RLookup_HasIndexSpecCache(firstLk)) ? &loadKeys : NULL,
+      params->common.reqflags, params->groupByLimits, status);
 
   if (!groupRP) {
     array_free(loadKeys);
@@ -387,7 +404,7 @@ ResultProcessor *processLoadStep(PLN_LoadStep *loadStep, RLookup *lookup,
  * This creates the initial pipeline components that find matching documents and calculate
  * their relevance scores, providing the foundation for subsequent aggregation and filtering stages.
  */
-void Pipeline_BuildQueryPart(Pipeline *pipeline, QueryPipelineParams *params) {
+void Pipeline_BuildQueryPart(Pipeline *pipeline, QueryPipelineParams *params, QueryError *status) {
   IndexSpecCache *cache = IndexSpec_GetSpecCache(params->common.sctx->spec);
   RS_LOG_ASSERT(cache, "IndexSpec_GetSpecCache failed")
   RLookup *first = AGPLN_GetLookup(&pipeline->ap, NULL, AGPLN_GETLOOKUP_FIRST);
@@ -404,7 +421,7 @@ void Pipeline_BuildQueryPart(Pipeline *pipeline, QueryPipelineParams *params) {
   // Load results metrics according to their RLookup key.
   // We need this RP only if metricRequests is not empty.
   if (params->ast->metricRequests) {
-    rp = getAdditionalMetricsRP(params->common.sctx, params->ast, first, pipeline->qctx.err);
+    rp = getAdditionalMetricsRP(params->common.sctx, params->ast, first, status);
     if (!rp) {
       return;
     }
@@ -441,7 +458,7 @@ void Pipeline_BuildQueryPart(Pipeline *pipeline, QueryPipelineParams *params) {
       if (params->common.scoreAlias) {
         scoreKey = RLookup_GetKey_Write(first, params->common.scoreAlias, RLOOKUP_F_NOFLAGS);
         if (!scoreKey) {
-          QueryError_SetWithUserDataFmt(pipeline->qctx.err, QUERY_ERROR_CODE_DUP_FIELD, "Could not create score alias, name already exists in query", "%s", params->common.scoreAlias);
+          QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_DUP_FIELD, "Could not create score alias, name already exists in query", "%s", params->common.scoreAlias);
           return;
         }
       } else {
@@ -522,12 +539,11 @@ error:
   return REDISMODULE_ERR;
 }
 
-int Pipeline_BuildAggregationPart(Pipeline *pipeline, const AggregationPipelineParams *params, uint32_t *outStateFlags) {
+int Pipeline_BuildAggregationPart(Pipeline *pipeline, const AggregationPipelineParams *params, uint32_t *outStateFlags, QueryError *status) {
   AGGPlan *pln = &pipeline->ap;
   ResultProcessor *rp = NULL, *rpUpstream = pipeline->qctx.endProc;
   RedisSearchCtx *sctx = params->common.sctx;
   int requestFlags = params->common.reqflags;
-  QueryError *status = pipeline->qctx.err;
 
   // If we have a JSON spec, and an "old" API version (DIALECT < 3), we don't store all the data of a multi-value field
   // in the SV as we want to return it, so we need to load and override all requested return fields that are SV source.

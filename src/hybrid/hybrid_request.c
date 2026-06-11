@@ -1,4 +1,5 @@
 #include "hybrid/hybrid_request.h"
+#include <stdatomic.h>
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_construction.h"
 #include "rlookup.h"
@@ -13,11 +14,11 @@
 #include "util/workers.h"
 #include "cursor.h"
 #include "info/info_redis/block_client.h"
-#include "query_error.h"
+#include "query_error_ffi.h"
 #include "spec.h"
 #include "module.h"
 #include "profile/profile.h"
-#include "iterators_rs.h"
+#include "iterators_ffi.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,7 +44,7 @@ int HybridRequest_BuildDepletionPipeline(HybridRequest *req, const HybridPipelin
         }
 
         // Parse subquery: Convert AST to iterator tree
-        areq->rootiter = QAST_Iterate(&areq->ast, &areq->searchopts, AREQ_SearchCtx(areq), areq->reqflags, &req->errors[i]);
+        areq->rootiter = QAST_Iterate(&areq->ast, &areq->searchopts, AREQ_SearchCtx(areq), areq->reqflags, areq, &req->errors[i]);
 
         rs_wall_clock parseClock;
         if (isProfile) {
@@ -78,7 +79,7 @@ int HybridRequest_BuildDepletionPipeline(HybridRequest *req, const HybridPipelin
           // The safe depleter will feed results to the hybrid merger
           RedisSearchCtx *nextThread = params->aggregationParams.common.sctx; // We will use the context provided in the params
           RedisSearchCtx *depletingThread = AREQ_SearchCtx(areq); // when constructing the AREQ a new context should have been created
-          ResultProcessor *depleter = RPSafeDepleter_New(StrongRef_Clone(sync_ref), depletingThread, nextThread);
+          ResultProcessor *depleter = RPSafeDepleter_New(StrongRef_Clone(sync_ref), depletingThread, nextThread, depleterPool);
           QITR_PushRP(qctx, depleter);
         } else {
           // Create a depleter processor for foreground depletion (WORKERS == 0)
@@ -125,7 +126,7 @@ void HybridRequest_SynchronizeLookupKeys(HybridRequest *req) {
   }
 }
 
-int HybridRequest_BuildMergePipeline(HybridRequest *req, const RLookupKey *scoreKey, HybridPipelineParams *params) {
+int HybridRequest_BuildMergePipeline(HybridRequest *req, const RLookupKey *scoreKey, HybridPipelineParams *params, QueryError *status) {
     // Array to collect upstream from each individual request pipeline
     arrayof(ResultProcessor*) upstreams = array_new(ResultProcessor *, req->nrequests);
     for (size_t i = 0; i < req->nrequests; i++) {
@@ -133,7 +134,7 @@ int HybridRequest_BuildMergePipeline(HybridRequest *req, const RLookupKey *score
         // In profile mode, the end processor must be RP_PROFILE (which wraps the depleter)
         if (IsProfile(req) && areq->pipeline.qctx.endProc->type != RP_PROFILE) {
             QueryError_SetWithoutUserDataFmt(
-                &req->tailPipelineError,
+                status,
                 QUERY_ERROR_CODE_GENERIC,
                 "Expected %s processor at end of pipeline, found %s",
                 RPTypeToString(RP_PROFILE),
@@ -164,13 +165,22 @@ int HybridRequest_BuildMergePipeline(HybridRequest *req, const RLookupKey *score
     // Build the aggregation part of the tail pipeline for final result processing
     // This handles sorting, filtering, field loading, and output formatting of merged results
     uint32_t stateFlags = 0;
-    int rc = Pipeline_BuildAggregationPart(req->tailPipeline, &params->aggregationParams, &stateFlags);
+    int rc = Pipeline_BuildAggregationPart(req->tailPipeline, &params->aggregationParams, &stateFlags, status);
     return rc;
 }
 
-int HybridRequest_BuildPipeline(HybridRequest *req, HybridPipelineParams *params, bool depleteInBackground) {
+int HybridRequest_BuildPipeline(HybridRequest *req, HybridPipelineParams *params, bool depleteInBackground, QueryError *status) {
     // Build the depletion pipeline for extracting results from individual search requests
     if (HybridRequest_BuildDepletionPipeline(req, params, depleteInBackground) != REDISMODULE_OK) {
+      for (size_t i = 0; i < req->nrequests; i++) {
+        if (QueryError_HasError(&req->errors[i])) {
+          QueryError_CloneFrom(&req->errors[i], status);
+          break;
+        }
+      }
+      if (!QueryError_HasError(status)) {
+        QueryError_SetError(status, QUERY_ERROR_CODE_GENERIC, "Failed to build hybrid pipeline");
+      }
       return REDISMODULE_ERR;
     }
     RLookup *tailLookup = AGPLN_GetLookup(&req->tailPipeline->ap, NULL, AGPLN_GETLOOKUP_FIRST);
@@ -185,13 +195,13 @@ int HybridRequest_BuildPipeline(HybridRequest *req, HybridPipelineParams *params
       HybridRequest_SynchronizeLookupKeys(req);
     }
 
-    const RLookupKey *scoreKey = OpenMergeScoreKey(tailLookup, params->aggregationParams.common.scoreAlias, &req->tailPipelineError);
-    if (QueryError_HasError(&req->tailPipelineError)) {
+    const RLookupKey *scoreKey = OpenMergeScoreKey(tailLookup, params->aggregationParams.common.scoreAlias, status);
+    if (QueryError_HasError(status)) {
       return REDISMODULE_ERR;
     }
 
     // Build the merge pipeline for combining and processing results from the depletion pipeline
-    return HybridRequest_BuildMergePipeline(req, scoreKey, params);
+    return HybridRequest_BuildMergePipeline(req, scoreKey, params, status);
 }
 
 /**
@@ -217,6 +227,7 @@ void HybridRequest_Init(HybridRequest *hybridReq, RedisSearchCtx *sctx, AREQ **r
     hybridReq->requests = requests;
     hybridReq->nrequests = nrequests;
     hybridReq->sctx = sctx;
+    hybridReq->kArgIndex = -1;
 
     rs_wall_clock now = {0};
     rs_wall_clock_init(&now);
@@ -246,20 +257,14 @@ void HybridRequest_Init(HybridRequest *hybridReq, RedisSearchCtx *sctx, AREQ **r
     RequestSyncCtx_Init(&hybridReq->syncCtx);
     pthread_mutex_init(&hybridReq->cursorMutex, NULL);
     hybridReq->storedReplyState.err = QueryError_Default();
+
+
 }
 
 HybridRequest *HybridRequest_New(RedisSearchCtx *sctx, AREQ **requests, size_t nrequests) {
     HybridRequest *hybridReq = rm_calloc(1, sizeof(*hybridReq));
     HybridRequest_Init(hybridReq, sctx, requests, nrequests);
     return hybridReq;
-}
-
-bool HybridRequest_TimedOut(HybridRequest *req) {
-  return atomic_load_explicit(&req->syncCtx.timedOut, memory_order_acquire);
-}
-
-void HybridRequest_SetTimedOut(HybridRequest *req) {
-  atomic_store_explicit(&req->syncCtx.timedOut, true, memory_order_release);
 }
 
 void HybridRequest_InitArgsCursor(HybridRequest *req, ArgsCursor *ac, RedisModuleString **argv, int argc) {
@@ -303,7 +308,7 @@ static void HybridRequest_Free(HybridRequest *req) {
         RedisModuleCtx *thctx = areq->sctx->redisCtx;
         RedisSearchCtx *sctx = areq->sctx;
 
-        if (RunInThread()) {
+        if (areq->reqflags & QEXEC_F_RUN_IN_BACKGROUND) {
           // Background thread: schedule async cleanup
           ScheduleContextCleanup(thctx, sctx);
         } else {
@@ -347,6 +352,10 @@ static void HybridRequest_Free(HybridRequest *req) {
     // Destroy the cursor mutex
     pthread_mutex_destroy(&req->cursorMutex);
 
+    rm_free(req->debugParams);
+
+    RequestSyncCtx_Destroy(&req->syncCtx);
+
     if (req->args) {
       for (size_t ii = 0; ii < req->nargs; ++ii) {
         sdsfree(req->args[ii]);
@@ -370,10 +379,14 @@ void HybridRequest_DecrRef(HybridRequest *req) {
   }
 }
 
+static bool isSoftTailPipelineErrorCode(QueryErrorCode code) {
+    return code == QUERY_ERROR_CODE_NO_PROP_VAL;
+}
+
 /**
  * Get error information from a HybridRequest.
  * This function checks for errors in priority order:
- * 1. Tail pipeline errors (affects final result processing)
+ * 1. Tail pipeline errors (soft codes skipped — emitted as warnings instead)
  * 2. Individual AREQ errors (sub-query failures)
  *
  * @param hreq The HybridRequest to check for errors
@@ -385,8 +398,9 @@ int HybridRequest_GetError(HybridRequest *hreq, QueryError *status) {
         return REDISMODULE_ERR;
     }
 
-    // Priority 1: Tail pipeline error (affects final result processing)
-    if (QueryError_HasError(&hreq->tailPipelineError)) {
+    // Skip soft codes so the reply path can render them as warnings.
+    if (QueryError_HasError(&hreq->tailPipelineError) &&
+        !isSoftTailPipelineErrorCode(QueryError_GetCode(&hreq->tailPipelineError))) {
         QueryError_CloneFrom(&hreq->tailPipelineError, status);
         return REDISMODULE_ERR;
     }
@@ -464,6 +478,40 @@ void AddValidationErrorContext(AREQ *req, QueryError *status) {
                                        "Weight attributes are not allowed in FT.HYBRID VSIM FILTER");
     }
   }
+}
+
+void HybridRequest_SetTimedOut(HybridRequest *req) {
+  RS_AtomicBoolStoreRelaxed(&req->syncCtx.timedOut, true);
+  // Propagate to each subquery AREQ so its RPNet's MRChannel_PopWithTimeout
+  // abort flag (&areq->syncCtx.timedOut) is flipped. Without this the BG
+  // worker can stay parked on the channel even after the hybrid-level flag
+  // is set.
+  for (size_t i = 0; i < req->nrequests; i++) {
+    if (req->requests[i]) {
+      AREQ_SetTimedOut(req->requests[i]);
+    }
+  }
+}
+
+bool HybridRequest_TryClaimAggregateResults(HybridRequest *req) {
+  bool expected = false;
+  return atomic_compare_exchange_strong_explicit(&req->syncCtx.aggregatingResults, &expected, true,
+                                                 memory_order_relaxed, memory_order_relaxed);
+}
+
+void HybridRequest_SignalAggregateResultsComplete(HybridRequest *req) {
+  pthread_mutex_lock(&req->syncCtx.aggregateResultsLock);
+  req->syncCtx.aggregateResultsDone = true;
+  pthread_cond_broadcast(&req->syncCtx.aggregateResultsCond);
+  pthread_mutex_unlock(&req->syncCtx.aggregateResultsLock);
+}
+
+void HybridRequest_WaitForAggregateResultsComplete(HybridRequest *req) {
+  pthread_mutex_lock(&req->syncCtx.aggregateResultsLock);
+  while (!req->syncCtx.aggregateResultsDone) {
+    pthread_cond_wait(&req->syncCtx.aggregateResultsCond, &req->syncCtx.aggregateResultsLock);
+  }
+  pthread_mutex_unlock(&req->syncCtx.aggregateResultsLock);
 }
 
 #ifdef __cplusplus

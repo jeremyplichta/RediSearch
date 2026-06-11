@@ -7,10 +7,12 @@
  * GNU Affero General Public License v3 (AGPLv3).
 */
 #include "spell_check.h"
+#include "types_ffi.h"
 #include "util/arr.h"
 #include "dictionary.h"
 #include "reply.h"
 #include "inverted_index.h"
+#include "inverted_index_ffi.h"
 #include <stdbool.h>
 
 /** Forward declaration **/
@@ -52,26 +54,23 @@ RS_Suggestions *RS_SuggestionsCreate() {
 void RS_SuggestionsAdd(RS_Suggestions *s, char *term, size_t len, double score, int incr) {
   double currScore;
   bool isExists = SpellCheck_IsTermExistsInTrie(s->suggestionsTrie, term, len, &currScore);
-  if (score == 0) {
-    /** we can not add zero score so we set it to -1 instead :\ **/
-    score = -1;
-  }
-
   if (!incr) {
     if (!isExists) {
+      // Payload is NULL so TRIE_ERR_PAYLOAD_OVERFLOW cannot occur.
       Trie_InsertStringBuffer(s->suggestionsTrie, term, len, score, incr, NULL, 0);
     }
     return;
   }
 
-  if (isExists && score == -1) {
+  if (isExists && score == 0) {
     return;
   }
 
-  if (!isExists || currScore == -1) {
+  if (!isExists || currScore == 0) {
     incr = 0;
   }
 
+  // Payload is NULL so TRIE_ERR_PAYLOAD_OVERFLOW cannot occur.
   Trie_InsertStringBuffer(s->suggestionsTrie, term, len, score, incr, NULL, 0);
 }
 
@@ -87,9 +86,9 @@ void RS_SuggestionsFree(RS_Suggestions *s) {
  */
 static double SpellCheck_GetScore(SpellCheckCtx *scCtx, char *suggestion, size_t len,
                                   t_fieldMask fieldMask) {
-  InvertedIndex *invidx = Redis_OpenInvertedIndex(scCtx->sctx, suggestion, len, 0, NULL);
+  InvertedIndex *invidx = Redis_OpenInvertedIndex(scCtx->sctx->spec, suggestion, len, 0, NULL);
   double retVal = 0;
-  IndexDecoderCtx ctx = {.field_mask_tag = IndexDecoderCtx_FieldMask, .field_mask = fieldMask};
+  IndexDecoderCtx ctx = {.fieldmask_tag = IndexDecoderCtx_FieldMask, .fieldmask = fieldMask};
   IndexReader *reader = NULL;
   RSIndexResult *res = NULL;
 
@@ -160,7 +159,7 @@ static void SpellCheck_FindSuggestions(SpellCheckCtx *scCtx, Trie *t, const char
 
 RS_Suggestion **spellCheck_GetSuggestions(RS_Suggestions *s) {
   TrieIterator *iter = Trie_Iterate(s->suggestionsTrie, "", 0, 0, 1);
-  RS_Suggestion **ret = array_new(RS_Suggestion *, s->suggestionsTrie->size);
+  RS_Suggestion **ret = array_new(RS_Suggestion *, Trie_Size(s->suggestionsTrie));
   rune *rstr = NULL;
   t_len slen = 0;
   float score = 0;
@@ -197,8 +196,7 @@ void SpellCheck_SendReplyOnTerm(RedisModule_Reply *reply, char *term, size_t len
       for (int i = 0; i < n; ++i) {
         RedisModule_Reply_Map(reply);
           RedisModule_Reply_StringBuffer(reply, suggestions[i]->suggestion, suggestions[i]->len);
-          RedisModule_Reply_Double(reply, suggestions[i]->score == -1 ? 0 :
-                                        suggestions[i]->score / totalDocNumber);
+          RedisModule_Reply_Double(reply, suggestions[i]->score / totalDocNumber);
         RedisModule_Reply_MapEnd(reply);
       }
 
@@ -216,8 +214,7 @@ void SpellCheck_SendReplyOnTerm(RedisModule_Reply *reply, char *term, size_t len
         int n = array_len(suggestions);
         for (int i = 0; i < n; ++i) {
           RedisModule_Reply_Array(reply);
-            RedisModule_Reply_Double(reply, suggestions[i]->score == -1 ? 0 :
-                                            suggestions[i]->score / totalDocNumber);
+            RedisModule_Reply_Double(reply, suggestions[i]->score / totalDocNumber);
             RedisModule_Reply_StringBuffer(reply, suggestions[i]->suggestion, suggestions[i]->len);
           RedisModule_Reply_ArrayEnd(reply);
         }

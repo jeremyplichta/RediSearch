@@ -9,10 +9,38 @@
 
 //! Flat array variant of the union iterator with O(n) min-finding.
 
-use ffi::t_docId;
-use inverted_index::RSIndexResult;
+use index_result::RSIndexResult;
+use rqe_core::DocId;
 
 use crate::{IteratorType, RQEIterator, RQEIteratorError, RQEValidateStatus, SkipToOutcome};
+use index_spec::IndexSpecReadGuard;
+
+/// A child iterator paired with its original insertion index.
+///
+/// Tracks where the child was in the original `children` vector so that
+/// we can restore the original order.
+pub(crate) struct IndexedChild<I> {
+    /// Position of this child in the original `children` vector passed to
+    /// [`UnionFlat::new`].
+    pub(crate) original_index: usize,
+    /// The underlying child iterator.
+    pub(crate) inner: I,
+}
+
+impl<I> std::ops::Deref for IndexedChild<I> {
+    type Target = I;
+    #[inline(always)]
+    fn deref(&self) -> &I {
+        &self.inner
+    }
+}
+
+impl<I> std::ops::DerefMut for IndexedChild<I> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut I {
+        &mut self.inner
+    }
+}
 
 /// Yields documents appearing in ANY child iterator using a flat array scan.
 ///
@@ -34,7 +62,7 @@ use crate::{IteratorType, RQEIterator, RQEIteratorError, RQEValidateStatus, Skip
 pub struct UnionFlat<'index, I, const QUICK_EXIT: bool> {
     /// Child iterators. Active children are in `children[..num_active]`,
     /// exhausted children are moved to the end and not removed so we can rewind the iterator.
-    children: Vec<I>,
+    children: Vec<IndexedChild<I>>,
     /// Number of active (non-EOF) children. Only `children[..num_active]` are scanned.
     num_active: usize,
     /// Sum of all children's estimated counts (upper bound).
@@ -55,6 +83,14 @@ where
     pub fn new(children: Vec<I>) -> Self {
         let num_estimated: usize = children.iter().map(|c| c.num_estimated()).sum();
         let num_children = children.len();
+        let children: Vec<IndexedChild<I>> = children
+            .into_iter()
+            .enumerate()
+            .map(|(i, inner)| IndexedChild {
+                original_index: i,
+                inner,
+            })
+            .collect();
 
         if children.is_empty() {
             return Self {
@@ -75,12 +111,51 @@ where
         }
     }
 
+    /// Returns the total number of children (including exhausted ones).
+    pub const fn num_children_total(&self) -> usize {
+        self.children.len()
+    }
+
+    /// Returns the number of currently active (non-exhausted) children.
+    pub const fn num_children_active(&self) -> usize {
+        self.num_active
+    }
+
+    /// Returns a shared reference to the child originally at insertion index `idx`.
+    ///
+    /// Returns `None` if the child was permanently removed (e.g. aborted during
+    /// revalidation). Scans the children to find the one whose `original_index`
+    /// matches, so this is O(n) — intended for profile display, not hot-path
+    /// iteration.
+    pub fn child_at(&self, idx: usize) -> Option<&I> {
+        self.children
+            .iter()
+            .find(|c| c.original_index == idx)
+            .map(|c| &c.inner)
+    }
+
+    /// Returns a mutable iterator over all children (including exhausted ones).
+    pub fn children_mut(&mut self) -> impl Iterator<Item = &mut I> {
+        self.children.iter_mut().map(|c| &mut c.inner)
+    }
+
+    /// Consumes the iterator and returns its children.
+    pub fn into_children(self) -> Vec<I> {
+        self.children.into_iter().map(|c| c.inner).collect()
+    }
+
+    /// Consumes the iterator and returns a [`super::UnionTrimmed`] over the same children,
+    /// or [`None`] if there are fewer than 3 children.
+    pub fn into_trimmed(self, limit: usize, asc: bool) -> Option<super::UnionTrimmed<'index, I>> {
+        let children: Vec<I> = self.children.into_iter().map(|c| c.inner).collect();
+        (children.len() >= 3).then(|| super::UnionTrimmed::new(children, limit, asc))
+    }
     /// Advances all active children whose `last_doc_id` equals `current_id` and finds the
     /// minimum doc_id in a single pass.
     ///
-    /// Returns the minimum doc_id among active children, or `t_docId::MAX` if all are exhausted.
-    fn advance_and_find_min(&mut self, current_id: t_docId) -> Result<t_docId, RQEIteratorError> {
-        let mut min_id: t_docId = t_docId::MAX;
+    /// Returns the minimum doc_id among active children, or `DocId::MAX` if all are exhausted.
+    fn advance_and_find_min(&mut self, current_id: DocId) -> Result<DocId, RQEIteratorError> {
+        let mut min_id: DocId = DocId::MAX;
         let mut i = 0;
 
         while i < self.num_active {
@@ -123,7 +198,7 @@ where
 
     /// Builds the result from active children whose `last_doc_id` equals `min_id`.
     /// Only used in Full mode - aggregates ALL matching children.
-    fn build_aggregate_result(&mut self, min_id: t_docId) {
+    fn build_aggregate_result(&mut self, min_id: DocId) {
         self.result.reset_aggregate();
         self.result.doc_id = min_id;
 
@@ -131,23 +206,23 @@ where
             if child.last_doc_id() == min_id
                 && let Some(child_result) = child.current()
             {
+                let drained_metrics = std::mem::take(&mut child_result.metrics);
                 let child_ptr: *const RSIndexResult<'index> = child_result;
                 // SAFETY: We need a raw pointer to decouple the borrow of the child's
                 // result from `&mut self.result`. This is sound because:
                 // 1. `self.children[i]` and `self.result` are disjoint fields — no aliasing.
-                // 2. `push_borrowed` takes a shared reference, so no mutation through child_ref.
-                // 3. The child is owned by `self`, so the 'index data remains valid.
+                // 2. The child is owned by `self`, so the 'index data remains valid.
                 let child_ref = unsafe { &*child_ptr };
-                self.result.push_borrowed(child_ref);
+                self.result.push_borrowed(child_ref, drained_metrics);
             }
         }
     }
 
     /// Performs initial read on all children to position them at their first document.
     /// Removes any children that are immediately exhausted (empty iterators).
-    /// Returns the minimum doc_id among active children, or `t_docId::MAX` if all are exhausted.
-    fn initialize_children(&mut self) -> Result<t_docId, RQEIteratorError> {
-        let mut min_id: t_docId = t_docId::MAX;
+    /// Returns the minimum doc_id among active children, or `DocId::MAX` if all are exhausted.
+    fn initialize_children(&mut self) -> Result<DocId, RQEIteratorError> {
+        let mut min_id: DocId = DocId::MAX;
         let mut i = 0;
         while i < self.num_active {
             let child = &mut self.children[i];
@@ -184,7 +259,7 @@ where
             self.advance_and_find_min(self.last_doc_id())?
         };
 
-        if min_id == t_docId::MAX {
+        if min_id == DocId::MAX {
             self.is_eof = true;
             return Ok(None);
         }
@@ -210,9 +285,9 @@ where
     /// This avoids a second pass when the target is found (matching C's `UI_Skip_Full_Flat`).
     fn skip_to_full(
         &mut self,
-        doc_id: t_docId,
+        doc_id: DocId,
     ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError> {
-        let mut min_id: t_docId = t_docId::MAX;
+        let mut min_id: DocId = DocId::MAX;
         let mut i = 0;
 
         // Reset aggregate before potentially adding children during the loop
@@ -259,7 +334,7 @@ where
             i += 1;
         }
 
-        if min_id == t_docId::MAX {
+        if min_id == DocId::MAX {
             self.is_eof = true;
             return Ok(None);
         }
@@ -278,10 +353,10 @@ where
     /// Tracks minimum doc_id among non-matches for NotFound case.
     fn skip_to_quick(
         &mut self,
-        doc_id: t_docId,
+        doc_id: DocId,
     ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError> {
         // Use MAX as sentinel like C uses DOCID_MAX - avoids Option overhead
-        let mut min_id: t_docId = t_docId::MAX;
+        let mut min_id: DocId = DocId::MAX;
         let mut min_child_idx: usize = 0;
         let mut i = 0;
 
@@ -327,7 +402,7 @@ where
         }
 
         // No exact match found - use minimum if available
-        if min_id != t_docId::MAX {
+        if min_id != DocId::MAX {
             self.quick_set_from_child(min_child_idx);
             Ok(Some(SkipToOutcome::NotFound(&mut self.result)))
         } else {
@@ -352,14 +427,14 @@ where
     fn add_child_to_result(&mut self, child_idx: usize) {
         let child = &mut self.children[child_idx];
         if let Some(child_result) = child.current() {
+            let drained_metrics = std::mem::take(&mut child_result.metrics);
             let child_ptr: *const RSIndexResult<'index> = child_result;
             // SAFETY: We need a raw pointer to decouple the borrow of the child's
             // result from `&mut self.result`. This is sound because:
             // 1. `self.children[i]` and `self.result` are disjoint fields — no aliasing.
-            // 2. `push_borrowed` takes a shared reference, so no mutation through child_ref.
-            // 3. The child is owned by `self`, so the 'index data remains valid.
+            // 2. The child is owned by `self`, so the 'index data remains valid.
             let child_ref = unsafe { &*child_ptr };
-            self.result.push_borrowed(child_ref);
+            self.result.push_borrowed(child_ref, drained_metrics);
         }
     }
 }
@@ -391,7 +466,7 @@ where
 
     fn skip_to(
         &mut self,
-        doc_id: t_docId,
+        doc_id: DocId,
     ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError> {
         if self.is_eof {
             return Ok(None);
@@ -407,7 +482,9 @@ where
     }
 
     fn rewind(&mut self) {
-        // Reset num_active to include all children again
+        // Restore children to their original insertion order.
+        self.children.sort_unstable_by_key(|c| c.original_index);
+
         self.num_active = self.children.len();
         self.is_eof = self.children.is_empty();
         self.result.reset_aggregate();
@@ -420,7 +497,7 @@ where
     }
 
     #[inline(always)]
-    fn last_doc_id(&self) -> t_docId {
+    fn last_doc_id(&self) -> DocId {
         self.result.doc_id
     }
 
@@ -429,7 +506,10 @@ where
         self.is_eof
     }
 
-    fn revalidate(&mut self) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
+    fn revalidate(
+        &mut self,
+        spec: &IndexSpecReadGuard,
+    ) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
         // Already at EOF - nothing to do
         if self.is_eof {
             return Ok(RQEValidateStatus::Ok);
@@ -443,7 +523,7 @@ where
         // We use index-based iteration because we need to remove elements while iterating.
         let mut i = 0;
         while i < self.children.len() {
-            match self.children[i].revalidate()? {
+            match self.children[i].revalidate(spec)? {
                 RQEValidateStatus::Aborted => {
                     // Remove aborted child using swap_remove for O(1) removal.
                     // Order doesn't matter for union iteration.
@@ -475,7 +555,7 @@ where
         // Sync num_active and find minimum doc_id.
         // Use swap_remove_child to move EOF children out of the active region.
         self.num_active = self.children.len();
-        let mut min_doc_id: t_docId = t_docId::MAX;
+        let mut min_doc_id: DocId = DocId::MAX;
         let mut min_child_idx: usize = 0;
         let mut i = 0;
         while i < self.num_active {
@@ -538,7 +618,10 @@ impl<'index, const QUICK_EXIT: bool> crate::interop::ProfileChildren<'index>
             children: self
                 .children
                 .into_iter()
-                .map(crate::c2rust::CRQEIterator::into_profiled)
+                .map(|c| IndexedChild {
+                    original_index: c.original_index,
+                    inner: c.inner.into_profiled(),
+                })
                 .collect(),
             num_active: self.num_active,
             num_estimated: self.num_estimated,

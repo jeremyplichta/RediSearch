@@ -8,11 +8,12 @@
 */
 
 use enumflags2::{BitFlags, bitflags};
-use inverted_index::RSIndexResult;
+use index_result::RSIndexResult;
 use rlookup::RLookupRow;
+use rqe_core::DocId;
 use std::ptr::NonNull;
 
-use document_metadata::DocumentMetadata;
+use document_metadata::{DocumentMetadata, OwnedDocumentMetadata};
 
 #[bitflags]
 #[repr(u8)]
@@ -29,7 +30,7 @@ pub type SearchResultFlags = enumflags2::BitFlags<SearchResultFlag>;
 #[derive(Debug)]
 #[repr(C)]
 pub struct SearchResult<'index> {
-    _doc_id: ffi::t_docId,
+    _doc_id: DocId,
     // not all results have score - TBD
     _score: f64,
 
@@ -44,7 +45,7 @@ pub struct SearchResult<'index> {
     // TODO resolve ownership (this is heap-allocated but owned by this search result??)
     _score_explain: Option<NonNull<ffi::RSScoreExplain>>,
 
-    _document_metadata: Option<DocumentMetadata>,
+    _document_metadata: Option<OwnedDocumentMetadata>,
 
     // index result should cover what you need for highlighting,
     // but we will add a method to duplicate index results to make
@@ -109,12 +110,12 @@ impl<'index> SearchResult<'index> {
     }
 
     /// Sets the document ID of this search result.
-    pub const fn doc_id(&self) -> ffi::t_docId {
+    pub const fn doc_id(&self) -> DocId {
         self._doc_id
     }
 
     /// Sets the document ID of this search result.
-    pub const fn set_doc_id(&mut self, doc_id: ffi::t_docId) {
+    pub const fn set_doc_id(&mut self, doc_id: DocId) {
         self._doc_id = doc_id;
     }
 
@@ -160,12 +161,12 @@ impl<'index> SearchResult<'index> {
     }
 
     /// Returns an immutable reference to the [`DocumentMetadata`] associated with this search result.
-    pub fn document_metadata(&self) -> Option<&ffi::RSDocumentMetadata> {
+    pub fn document_metadata(&self) -> Option<&DocumentMetadata> {
         self._document_metadata.as_deref()
     }
 
     /// Sets the [`DocumentMetadata`] associated with this search result.
-    pub fn set_document_metadata(&mut self, document_metadata: Option<DocumentMetadata>) {
+    pub fn set_document_metadata(&mut self, document_metadata: Option<OwnedDocumentMetadata>) {
         self._document_metadata = document_metadata;
     }
 

@@ -30,13 +30,23 @@ pub fn repository_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error
 }
 
 fn rerun_if_changes(dir: &Path, extensions: &[&str]) -> std::io::Result<()> {
+    // Don't descend into Cargo's target directory. Cargo marks it with a
+    // `CACHEDIR.TAG` file, so detect it that way regardless of where
+    // `CARGO_TARGET_DIR` points (e.g. the CMake build sets it to
+    // `src/redisearch_rs/target`, which sits under the `src` include root
+    // scanned by `ffi/build.rs`). Otherwise the sweep would reach a build
+    // script's own `OUT_DIR` and emit `rerun-if-changed` for the headers that
+    // script just staged there, forcing a rebuild on every invocation.
+    if dir.join("CACHEDIR.TAG").exists() {
+        return Ok(());
+    }
     for entry in read_dir(dir)? {
         let Ok(entry) = entry else {
             continue;
         };
         let path = entry.path();
         if path.is_dir() {
-            return rerun_if_changes(&path, extensions);
+            rerun_if_changes(&path, extensions)?;
         } else if let Some(extension) = path.extension().and_then(|ext| ext.to_str())
             && extensions.contains(&extension)
         {
@@ -54,50 +64,6 @@ pub fn rerun_if_c_changes(dir: &Path) -> std::io::Result<()> {
     rerun_if_changes(dir, &["c", "h"])
 }
 
-/// Walk the specified directory and emit granular `rerun-if-changed` statements,
-/// scoped to `*.rs` files.
-/// It'd be nice if `cargo` supported globbing syntax natively, but that's not the
-/// case today.
-fn rerun_if_rust_changes(dir: &Path) -> std::io::Result<()> {
-    rerun_if_changes(dir, &["rs"])
-}
-
-/// Generate a C header file via `cbindgen` for the calling crate.
-/// It'll read `cbindgen` configuration from the `cbindgen.toml` file at the crate root
-/// and output the header file to `header_path`.
-pub fn run_cbindgen(header_path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
-    let config =
-        cbindgen::Config::from_file("cbindgen.toml").expect("Failed to find cbindgen config");
-    println!("cargo::rerun-if-changed=cbindgen.toml");
-
-    // emit `rerun-if-changed` for all the headers files referenced by the config as well
-    if let Some(include) = &config.parse.include {
-        for included_crate in include.iter() {
-            let path = repository_root()?
-                .join("src")
-                .join("redisearch_rs")
-                .join(included_crate);
-            if path.exists() {
-                let _ = rerun_if_rust_changes(&path);
-            }
-        }
-    }
-    // We should also regenerate the header files if the source of the current
-    // crate changes. The current crate isn't usually included in `cbindgen`'s
-    // config file under `parse.include`.
-    let _ = rerun_if_rust_changes(&PathBuf::from("src"));
-
-    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-
-    cbindgen::Builder::new()
-        .with_crate(crate_dir)
-        .with_config(config)
-        .generate()?
-        .write_to_file(header_path);
-
-    Ok(())
-}
-
 /// Link all the relevant C dependencies to allow Rust (testing and benchmarking) code to invoke
 /// RediSearch C symbols.
 ///
@@ -105,14 +71,15 @@ pub fn run_cbindgen(header_path: impl AsRef<Path>) -> Result<(), Box<dyn std::er
 /// all C code and dependencies together. The combined library is created by CMake
 /// during the build process.
 pub fn bind_foreign_c_symbols() {
+    let bin_root = bin_root();
     force_link_time_symbol_resolution();
-    link_redisearch_all();
-    link_mkl();
+    link_redisearch_all(&bin_root).unwrap_or_else(|e| panic!("{e}"));
+    link_mkl(&bin_root.join("_deps/svs-src/lib"));
     link_c_plusplus();
 }
 
 /// Require all symbols to be resolved at link time.
-fn force_link_time_symbol_resolution() {
+pub fn force_link_time_symbol_resolution() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| "linux".to_string());
     if target_os == "macos" {
         println!("cargo::rustc-link-arg=-Wl,-undefined,error");
@@ -150,7 +117,8 @@ fn bin_root() -> PathBuf {
     }
 }
 
-/// Link `libredisearch_all.a` using the `-bundle` modifier.
+/// Link `libredisearch_all.a` using the `-bundle` modifier, returning an error if the
+/// library is not found.
 ///
 /// The `-bundle` modifier prevents the (very large) C archive from being
 /// embedded into every Rust rlib in the dependency tree. Instead, the linker
@@ -163,16 +131,20 @@ fn bin_root() -> PathBuf {
 ///    errors in unrelated workspace members.
 /// 2. Archive member counts exceeding `u16::MAX` in rustc's
 ///    `ar_archive_writer` when MKL or other large archives are involved.
-fn link_redisearch_all() {
-    let bin_root = bin_root();
+///
+/// Callers that need soft-fail behaviour (e.g. lint-only runs where the
+/// library has not been built) can inspect the returned `Err` and emit a
+/// `cargo::warning` instead of panicking.
+pub fn link_redisearch_all(bin_root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let lib_dir = bin_root.join("src");
     let lib = lib_dir.join("libredisearch_all.a");
     if std::fs::exists(&lib).unwrap_or(false) {
         println!("cargo::rustc-link-lib=static:-bundle=redisearch_all");
         println!("cargo::rerun-if-changed={}", lib.display());
         println!("cargo::rustc-link-search=native={}", lib_dir.display());
+        Ok(lib)
     } else {
-        panic!("Static library not found: {}", lib.display());
+        Err(format!("Static library not found: {}", lib.display()).into())
     }
 }
 
@@ -181,8 +153,11 @@ fn link_redisearch_all() {
 /// MKL is excluded from `libredisearch_all.a` because its ~42K object files
 /// overflow the `u16` archive member index in rustc's `ar_archive_writer`.
 /// Like `redisearch_all`, we link with `-bundle` to avoid rlib bloat.
-fn link_mkl() {
-    let svs_lib_dir = bin_root().join("_deps/svs-src/lib");
+///
+/// `svs_lib_dir` is the directory that contains `libmkl_static_library.a`.
+/// Its location varies across build configurations, so callers are responsible
+/// for supplying the correct path.
+pub fn link_mkl(svs_lib_dir: &Path) {
     let mkl = svs_lib_dir.join("libmkl_static_library.a");
     if std::fs::exists(&mkl).unwrap_or(false) {
         println!("cargo::rerun-if-changed={}", mkl.display());

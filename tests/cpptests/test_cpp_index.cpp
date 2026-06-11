@@ -17,14 +17,14 @@ extern "C" {
 #include "query_parser/tokenizer.h"
 #include "spec.h"
 #include "tokenize.h"
-#include "varint.h"
+#include "varint_ffi.h"
 #include "iterators/hybrid_reader.h"
-#include "iterators_rs.h"
-#include "iterators/union_iterator.h"
-#include "redisearch_rs/headers/iterators_rs.h"
+#include "iterators_ffi.h"
+#include "metrics_ffi.h"
+#include "query_term_ffi.h"
 #include "util/arr.h"
 #include "util/references.h"
-#include "types_rs.h"
+#include "types_ffi.h"
 
 #include "rmutil/alloc.h"
 
@@ -144,7 +144,7 @@ TEST_P(IndexFlagsTest, testRWFlags) {
   ASSERT_EQ(200, InvertedIndex_LastId(idx));
 
   for (int xx = 0; xx < 1; xx++) {
-    IndexDecoderCtx decoderCtx = {.field_mask_tag = IndexDecoderCtx_FieldMask, .field_mask = RS_FIELDMASK_ALL};
+    IndexDecoderCtx decoderCtx = {.fieldmask_tag = IndexDecoderCtx_FieldMask, .fieldmask = RS_FIELDMASK_ALL};
     IndexReader *reader = NewIndexReader(idx, decoderCtx);
     RSIndexResult *res = NewTokenRecord(NULL, 1);
     res->freq = 1;
@@ -292,7 +292,7 @@ TEST_F(IndexTest, testNot) {
   MockQueryEvalCtx mockQctx(16, 16);
   irs[0] = NewInvIndIterator_TermQuery(w, &mockQctx.sctx, f, makeTestQueryTerm(), 1);
   MockQueryEvalCtx mockQctx2(10, 10);
-  irs[1] = NewNotIterator(NewInvIndIterator_TermQuery(w2, &mockQctx2.sctx, f, makeTestQueryTerm(), 1), InvertedIndex_LastId(w2), 1, {0}, &ctx->qctx);
+  irs[1] = NewNotIterator(NewInvIndIterator_TermQuery(w2, &mockQctx2.sctx, f, makeTestQueryTerm(), 1), InvertedIndex_LastId(w2), 1, {0}, NULL, &ctx->qctx);
 
   QueryIterator *ui = NewIntersectionIterator(irs, 2, -1, 0, 1);
   int expected[] = {1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16};
@@ -314,7 +314,7 @@ TEST_F(IndexTest, testPureNot) {
   auto ctx = std::make_unique<MockQueryEvalCtx>();
   FieldMaskOrIndex f = {.mask_tag = FieldMaskOrIndex_Mask, .mask = RS_FIELDMASK_ALL};
   MockQueryEvalCtx mockQctx(10, 10);
-  QueryIterator *ir = NewNotIterator(NewInvIndIterator_TermQuery(w, &mockQctx.sctx, f, makeTestQueryTerm(), 1), InvertedIndex_LastId(w) + 5, 1, {0}, &ctx->qctx);
+  QueryIterator *ir = NewNotIterator(NewInvIndIterator_TermQuery(w, &mockQctx.sctx, f, makeTestQueryTerm(), 1), InvertedIndex_LastId(w) + 5, 1, {0}, NULL, &ctx->qctx);
 
   RSIndexResult *h = NULL;
   int expected[] = {1,  2,  4,  5,  7,  8,  10, 11, 13, 14, 16, 17, 19,
@@ -392,7 +392,7 @@ TEST_F(IndexTest, testNumericInverted) {
     }
 
     // Check if the write matches the simulation
-    sz = InvertedIndex_WriteNumericEntry(idx, i + 1, (double)(i + 1));
+    sz = InvertedIndex_WriteNumericEntry(idx, i + 1, (double)(i + 1)).mem_growth;
     ASSERT_EQ(sz, expected_sz) << " at i=" << i;
   }
   ASSERT_EQ(75, InvertedIndex_LastId(idx));
@@ -429,7 +429,7 @@ TEST_F(IndexTest, testNumericVaried) {
   static const size_t numCount = sizeof(nums) / sizeof(double);
 
   for (size_t i = 0; i < numCount; i++) {
-    size_t sz = InvertedIndex_WriteNumericEntry(idx, i + 1, nums[i]);
+    size_t sz = InvertedIndex_WriteNumericEntry(idx, i + 1, nums[i]).mem_growth;
     // printf("[%lu]: Stored %lf\n", i, nums[i]);
   }
 
@@ -490,10 +490,10 @@ void testNumericEncodingHelper(bool isMulti) {
 
   for (size_t ii = 0; ii < numInfos; ii++) {
     // printf("\n[%lu]: Expecting Val=%lf, Sz=%lu\n", ii, infos[ii].value, infos[ii].size);
-    size_t sz = InvertedIndex_WriteNumericEntry(idx, ii + 1, infos[ii].value);
+    size_t sz = InvertedIndex_WriteNumericEntry(idx, ii + 1, infos[ii].value).mem_growth;
 
     if (isMulti) {
-      size_t sz = InvertedIndex_WriteNumericEntry(idx, ii + 1, infos[ii].value);
+      size_t sz = InvertedIndex_WriteNumericEntry(idx, ii + 1, infos[ii].value).mem_growth;
     }
   }
 
@@ -706,7 +706,7 @@ TEST_F(IndexTest, testHybridVector) {
     ASSERT_EQ(hybridIt->lastDocId, expected_id);
   }
   ASSERT_EQ(hybridIt->lastDocId, max_id - step*((k/2)-1));
-  ASSERT_EQ(hybridIt->Revalidate(hybridIt), VALIDATE_OK);
+  ASSERT_EQ(hybridIt->Revalidate(hybridIt, mockQctx.sctx.spec), VALIDATE_OK);
 
   // Rerun in AD_HOC BF mode.
   hybridIt->Rewind(hybridIt);
@@ -839,7 +839,7 @@ TEST_F(IndexTest, testMetric_VectorRange) {
     ASSERT_EQ(h->docId, lowest_id + count);
     double exp_dist = VecSimIndex_GetDistanceFrom_Unsafe(index, h->docId, query);
     ASSERT_EQ(IndexResult_NumValue(h), exp_dist);
-    ASSERT_EQ(RSValue_Number_Get(h->metrics[0].value), exp_dist);
+    ASSERT_EQ(MetricsVec_AsSlice(&h->metrics).data[0].value, exp_dist);
     count++;
   }
   ASSERT_EQ(count, n_expected_res);
@@ -858,13 +858,13 @@ TEST_F(IndexTest, testMetric_VectorRange) {
   ASSERT_EQ(vecIt->lastDocId, lowest_id + 10);
   double exp_dist = VecSimIndex_GetDistanceFrom_Unsafe(index, vecIt->lastDocId, query);
   ASSERT_EQ(IndexResult_NumValue(vecIt->current), exp_dist);
-  ASSERT_EQ(RSValue_Number_Get(vecIt->current->metrics[0].value), exp_dist);
+  ASSERT_EQ(MetricsVec_AsSlice(&vecIt->current->metrics).data[0].value, exp_dist);
 
   ASSERT_EQ(vecIt->SkipTo(vecIt, n-1), ITERATOR_OK);
   ASSERT_EQ(vecIt->lastDocId, n-1);
   exp_dist = VecSimIndex_GetDistanceFrom_Unsafe(index, vecIt->lastDocId, query);
   ASSERT_EQ(IndexResult_NumValue(vecIt->current), exp_dist);
-  ASSERT_EQ(RSValue_Number_Get(vecIt->current->metrics[0].value), exp_dist);
+  ASSERT_EQ(MetricsVec_AsSlice(&vecIt->current->metrics).data[0].value, exp_dist);
 
   // Invalid SkipTo
   ASSERT_EQ(vecIt->SkipTo(vecIt, n+1), ITERATOR_EOF);
@@ -1146,7 +1146,7 @@ TEST_F(IndexTest, testHugeSpec) {
   s = (IndexSpec *)StrongRef_Get(ref);
   ASSERT_TRUE(s == NULL);
   ASSERT_TRUE(QueryError_HasError(&err));
-#if (defined(__x86_64__) || defined(__aarch64__) || defined(__arm64__)) && !defined(RS_NO_U128)
+#if (defined(__x86_64__) || defined(__aarch64__) || defined(__arm64__))
   ASSERT_STREQ("SEARCH_LIMIT_OVER Schema is limited to 128 TEXT fields", QueryError_GetUserError(&err));
 #else
   ASSERT_STREQ("SEARCH_LIMIT_OVER Schema is limited to 64 TEXT fields", QueryError_GetUserError(&err));
@@ -1177,7 +1177,7 @@ TEST_F(IndexTest, testIndexFlags) {
   // storing fieldmask on idx             16
   ASSERT_EQ(40, index_memsize);
   ASSERT_TRUE(InvertedIndex_Flags(w) == flags);
-  size_t sz = InvertedIndex_WriteForwardIndexEntry(w, &h);
+  size_t sz = InvertedIndex_WriteForwardIndexEntry(w, &h).mem_growth;
   ASSERT_EQ(73, sz);
   InvertedIndex_Free(w);
 
@@ -1185,7 +1185,7 @@ TEST_F(IndexTest, testIndexFlags) {
   w = NewInvertedIndex(IndexFlags(flags), &index_memsize);
   ASSERT_EQ(40, index_memsize);
   ASSERT_TRUE(!(InvertedIndex_Flags(w) & Index_StoreTermOffsets));
-  size_t sz2 = InvertedIndex_WriteForwardIndexEntry(w, &h);
+  size_t sz2 = InvertedIndex_WriteForwardIndexEntry(w, &h).mem_growth;
   ASSERT_EQ(sz2, 60);
   InvertedIndex_Free(w);
 
@@ -1194,7 +1194,7 @@ TEST_F(IndexTest, testIndexFlags) {
   ASSERT_EQ(40, index_memsize);
   ASSERT_TRUE((InvertedIndex_Flags(w) & Index_WideSchema));
   h.fieldMask = 0xffffffffffff;
-  ASSERT_EQ(77, InvertedIndex_WriteForwardIndexEntry(w, &h));
+  ASSERT_EQ(77, InvertedIndex_WriteForwardIndexEntry(w, &h).mem_growth);
   InvertedIndex_Free(w);
 
   flags &= Index_StoreFreqs;
@@ -1206,7 +1206,7 @@ TEST_F(IndexTest, testIndexFlags) {
   ASSERT_EQ(24, index_memsize);
   ASSERT_TRUE(!(InvertedIndex_Flags(w) & Index_StoreTermOffsets));
   ASSERT_TRUE(!(InvertedIndex_Flags(w) & Index_StoreFieldFlags));
-  sz = InvertedIndex_WriteForwardIndexEntry(w, &h);
+  sz = InvertedIndex_WriteForwardIndexEntry(w, &h).mem_growth;
   ASSERT_EQ(59, sz);
   InvertedIndex_Free(w);
 
@@ -1216,7 +1216,7 @@ TEST_F(IndexTest, testIndexFlags) {
   ASSERT_TRUE((InvertedIndex_Flags(w) & Index_WideSchema));
   ASSERT_TRUE((InvertedIndex_Flags(w) & Index_StoreFieldFlags));
   h.fieldMask = 0xffffffffffff;
-  sz = InvertedIndex_WriteForwardIndexEntry(w, &h);
+  sz = InvertedIndex_WriteForwardIndexEntry(w, &h).mem_growth;
   ASSERT_EQ(67, sz);
   InvertedIndex_Free(w);
 
@@ -1244,7 +1244,7 @@ TEST_F(IndexTest, testDocTable) {
   ASSERT_EQ(N + 1, dt.size);
   ASSERT_EQ(N, dt.maxDocId);
 #ifdef __x86_64__
-  ASSERT_EQ(9380 + doc_table_size, (int)dt.memsize);
+  ASSERT_EQ(10180 + doc_table_size, (int)dt.memsize);
 #endif
   for (int i = 0; i < N; i++) {
     snprintf(buf, sizeof(buf), "doc_%d", i);
@@ -1281,7 +1281,7 @@ TEST_F(IndexTest, testDocTable) {
   RSDocumentMetadata *dmd = DocTable_Put(&dt, "Hello", 5, 1.0, Document_DefaultFlags, NULL, 0, DocumentType_Hash);
   t_docId strDocId = dmd->id;
   ASSERT_TRUE(0 != strDocId);
-  ASSERT_EQ(63 + doc_table_size, (int)dt.memsize);
+  ASSERT_EQ(71 + doc_table_size, (int)dt.memsize);
 
   // Test that binary keys also work here
   static const char binBuf[] = {"Hello\x00World"};
@@ -1290,7 +1290,7 @@ TEST_F(IndexTest, testDocTable) {
   DMD_Return(dmd);
   dmd = DocTable_Put(&dt, binBuf, binBufLen, 1.0, Document_DefaultFlags, NULL, 0, DocumentType_Hash);
   ASSERT_TRUE(dmd);
-  ASSERT_EQ(132 + doc_table_size, (int)dt.memsize);
+  ASSERT_EQ(148 + doc_table_size, (int)dt.memsize);
   ASSERT_NE(dmd->id, strDocId);
   ASSERT_EQ(dmd->id, DocIdMap_Get(&dt.dim, binBuf, binBufLen));
   ASSERT_EQ(strDocId, DocIdMap_Get(&dt.dim, "Hello", 5));
@@ -1338,7 +1338,7 @@ TEST_F(IndexTest, testDeltaSplits) {
   InvertedIndex_WriteForwardIndexEntry(idx, &ent);
   ASSERT_EQ(InvertedIndex_NumBlocks(idx), 2);
 
-  IndexDecoderCtx decoderCtx = {.field_mask_tag = IndexDecoderCtx_FieldMask, .field_mask = RS_FIELDMASK_ALL};
+  IndexDecoderCtx decoderCtx = {.fieldmask_tag = IndexDecoderCtx_FieldMask, .fieldmask = RS_FIELDMASK_ALL};
   IndexReader *reader = NewIndexReader(idx, decoderCtx);
   RSIndexResult *res = NewTokenRecord(NULL, 1);
   res->freq = 1;

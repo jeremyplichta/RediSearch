@@ -13,9 +13,10 @@
 
 use std::ptr::NonNull;
 
-use ffi::{IndexFlags_Index_WideSchema, RS_INVALID_FIELD_INDEX, RedisSearchCtx};
+use ffi::{IndexFlags_Index_WideSchema, RedisSearchCtx};
 use field::{FieldFilterContext, FieldMaskOrIndex};
-use inverted_index::RSIndexResult;
+use index_result::RSIndexResult;
+use rqe_core::RS_INVALID_FIELD_INDEX;
 
 /// Trait for checking if a document has expired.
 ///
@@ -93,8 +94,11 @@ impl ExpirationChecker for FieldExpirationChecker {
         // SAFETY: Guaranteed by the safety contract of `new`.
         let spec = unsafe { *(sctx.spec) };
 
-        // Check if TTL is configured and field expiration monitoring is enabled
-        if spec.docs.ttl.is_null() || !spec.monitorFieldExpiration {
+        // The TTL table holds field-level (HEXPIRE) entries only and is
+        // destroyed once the last one leaves the index, so a NULL `ttl`
+        // pointer is a sufficient and tight gate by itself: it means no doc
+        // in this spec currently has a field-level expiration.
+        if spec.docs.ttl.is_null() {
             return false;
         }
 
@@ -108,17 +112,22 @@ impl ExpirationChecker for FieldExpirationChecker {
     }
 
     fn is_expired(&self, result: &RSIndexResult) -> bool {
-        // `has_expiration()` should have been checked before calling this method.
-        // If TTL is not configured, the iterator should use the fast path without expiration checks.
-        debug_assert!(
-            self.has_expiration(),
-            "is_expired() should not be called when has_expiration() returns false"
-        );
-
         // SAFETY: Guaranteed by the safety contract of `new`.
         let sctx = unsafe { self.sctx.as_ref() };
         // SAFETY: Guaranteed by the safety contract of `new`.
         let spec = unsafe { *(sctx.spec) };
+
+        // The TTL table may transition from non-NULL to NULL mid-query when the
+        // last HFE doc is removed via `DocTable_Pop` (with the spec lock briefly
+        // released around an iterator yield). The InvIndIterator caches its
+        // `read_impl`/`skip_to_impl` function pointers at construction based on
+        // `has_expiration()` and does not refresh them in `revalidate()`, so we
+        // can be entered here with a now-NULL `ttl`. Mirror the C-side guard in
+        // `DocTable_CheckFieldExpirationPredicate` and treat that as "not
+        // expired" — passing NULL into the FFI verifier would deref it.
+        if spec.docs.ttl.is_null() {
+            return false;
+        }
 
         let current_time = &sctx.time.current as *const _;
         let doc_id = result.doc_id;

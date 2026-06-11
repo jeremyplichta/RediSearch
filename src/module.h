@@ -38,6 +38,8 @@ extern "C" {
 // docs and code.
 #define CMD_INTERNAL "internal"
 
+int RediSearch_Init(RedisModuleCtx *ctx);
+
 int RediSearch_InitModuleInternal(RedisModuleCtx *ctx);
 
 extern redisearch_thpool_t *depleterPool;
@@ -80,7 +82,18 @@ do {                                            \
     return REDISMODULE_ERR;                                            \
   }
 
-#define IS_SST_RDB_IN_PROCESS(ctx) (RedisModule_GetContextFlags(ctx) & REDISMODULE_CTX_FLAGS_SST_RDB)
+static inline bool IS_SST_RDB_IN_PROCESS(RedisModuleCtx *ctx) {
+  return (RedisModule_GetContextFlags(ctx) & REDISMODULE_CTX_FLAGS_SST_RDB) != 0;
+}
+
+static inline bool IS_SST_RDB_LOADING(RedisModuleCtx *ctx) {
+  // Fetch the context flags once and test both bits, instead of calling
+  // RedisModule_GetContextFlags() twice.
+  int flags = RedisModule_GetContextFlags(ctx);
+  return (flags & REDISMODULE_CTX_FLAGS_SST_RDB) &&
+         (flags & (REDISMODULE_CTX_FLAGS_LOADING | REDISMODULE_CTX_FLAGS_ASYNC_LOADING));
+}
+
 // Forward declaration of searchReducerCtx
 struct searchReducerCtx;
 
@@ -124,6 +137,7 @@ void processResultFormat(uint32_t *flags, MRReply *map);
 
 int DistAggregateCommandImp(RedisModuleCtx *ctx, RedisModuleString **argv, int argc, bool isDebug);
 int DistSearchCommandImp(RedisModuleCtx *ctx, RedisModuleString **argv, int argc, bool isDebug);
+int DistHybridCommandInternal(RedisModuleCtx *ctx, RedisModuleString **argv, int argc, bool isDebug, bool isProfile);
 int RSProfileCommandImp(RedisModuleCtx *ctx, RedisModuleString **argv, int argc, bool isDebug);
 int ProfileCommandHandlerImp(RedisModuleCtx *ctx, RedisModuleString **argv, int argc, bool isDebug);
 

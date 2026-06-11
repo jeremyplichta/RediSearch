@@ -10,6 +10,7 @@
 
 #include "gtest/gtest.h"
 #include "aggregate/aggregate.h"
+#include "search_result_ffi.h"
 #include "redismock/redismock.h"
 #include "redismock/util.h"
 #include "redismock/internal.h"
@@ -57,7 +58,7 @@ TEST_F(AggTest, testBasic) {
 
   AREQ *rr = AREQ_New();
   RMCK::ArgvList aggArgs(ctx, "*");
-  rv = AREQ_Compile(rr, aggArgs, aggArgs.size(), false, &qerr);
+  rv = AREQ_Compile(rr, ctx, aggArgs, aggArgs.size(), false, &qerr);
   ASSERT_EQ(REDISMODULE_OK, rv) << QueryError_GetUserError(&qerr);
   ASSERT_FALSE(QueryError_HasError(&qerr));
   RedisSearchCtx *sctx = NewSearchCtxC(ctx, spec->specName, true);
@@ -168,7 +169,8 @@ TEST_F(AggTest, testGroupBy) {
   RLookupKey *score_out = RLookup_GetKey_Write(&rk_out, "SCORE", RLOOKUP_F_NOFLAGS);
   RLookupKey *count_out = RLookup_GetKey_Write(&rk_out, "COUNT", RLOOKUP_F_NOFLAGS);
 
-  Grouper *gr = Grouper_New((const RLookupKey **)&ctx.rkvalue, (const RLookupKey **)&v_out, 1);
+  Grouper *gr = Grouper_New((const RLookupKey **)&ctx.rkvalue, (const RLookupKey **)&v_out, 1,
+                            GroupByLimits_Default(DEFAULT_MAX_AGGREGATE_GROUPS));
   ASSERT_TRUE(gr != NULL);
 
   ArgsCursor args = {0};
@@ -212,7 +214,8 @@ TEST_F(AggTest, testGroupSplit) {
   gen.kvalue = RLookup_GetKey_Write(&lk_in, "value", RLOOKUP_F_NOFLAGS);
   RLookupKey *val_out = RLookup_GetKey_Write(&lk_out, "value", RLOOKUP_F_NOFLAGS);
   RLookupKey *count_out = RLookup_GetKey_Write(&lk_out, "COUNT", RLOOKUP_F_NOFLAGS);
-  Grouper *gr = Grouper_New((const RLookupKey **)&gen.kvalue, (const RLookupKey **)&val_out, 1);
+  Grouper *gr = Grouper_New((const RLookupKey **)&gen.kvalue, (const RLookupKey **)&val_out, 1,
+                            GroupByLimits_Default(DEFAULT_MAX_AGGREGATE_GROUPS));
   ArgsCursor args = {0};
   ReducerOptions opt = {0};
   opt.args = &args;
@@ -305,7 +308,7 @@ TEST_F(AggTest, AvoidingCompleteResultStructOpt) {
     AREQ *rr = AREQ_New();
     AREQ_AddRequestFlags(rr, flags);
     RMCK::ArgvList aggArgs(ctx, "*", args...);
-    int rv = AREQ_Compile(rr, aggArgs, aggArgs.size(), false, &qerr);
+    int rv = AREQ_Compile(rr, ctx, aggArgs, aggArgs.size(), false, &qerr);
     EXPECT_EQ(REDISMODULE_OK, rv) << QueryError_GetUserError(&qerr);
     bool res = rr->searchopts.flags & Search_CanSkipRichResults;
     QueryError_ClearError(&qerr);

@@ -444,6 +444,24 @@ def testStopwords(env):
     env.assertEqual(0, r1[0])
     env.assertEqual(1, r2[0])
 
+def testStopwordParserCaseFold(env):
+    # Stopword detection in the query lexer/parser is case-insensitive: a
+    # mixed-case stopword adjacent to a real term must still collapse out
+    # of the query rather than leak through as a literal TERM (which would
+    # then miss the lowercased term trie and yield 0 docs).
+    env.cmd('FT.CREATE', 'idx', 'STOPWORDS', 1, 'the',
+            'SCHEMA', 't', 'TEXT')
+    conn = getConnectionByEnv(env)
+    conn.execute_command('HSET', 'doc:1', 't', 'The quick brown fox')
+
+    for dialect in (1, 2):
+        for stop in ('the', 'THE', 'The', 'tHe'):
+            env.assertEqual(
+                [1, 'doc:1'],
+                env.cmd('FT.SEARCH', 'idx', f'{stop} quick',
+                        'NOCONTENT', 'DIALECT', dialect),
+                message=f'dialect={dialect} stop={stop!r}')
+
 def testNoStopwords(env):
     # This test taken from Java's test suite
     env.cmd('ft.create', 'idx', 'ON', 'HASH', 'schema', 'title', 'text')
@@ -3757,6 +3775,37 @@ def testAliasAddIfNX(env):
 def testAliasDelIfX(env):
     env.expect('FT._ALIASDELIFX a1').ok()
 
+def test_alias_list(env):
+    env.cmd('ft.create', 'idx', 'ON', 'HASH', 'schema', 't1', 'text')
+
+    # No aliases initially
+    env.expect('ft.aliaslist', 'idx').equal([])
+
+    # Add some aliases
+    env.cmd('ft.aliasAdd', 'alias1', 'idx')
+    env.cmd('ft.aliasAdd', 'alias2', 'idx')
+
+    # List should contain both aliases
+    res = env.cmd('ft.aliaslist', 'idx')
+    env.assertEqual(sorted(res), sorted(['alias1', 'alias2']))
+
+    # Delete one alias
+    env.cmd('ft.aliasDel', 'alias1')
+    env.expect('ft.aliaslist', 'idx').equal(['alias2'])
+
+    # Error on non-existent index
+    env.expect('ft.aliaslist', 'nonexistent').error().contains('SEARCH_INDEX_NOT_FOUND Index not found: nonexistent')
+
+    # Error on alias name (not index name) - aliases cannot be used
+    # The INDEXSPEC_LOAD_NOALIAS flag ensures we only accept actual index names
+    env.expect('ft.aliaslist', 'alias2').error().contains('SEARCH_INDEX_NOT_FOUND Index not found: alias2')
+
+    # Wrong arity - no arguments
+    env.expect('ft.aliaslist').error().contains('wrong number of arguments')
+
+    # Wrong arity - too many arguments
+    env.expect('ft.aliaslist', 'idx', 'extra').error().contains('wrong number of arguments')
+
 def testEmptyDoc(env):
     conn = getConnectionByEnv(env)
     env.expect('FT.CREATE idx SCHEMA t TEXT').ok()
@@ -4366,7 +4415,9 @@ def test_cluster_set_myself_excluded(env: Env):
     ]
     env.expect('SEARCH.CLUSTERINFO').equal(expected)
 
-@skip(cluster=False) # this test is only relevant on cluster
+# TODO(MOD-15868): re-enable once https://redislabs.atlassian.net/browse/MOD-15868 is resolved
+@skip()
+#@skip(cluster=False) # this test is only relevant on cluster
 def test_cluster_set_errors(env: Env):
 
     # Check general values parsing
@@ -4573,6 +4624,7 @@ def test_with_tls():
     common_with_auth(env)
 
 # TODO: enable macos+san once https://redislabs.atlassian.net/browse/RED-176581 is fixed
+@skip_until("2026-07-29", reason="Flaky test, see RED-176581")
 @skip(cluster=False, macos=True, asan=True)
 def test_with_tls_and_non_tls_ports():
     """Tests that the coordinator-shard connections are using the correct

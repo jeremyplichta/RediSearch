@@ -7,6 +7,7 @@
  * GNU Affero General Public License v3 (AGPLv3).
 */
 #include "aggregate.h"
+#include "search_result_ffi.h"
 #include "reducer.h"
 
 #include <cursor.h>
@@ -25,9 +26,11 @@
 #include "obfuscation/hidden.h"
 #include "hybrid/vector_query_utils.h"
 #include "vector_index.h"
-#include "slots_tracker.h"
+#include "slots_tracker_ffi.h"
 #include "asm_state_machine.h"
 #include "coord/rmr/command.h"
+#include "coord/rmr/chan.h"
+#include "coord/rpnet.h"
 #include "search_disk.h"
 #include "search_disk_utils.h"
 #include "doc_id_meta.h"
@@ -722,6 +725,15 @@ static int parseQueryArgs(ArgsCursor *ac, AREQ *req, RSSearchOptions *searchOpts
     AREQ_AddRequestFlags(req, QEXEC_OPTIMIZE);
   }
 
+  // QEXEC_OPTIMIZE can be set either by the dialect-4 default above or by an
+  // explicit WITHOUTCOUNT token earlier in this function. Either way, the
+  // QOptimizer pipeline reads from the RAM DocTable / NumericRangeTree, which
+  // aren't populated on disk specs. Force-disable so QOptimizer_Iterators is
+  // never entered for disk specs (it asserts the same).
+  if (isDiskIndex) {
+    AREQ_RemoveRequestFlags(req, QEXEC_OPTIMIZE);
+  }
+
   QEFlags reqFlags = AREQ_RequestFlags(req);
   if ((reqFlags & QEXEC_F_SEND_SCOREEXPLAIN) && !(reqFlags & QEXEC_F_SEND_SCORES)) {
     QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS, "EXPLAINSCORE must be accompanied with WITHSCORES");
@@ -822,6 +834,7 @@ static void groupStepFree(PLN_BaseStep *base) {
     for (size_t ii = 0; ii < nreducers; ++ii) {
       PLN_Reducer *gr = g->reducers + ii;
       rm_free(gr->alias);
+      rm_free(gr->inputAlias);
     }
     array_free(g->reducers);
   }
@@ -879,6 +892,8 @@ int PLNGroupStep_AddReducer(PLN_GroupStep *gstp, const char *name, ArgsCursor *a
     gr->alias = rm_strdup(alias);
   }
   gr->isHidden = 0; // By default, reducers are not hidden
+  gr->isLocal = false;
+  gr->inputAlias = NULL;
   return REDISMODULE_OK;
 
 error:
@@ -1053,6 +1068,26 @@ static int handleLoad(AGGPlan *plan, uint32_t *reqflags, ArgsCursor *ac, bool is
   return REDISMODULE_OK;
 }
 
+bool RunInThread(RedisModuleCtx *ctx) {
+  const bool hasWorkerThreads = RSGlobalConfig.numWorkerThreads > 0;
+  if (!hasWorkerThreads) {
+    return false;
+  }
+
+  const bool blockClientUnavailable = RedisModule_GetContextFlags(ctx) & REDISMODULE_CTX_FLAGS_DENY_BLOCKING;
+  if (blockClientUnavailable && RSGlobalConfig.fallbackToMainThreadWhenBlockClientUnavailable) {
+    // We only log once to reduce log spam
+    static bool logged = false;
+    if (!logged) {
+      RedisModule_Log(ctx, "warning", "Detected a client that cannot be blocked, all similar requests including this one will fall back to run on the main thread.");
+      logged = true;
+    }
+    return false;
+  }
+
+  return true;
+}
+
 AREQ *AREQ_New(void) {
   AREQ* req = rm_calloc(1, sizeof(AREQ));
   /*
@@ -1078,12 +1113,65 @@ AREQ *AREQ_New(void) {
   return req;
 }
 
-bool AREQ_TimedOut(AREQ *req) {
-  return atomic_load_explicit(&req->syncCtx.timedOut, memory_order_acquire);
+bool SearchTime_IsTimedOut(void *arg) {
+  const SearchTime *time = arg;
+  if (!time || !time->timedOutFlag) return false;
+  return atomic_load_explicit((const _Atomic(bool) *)time->timedOutFlag,
+                              memory_order_relaxed);
 }
 
-void AREQ_SetTimedOut(AREQ *req) {
-  atomic_store_explicit(&req->syncCtx.timedOut, true, memory_order_release);
+bool AREQ_TryClaimAggregateResults(AREQ *req) {
+  bool expected = false;
+  return atomic_compare_exchange_strong_explicit(&req->syncCtx.aggregatingResults, &expected, true,
+                                                 memory_order_relaxed, memory_order_relaxed);
+}
+
+void AREQ_SignalAggregateResultsComplete(AREQ *req) {
+  pthread_mutex_lock(&req->syncCtx.aggregateResultsLock);
+  req->syncCtx.aggregateResultsDone = true;
+  pthread_cond_broadcast(&req->syncCtx.aggregateResultsCond);
+  pthread_mutex_unlock(&req->syncCtx.aggregateResultsLock);
+}
+
+void AREQ_WaitForAggregateResultsComplete(AREQ *req) {
+  pthread_mutex_lock(&req->syncCtx.aggregateResultsLock);
+  while (!req->syncCtx.aggregateResultsDone) {
+    pthread_cond_wait(&req->syncCtx.aggregateResultsCond, &req->syncCtx.aggregateResultsLock);
+  }
+  pthread_mutex_unlock(&req->syncCtx.aggregateResultsLock);
+}
+
+void AREQ_ResetForCursorReadReturnStrict(AREQ *req) {
+  RS_AtomicBoolStoreRelaxed(&req->syncCtx.aggregatingResults, false);
+  req->syncCtx.aggregateResultsClaimLost = false;
+  pthread_mutex_lock(&req->syncCtx.aggregateResultsLock);
+  req->syncCtx.aggregateResultsDone = false;
+  pthread_mutex_unlock(&req->syncCtx.aggregateResultsLock);
+  RS_AtomicBoolStoreRelaxed(&req->syncCtx.timedOut, false);
+  ResultProcessor *root = AREQ_QueryProcessingCtx(req)->rootProc;
+  if (root && root->type == RP_NETWORK) {
+    ((RPNet *)root)->drainOnly = false;
+  }
+}
+
+void RequestSyncCtx_RegisterAbortWakeChannel(RequestSyncCtx *ctx, struct MRChannel *chan) {
+  pthread_mutex_lock(&ctx->abortWakeLock);
+  ctx->abortWakeChannel = chan;
+  pthread_mutex_unlock(&ctx->abortWakeLock);
+}
+
+void RequestSyncCtx_UnregisterAbortWakeChannel(RequestSyncCtx *ctx) {
+  pthread_mutex_lock(&ctx->abortWakeLock);
+  ctx->abortWakeChannel = NULL;
+  pthread_mutex_unlock(&ctx->abortWakeLock);
+}
+
+void RequestSyncCtx_WakeAbortChannel(RequestSyncCtx *ctx) {
+  pthread_mutex_lock(&ctx->abortWakeLock);
+  if (ctx->abortWakeChannel) {
+    MRChannel_WakeAbort(ctx->abortWakeChannel);
+  }
+  pthread_mutex_unlock(&ctx->abortWakeLock);
 }
 
 
@@ -1142,15 +1230,15 @@ static bool IsNeededDepleter(AREQ *req) {
 
 // This function should only be called from the main thread (calling RunInThread() is not thread safe)
 // AREQ execution flags are not set when this function is called currently
-static bool shouldCheckInPipelineTimeout(AREQ *req) {
+static bool shouldCheckInPipelineTimeout(RedisModuleCtx* ctx, AREQ *req) {
   // We should check for timeout in pipeline only if timeout is > 0
   // and when the policy is RETURN or the policy is FAIL/RETURN-strict, without workers.
   return req->reqConfig.queryTimeoutMS > 0 &&
-         (req->reqConfig.timeoutPolicy == TimeoutPolicy_Return || !RunInThread());
+         (req->reqConfig.timeoutPolicy == TimeoutPolicy_Return || !RunInThread(ctx));
 
 }
 
-int AREQ_Compile(AREQ *req, RedisModuleString **argv, int argc, bool isDiskIndex, QueryError *status) {
+int AREQ_Compile(AREQ *req, RedisModuleCtx *ctx, RedisModuleString **argv, int argc, bool isDiskIndex, QueryError *status) {
   req->args = rm_malloc(sizeof(*req->args) * argc);
   req->nargs = argc;
   // Copy the arguments into an owned array of sds strings
@@ -1197,6 +1285,12 @@ int AREQ_Compile(AREQ *req, RedisModuleString **argv, int argc, bool isDiskIndex
     goto error;
   }
 
+  // Cap the per-query timeout to _MAX_FOREGROUND_TIMEOUT_LIMIT when workers
+  // are disabled; the state flag drives the RESP3 MaxTimeoutCapped warning.
+  if (RSConfig_CapQueryTimeoutToForegroundLimit(&req->reqConfig.queryTimeoutMS)) {
+    req->stateflags |= QEXEC_S_MAX_TIMEOUT_CAPPED;
+  }
+
   if (IsInternal(req) &&
       RequestConfig_ApplyCoordinatorElapsedTime(&req->reqConfig, req->profileClocks.coordDispatchTime)) {
     QueryError_SetCode(status, QUERY_ERROR_CODE_TIMED_OUT);
@@ -1217,7 +1311,7 @@ int AREQ_Compile(AREQ *req, RedisModuleString **argv, int argc, bool isDiskIndex
   }
 
   // Check if we should check for timeout in pipeline
-  AREQ_SetSkipTimeoutChecks(req, !shouldCheckInPipelineTimeout(req));
+  AREQ_SetSkipTimeoutChecks(req, !shouldCheckInPipelineTimeout(ctx, req));
 
   return REDISMODULE_OK;
 
@@ -1406,6 +1500,10 @@ int AREQ_ApplyContext(AREQ *req, RedisSearchCtx *sctx, QueryError *status) {
   IndexSpec *index = sctx->spec;
   RSSearchOptions *opts = &req->searchopts;
   req->sctx = sctx;
+  // Borrow the request's timed-out flag onto the sctx so pipeline RPs can
+  // observe a RETURN-STRICT main-thread timeout without holding an AREQ
+  // back-pointer (read via SearchTime_IsTimedOut).
+  sctx->time.timedOutFlag = &req->syncCtx.timedOut;
 
   if (!IsIndexCoherent(req)) {
     QueryError_SetError(status, QUERY_ERROR_CODE_MISMATCH, NULL);
@@ -1454,24 +1552,7 @@ int AREQ_ApplyContext(AREQ *req, RedisSearchCtx *sctx, QueryError *status) {
     opts->scorerName = RSGlobalConfig.defaultScorer;
   }
 
-  // Block scorers that use slop for disk indexes
-  if (SearchDisk_IsEnabledForValidation()) {
-    if (strcasecmp(opts->scorerName, TFIDF_SCORER_NAME) == 0) {
-      if (!SearchDisk_MarkUnsupportedArgumentIfDiskEnabled("TFIDF scorer", status)) {
-        return REDISMODULE_ERR;
-      }
-    }
-    if (strcasecmp(opts->scorerName, TFIDF_DOCNORM_SCORER_NAME) == 0) {
-      if (!SearchDisk_MarkUnsupportedArgumentIfDiskEnabled("TFIDF.DOCNORM scorer", status)) {
-        return REDISMODULE_ERR;
-      }
-    }
-    if (strcasecmp(opts->scorerName, BM25_SCORER_NAME) == 0) {
-      if (!SearchDisk_MarkUnsupportedArgumentIfDiskEnabled("BM25 scorer", status)) {
-        return REDISMODULE_ERR;
-      }
-    }
-  }
+
 
   bool resp3 = req->protocol == 3;
   if (SetValueFormat(resp3, isSpecJson(index), &req->reqflags, status) != REDISMODULE_OK) {
@@ -1647,6 +1728,9 @@ static void AREQ_Free(AREQ *req) {
   }
 
   rm_free(req->args);
+
+  RequestSyncCtx_Destroy(&req->syncCtx);
+
   rm_free(req);
 }
 
@@ -1661,7 +1745,34 @@ void AREQ_DecrRef(AREQ *req) {
   }
 }
 
-int AREQ_BuildPipeline(AREQ *req, QueryError *status) {
+void AREQ_CleanUpStoredCursor(AREQ *req) {
+  if (req->storedReplyState.cursor) {
+    Cursor *cursor = req->storedReplyState.cursor;
+    req->storedReplyState.cursor = NULL;
+    Cursor_Free(cursor);
+  }
+}
+
+AggregationPipelineParams AREQ_MakeAggregationPipelineParams(AREQ *req,
+                                                             GroupByLimits groupByLimits) {
+  return (AggregationPipelineParams){
+    .common = {
+      .sctx = req->sctx,
+      .reqflags = req->reqflags,
+      .optimizer = req->optimizer,
+      // Score alias is not supposed to be used in the aggregation pipeline
+      .scoreAlias = NULL,
+    },
+    .outFields = &req->outFields,
+    .maxResultsLimit = IsSearch(req) ? req->maxSearchResults : req->maxAggregateResults,
+    .groupByLimits = groupByLimits,
+    .language = req->searchopts.language,
+  };
+}
+
+int AREQ_BuildPipelineWithAggregationParams(AREQ *req,
+                                            const AggregationPipelineParams *aggregationParams,
+                                            QueryError *status) {
   Pipeline_Initialize(&req->pipeline, req->reqConfig.timeoutPolicy, status);
   if (!(AREQ_RequestFlags(req) & QEXEC_F_BUILDPIPELINE_NO_ROOT)) {
     QueryPipelineParams params = {
@@ -1680,22 +1791,21 @@ int AREQ_BuildPipeline(AREQ *req, QueryError *status) {
     };
     req->rootiter = NULL; // Ownership of the root iterator is now with the params.
     req->querySlots = NULL; // Ownership of the slot ranges is now with the params.
-    Pipeline_BuildQueryPart(&req->pipeline, &params);
+    Pipeline_BuildQueryPart(&req->pipeline, &params, status);
     if (QueryError_HasError(status)) {
       return REDISMODULE_ERR;
     }
   }
-  AggregationPipelineParams params = {
-    .common = {
-      .sctx = req->sctx,
-      .reqflags = req->reqflags,
-      .optimizer = req->optimizer,
-      // Right now score alias is not supposed to be used in the aggregation pipeline
-      .scoreAlias = NULL,
-    },
-    .outFields = &req->outFields,
-    .maxResultsLimit = IsSearch(req) ? req->maxSearchResults : req->maxAggregateResults,
-    .language = req->searchopts.language,
-  };
-  return Pipeline_BuildAggregationPart(&req->pipeline, &params, &req->stateflags);
+  int rc = Pipeline_BuildAggregationPart(&req->pipeline, aggregationParams, &req->stateflags, status);
+  if (rc == REDISMODULE_OK) {
+    AREQ_SetCanYieldPartialResults(req);
+  }
+  return rc;
+}
+
+int AREQ_BuildPipeline(AREQ *req, QueryError *status) {
+  AggregationPipelineParams aggregationParams =
+      AREQ_MakeAggregationPipelineParams(
+          req, GroupByLimits_Default(RSGlobalConfig.maxAggregateGroups));
+  return AREQ_BuildPipelineWithAggregationParams(req, &aggregationParams, status);
 }

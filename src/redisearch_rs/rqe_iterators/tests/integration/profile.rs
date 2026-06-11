@@ -9,7 +9,10 @@
 
 use std::time::Duration;
 
-use rqe_iterators::{IteratorType, RQEIterator, Wildcard, profile::Profile};
+use rqe_iterators::{
+    IteratorType, RQEIterator, Wildcard,
+    profile::{Profile, ProfileCounters},
+};
 
 use crate::utils::{Mock, MockIteratorError};
 
@@ -153,6 +156,7 @@ fn profile_rewind() {
 
 #[test]
 fn profile_revalidate() {
+    let mock_ctx = rqe_iterators_test_utils::MockContext::new(0, 0);
     let child = Wildcard::new(10, 1.0);
     let mut profile = Profile::new(child);
 
@@ -160,10 +164,60 @@ fn profile_revalidate() {
     let _ = profile.read(); // doc 2
 
     // Revalidate (Wildcard returns OK)
-    let status = profile.revalidate();
+    let status = profile.revalidate(&*mock_ctx.spec_read());
     assert!(status.is_ok());
 
     // Verify delegation still works
     assert_eq!(profile.last_doc_id(), 2);
     assert_eq!(profile.current().unwrap().doc_id, 2);
+}
+
+// ── ProfileCounters::num_reading_operations tests ───────────────────────
+
+#[test]
+fn counters_read_only() {
+    let counters = ProfileCounters {
+        read: 42,
+        skip_to: 0,
+        eof: false,
+    };
+    assert_eq!(counters.num_reading_operations(), 42);
+}
+
+#[test]
+fn counters_read_and_skip_to() {
+    let counters = ProfileCounters {
+        read: 10,
+        skip_to: 20,
+        eof: false,
+    };
+    assert_eq!(counters.num_reading_operations(), 30);
+}
+
+#[test]
+fn counters_with_eof_subtracts_one() {
+    let counters = ProfileCounters {
+        read: 5,
+        skip_to: 3,
+        eof: true,
+    };
+    // (5 + 3) - 1 = 7
+    assert_eq!(counters.num_reading_operations(), 7);
+}
+
+#[test]
+fn counters_eof_saturates_at_zero() {
+    let counters = ProfileCounters {
+        read: 0,
+        skip_to: 0,
+        eof: true,
+    };
+    // (0 + 0).saturating_sub(1) = 0
+    assert_eq!(counters.num_reading_operations(), 0);
+}
+
+#[test]
+fn counters_default_is_zero() {
+    let counters = ProfileCounters::default();
+    assert_eq!(counters.num_reading_operations(), 0);
 }

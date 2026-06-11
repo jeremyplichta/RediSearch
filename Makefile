@@ -14,6 +14,8 @@ MAKEFLAGS += --no-print-directory
 ROOT := $(shell pwd)
 BUILD_SCRIPT := $(ROOT)/build.sh
 
+export PATH := $(HOME)/.cargo/bin:$(HOME)/.local/bin:$(PATH)
+
 # Default target
 .DEFAULT_GOAL := build
 
@@ -79,6 +81,10 @@ endif
 
 ifeq ($(RUST_DYN_CRT),1)
 	BUILD_ARGS += RUST_DYN_CRT=1
+	# Export so the `generate-rust-headers` recipe (which invokes
+	# regen_headers.sh directly, bypassing build.sh) can apply
+	# `-C target-feature=-crt-static` to its cargo invocations.
+	export RUST_DYN_CRT
 endif
 
 ifeq ($(RUN_MIRI),1)
@@ -114,6 +120,10 @@ ifeq ($(LTO),1)
 	BUILD_ARGS += LTO
 endif
 
+ifneq ($(INLINE_LSE_ATOMICS),)
+	BUILD_ARGS += INLINE_LSE_ATOMICS=$(INLINE_LSE_ATOMICS)
+endif
+
 # Package variables (used by pack target)
 MODULE_NAME := search
 PACKAGE_NAME ?=
@@ -139,6 +149,9 @@ define HELPTEXT
 RediSearch Build System
 
 Setup:
+  make bootstrap     Install build-time system dependencies.
+                     Auto-prefixes `sudo` when not root.
+    SUDO=cmd           Override the privilege-escalation command (default: auto)
   make fetch         Download and prepare dependent modules
 
 Build:
@@ -154,6 +167,10 @@ Build:
     RUST_DYN_CRT=1     Use dynamic C runtime linking (for Alpine Linux)
     VERBOSE=1          Verbose build output
     LTO=1              Enable Rust/C LTO
+    INLINE_LSE_ATOMICS=0|1
+                       Inline LSE atomics on Linux AArch64 (default: 1).
+                       Set to 0 on pre-Armv8.1-a cores (Cortex-A72,
+                       Graviton1, Raspberry Pi 4) to avoid SIGILL on load.
 
   make clean         Remove build artifacts
     ALL=1              Remove entire artifacts directory
@@ -201,6 +218,15 @@ endef # HELPTEXT
 help:
 	$(info $(HELPTEXT))
 	@:
+
+# Auto-detect: empty when running as root (containers/CI), "sudo" otherwise.
+# Override with SUDO= for environments that need a different prefix (e.g. doas)
+# or to force no prefix.
+SUDO ?= $(shell [ "$$(id -u)" -eq 0 ] || echo sudo)
+
+bootstrap:
+	@echo "Installing build dependencies..."
+	@cd $(ROOT)/.install && ./install_script.sh $(SUDO)
 
 fetch:
 	@echo "Fetching dependencies..."
@@ -301,7 +327,17 @@ define get_rust_exclude_crates
 $(shell grep "EXCLUDE_RUST_BENCHING_CRATES_LINKING_C=" build.sh | cut -d'=' -f2 | tr -d '"' | head -n1)
 endef
 
-lint:
+# Regenerate the Rust → C FFI headers under src/redisearch_rs/headers/.
+#
+# The recipe (cheadergen CLI args + env scrub) lives in
+# src/redisearch_rs/regen_headers.sh; the CMake `cheadergen_generate`
+# custom target calls the same script. See the script for the rationale
+# on the env scrub.
+generate-rust-headers:
+	@echo "Regenerating Rust → C FFI headers via cheadergen..."
+	@$(ROOT)/src/redisearch_rs/regen_headers.sh
+
+lint: generate-rust-headers
 	@echo "Running linters for debug..."
 	@cd $(ROOT)/src/redisearch_rs && cargo clippy --workspace $(call get_rust_exclude_crates) -- -D warnings
 	@cd $(ROOT)/src/redisearch_rs && RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace $(call get_rust_exclude_crates) --no-deps --document-private-items
@@ -433,7 +469,7 @@ test-linkcheck:
 	fi
 	@python3 scripts/test_link_checker.py
 
-.PHONY: help build clean test unit-tests rust-tests pytest
+.PHONY: help bootstrap fetch build clean test unit-tests rust-tests pytest
 .PHONY: run lint fmt license-check pack upload-artifacts
 .PHONY: benchmark micro-benchmarks vecsim-bench callgrind parsers verify-deps
 .PHONY: check-links check-links-verbose test-linkcheck

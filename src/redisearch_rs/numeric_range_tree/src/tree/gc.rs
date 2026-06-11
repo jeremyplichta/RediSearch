@@ -13,9 +13,11 @@
 //! the normal insert/query hot paths. It handles applying GC deltas from
 //! child processes, trimming empty leaves, and compacting the node slab.
 
+use rqe_core::DocId;
 use std::collections::HashMap;
 
-use inverted_index::{GcApplyInfo, GcScanDelta, IndexBlock, RSIndexResult};
+use index_result::RSIndexResult;
+use inverted_index::{GcApplyInfo, GcScanDelta, IndexBlock};
 
 use super::{NumericRangeTree, TrimEmptyLeavesResult};
 use crate::NumericRangeNode;
@@ -61,6 +63,9 @@ pub struct CompactIfSparseResult {
     /// The change in the tree's node memory usage, in bytes.
     /// Positive values indicate growth, negative values indicate shrinkage.
     pub node_size_delta: i64,
+    /// Net change in inverted-index block count across all dropped leaves. Always non-positive
+    /// (trimming only removes blocks).
+    pub block_count_delta: i32,
 }
 
 impl NumericRangeNode {
@@ -71,7 +76,7 @@ impl NumericRangeNode {
     ///
     /// Returns `Some(NodeGcDelta)` if the node had GC work, `None` otherwise
     /// (either the node has no range, or no documents were deleted).
-    pub fn scan_gc(&self, doc_exists: &dyn Fn(ffi::t_docId) -> bool) -> Option<NodeGcDelta> {
+    pub fn scan_gc(&self, doc_exists: &dyn Fn(DocId) -> bool) -> Option<NodeGcDelta> {
         let range = self.range()?;
 
         // Pointer to the last block of the index. Used inside the repair
@@ -213,6 +218,7 @@ impl NumericRangeTree {
         CompactIfSparseResult {
             inverted_index_size_delta: rv.size_delta,
             node_size_delta: -(slab_freed as i64),
+            block_count_delta: rv.block_count_delta,
         }
     }
 
@@ -324,6 +330,7 @@ impl NumericRangeTree {
                 let br = Self::balance_node(nodes, node_idx);
                 rv.size_delta += br.size_delta;
                 rv.num_ranges_delta += br.num_ranges_delta;
+                rv.block_count_delta += br.block_count_delta;
                 if let NumericRangeNode::Internal(internal) = &mut nodes[node_idx] {
                     internal.max_depth = br.new_depth;
                 }
@@ -348,6 +355,7 @@ impl NumericRangeTree {
         if let Some(r) = nodes[node_idx].take_range() {
             rv.size_delta -= r.memory_usage() as i64;
             rv.num_ranges_delta -= 1;
+            rv.block_count_delta -= r.entries().num_blocks() as i32;
         }
 
         if right_empty {
@@ -381,11 +389,13 @@ impl NumericRangeTree {
                 rv.num_leaves_delta -= 1;
                 rv.size_delta -= leaf.range.memory_usage() as i64;
                 rv.num_ranges_delta -= 1;
+                rv.block_count_delta -= leaf.range.entries().num_blocks() as i32;
             }
             NumericRangeNode::Internal(internal) => {
                 if let Some(range) = internal.range.as_ref() {
                     rv.size_delta -= range.memory_usage() as i64;
                     rv.num_ranges_delta -= 1;
+                    rv.block_count_delta -= range.entries().num_blocks() as i32;
                 }
             }
         }

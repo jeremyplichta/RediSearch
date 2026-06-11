@@ -13,13 +13,16 @@
 //! compressed and uncompressed numeric storage in inverted indexes.
 
 use ffi::IndexFlags_Index_StoreNumeric;
+use index_result::RSIndexResult;
 use inverted_index::{
-    EntriesTrackingIndex, IndexBlock, IndexReader, IndexReaderCore, NumericReader, RSIndexResult,
+    EntriesTrackingIndex, IndexBlock, IndexReader, IndexReaderCore, NumericReader,
     debug::Summary,
     numeric::{Numeric, NumericFloatCompression},
 };
+use rqe_core::DocId;
 
 /// Enum to hold either compressed or uncompressed numeric index.
+#[cheadergen::config(rename = "InvertedIndexNumeric")]
 #[derive(Debug)]
 pub enum NumericIndex {
     /// Uncompressed: stores f64 values at full precision (8 bytes).
@@ -41,13 +44,14 @@ impl NumericIndex {
         }
     }
 
-    /// Add a record to the index, returning bytes written.
+    /// Add a record to the index. Returns `(memory_growth, blocks_added)` — see
+    /// [`InvertedIndex::add_record`][inverted_index::InvertedIndex::add_record].
     ///
     /// # Panics
     ///
     /// Panics if the underlying write fails. This should never happen with
     /// in-memory inverted indexes, so a panic indicates a bug.
-    pub fn add_record(&mut self, record: &RSIndexResult<'_>) -> usize {
+    pub fn add_record(&mut self, record: &RSIndexResult<'_>) -> inverted_index::AddRecordOutcome {
         let result = match self {
             NumericIndex::Uncompressed(idx) => idx.add_record(record),
             NumericIndex::Compressed(idx) => idx.add_record(record),
@@ -128,7 +132,7 @@ impl NumericIndex {
     /// Get the first document ID in a specific block.
     ///
     /// Returns `None` if the block index is out of bounds.
-    pub(crate) fn block_first_id(&self, block_idx: usize) -> Option<ffi::t_docId> {
+    pub(crate) fn block_first_id(&self, block_idx: usize) -> Option<DocId> {
         match self {
             NumericIndex::Uncompressed(idx) => idx.block_ref(block_idx).map(|b| b.first_block_id()),
             NumericIndex::Compressed(idx) => idx.block_ref(block_idx).map(|b| b.first_block_id()),
@@ -151,7 +155,7 @@ impl NumericIndex {
     /// Returns `Ok(Some(delta))` if GC is needed, `Ok(None)` otherwise.
     pub fn scan_gc<F>(
         &self,
-        doc_exist: impl Fn(ffi::t_docId) -> bool,
+        doc_exist: impl Fn(DocId) -> bool,
         repair_fn: Option<F>,
     ) -> std::io::Result<Option<inverted_index::GcScanDelta>>
     where
@@ -187,7 +191,7 @@ impl<'a> IndexReader<'a> for NumericIndexReader<'a> {
 
     fn seek_record(
         &mut self,
-        doc_id: ffi::t_docId,
+        doc_id: DocId,
         result: &mut RSIndexResult<'a>,
     ) -> std::io::Result<bool> {
         match self {
@@ -196,7 +200,7 @@ impl<'a> IndexReader<'a> for NumericIndexReader<'a> {
         }
     }
 
-    fn skip_to(&mut self, doc_id: ffi::t_docId) -> bool {
+    fn skip_to(&mut self, doc_id: DocId) -> bool {
         match self {
             Self::Uncompressed(r) => r.skip_to(doc_id),
             Self::Compressed(r) => r.skip_to(doc_id),

@@ -7,18 +7,20 @@
  * GNU Affero General Public License v3 (AGPLv3).
 */
 #include "aggregate/aggregate.h"
+#include "types_ffi.h"
+#include "value_ffi.h"
 #include "result_processor.h"
 #include "query.h"
 #include "extension.h"
 #include <util/minmax_heap.h>
-#include "ext/default.h"
-#include "result_processor_rs.h"
+#include "result_processor_ffi.h"
+#include "sorting_vector_ffi.h"
 #include "rlookup.h"
 #include "rlookup_load_document.h"
 #include "rmutil/rm_assert.h"
 #include "util/timeout.h"
-#include "util/arr.h"
-#include "iterators_rs.h"
+#include "iterators_ffi.h"
+#include "metrics_ffi.h"
 #include "rs_wall_clock.h"
 #include <stdatomic.h>
 #include <pthread.h>
@@ -32,9 +34,9 @@
 #include "search_disk.h"
 #include "debug_commands.h"
 #include "search_result.h"
+#include "search_result_ffi.h"
 #include "redisearch.h"
 #include "asm_state_machine.h"
-#include "index_result.h"
 #include "index_result_async_read.h"
 
 // Maximum number of concurrent async disk reads
@@ -233,7 +235,7 @@ static bool handleSpecLockAndRevalidate(RPQueryIterator *self) {
 
   RedisSearchCtx_LockSpecRead(sctx);
 
-  ValidateStatus rc = it->Revalidate(it);
+  ValidateStatus rc = it->Revalidate(it, sctx->spec);
 
   if (rc == VALIDATE_ABORTED) {
     self->iterator->Free(self->iterator);
@@ -260,14 +262,19 @@ static int rpQueryItNext(ResultProcessor *base, SearchResult *res) {
 
 #ifdef ENABLE_ASSERT
   // Make sure MT is enabled and `workers > 0` - deadlock otherwise.
+  // Interruptible wait: existing tests ARM/SIGNAL this point, while
+  // RETURN-STRICT shard-timeout tests rely on the predicate to break out as
+  // soon as the main-thread callback flips sctx->time.timedOutFlag (mirrors
+  // the coordinator's BeforeRPNetStart).
   if (self->firstRead) {
     self->firstRead = false;
-    SyncPoint_Wait(SYNC_POINT_BEFORE_FIRST_READ);
+    SyncPoint_WaitUntil(SYNC_POINT_BEFORE_FIRST_READ, SearchTime_IsTimedOut, &sctx->time);
   }
 #endif
 
   while (1) {
-    if (TimedOut_WithCounter(&sctx->time.timeout, &self->timeoutLimiter) == TIMED_OUT) {
+    if ((TimedOut_WithCounter(&sctx->time.timeout, &self->timeoutLimiter) == TIMED_OUT) ||
+        SearchTime_IsTimedOut(&sctx->time)) {
       return UnlockSpec_and_ReturnRPResult(sctx, RS_RESULT_TIMEDOUT);
     }
 
@@ -315,9 +322,10 @@ static int rpQueryItNext_AsyncDisk(ResultProcessor *base, SearchResult *res) {
   it = self->iterator;
 
 #ifdef ENABLE_ASSERT
+  // See rpQueryItNext: same interruptible park for the async-disk variant.
   if (self->firstRead) {
     self->firstRead = false;
-    SyncPoint_Wait(SYNC_POINT_BEFORE_FIRST_READ);
+    SyncPoint_WaitUntil(SYNC_POINT_BEFORE_FIRST_READ, SearchTime_IsTimedOut, &sctx->time);
   }
 #endif
 
@@ -549,9 +557,9 @@ static int rpMetricsNext(ResultProcessor *base, SearchResult *res) {
     return rc;
   }
 
-  arrayof(RSYieldableMetric) arr = SearchResult_GetIndexResult(res)->metrics;
-  for (size_t i = 0; i < array_len(arr); i++) {
-    RLookup_WriteKey(arr[i].key, SearchResult_GetRowDataMut(res), arr[i].value);
+  MetricsSlice slice = MetricsVec_AsSlice(&SearchResult_GetIndexResult(res)->metrics);
+  for (size_t i = 0; i < slice.len; i++) {
+    RLookup_WriteOwnKey(slice.data[i].key, SearchResult_GetRowDataMut(res), RSValue_NewNumber(slice.data[i].value));
   }
 
   return rc;
@@ -657,10 +665,23 @@ static int rpsortNext_innerLoop(ResultProcessor *rp, SearchResult *r) {
   if (rc == RS_RESULT_EOF) {
     rp->Next = rpsortNext_Yield;
     return rpsortNext_Yield(rp, r);
-  } else if (rc == RS_RESULT_TIMEDOUT && (rp->parent->timeoutPolicy == TimeoutPolicy_Return)) {
-    self->timedOut = true;
+  } else if (rc == RS_RESULT_TIMEDOUT) {
+    RSTimeoutPolicy policy = rp->parent->timeoutPolicy;
+
+    if (policy == TimeoutPolicy_Fail) {
+      return rc;
+    }
+    // Both Return and ReturnStrict switch to Yield mode (so subsequent Next
+    // calls pop the buffered, sorted prefix from the heap). They differ in
+    // who drives that draining: Return surfaces a row inline now, while
+    // ReturnStrict returns TIMEDOUT immediately so the BG unwinds promptly,
+    // and the main-thread drain pops the heap.
     rp->Next = rpsortNext_Yield;
-    return rpsortNext_Yield(rp, r);
+    if (policy == TimeoutPolicy_Return) {
+      self->timedOut = true;
+      return rpsortNext_Yield(rp, r);
+    }
+    return rc;
   } else if (rc != RS_RESULT_OK) {
     // whoops!
     return rc;
@@ -1612,9 +1633,19 @@ typedef struct {
   bool done_depleting;                 // Set to `true` when depleting is finished (under lock)
   size_t cur_idx;                      // Current index for yielding results
   RPStatus last_rc;                    // Last return code from upstream
-  bool first_call;                     // Whether the first call to Next has been made
+  // True iff a background depletion job has been submitted to the pool and
+  // will eventually call SignalDone(). Flips false->true exactly once, in
+  // RPSafeDepleter_StartDepletionThread. Read-only after that until Free().
+  //
+  // Drives two decisions:
+  //   - Next_Dispatch: false means "no BG in flight yet, take the lazy-start
+  //     branch"; true means "BG is in flight, take the wait branch".
+  //   - WaitForCompletion: false means "nothing to wait for, return"; true
+  //     means "block on done_depleting".
+  bool depletion_scheduled;
   StrongRef sync_ref;                  // Reference to shared synchronization object (DepleterSync)
   rs_wall_clock_ns_t depletionTime;    // Time spent depleting in the background thread (nanoseconds)
+  redisearch_thpool_t *pool;           // Thread pool used for depletion jobs
 } RPSafeDepleter;
 
 /*
@@ -1728,6 +1759,13 @@ static void RPSafeDepleter_DepleteFromUpstream(RPSafeDepleter *self, DepleterSyn
     array_append(self->results, r);
     r = rm_calloc(1, sizeof(*r));
     *r = SearchResult_New();
+    // Notice a blocked-client (RETURN_STRICT) timeout promptly: the main-thread
+    // callback flips the borrowed flag, which skipTimeoutChecks does not gate.
+    // The wall-clock deadline is already handled by the upstream's own checks.
+    if (SearchTime_IsTimedOut(&self->depletingThreadCtx->time)) {
+      rc = RS_RESULT_TIMEDOUT;
+      break;
+    }
   }
   rm_free(r);
 
@@ -1749,7 +1787,9 @@ static void RPSafeDepleter_DepleteFromUpstream(RPSafeDepleter *self, DepleterSyn
 /**
  * Background thread function: consumes all results from upstream and stores them in the results array.
  *
- * Checks for timeout before starting execution and relies on upstream timeout detection during processing.
+ * Checks for timeout before starting execution and, while depleting, polls the
+ * blocked-client timeout flag each iteration (the wall-clock deadline is still
+ * handled by the upstream's own checks) so the background thread exits promptly.
  * Signals completion by setting done_depleting to `true` and broadcasting to condition variable.
  */
 static void RPSafeDepleter_Deplete(void *arg) {
@@ -1760,8 +1800,13 @@ static void RPSafeDepleter_Deplete(void *arg) {
   rs_wall_clock depletionStart;
   rs_wall_clock_init(&depletionStart);
 
-  // Check if timeout was exceeded before starting execution (respecting skipTimeoutChecks flag)
-  if (self->depletingThreadCtx->time.skipTimeoutChecks || TimedOut(&self->depletingThreadCtx->time.timeout) == NOT_TIMED_OUT) {
+  // Check if timeout was exceeded before starting execution. The wall-clock
+  // check honors skipTimeoutChecks, but the blocked-client (RETURN_STRICT) flag
+  // is checked unconditionally since skipTimeoutChecks does not gate it.
+  bool timed_out = SearchTime_IsTimedOut(&self->depletingThreadCtx->time) ||
+                   (!self->depletingThreadCtx->time.skipTimeoutChecks &&
+                    TimedOut(&self->depletingThreadCtx->time.timeout) == TIMED_OUT);
+  if (!timed_out) {
     RPSafeDepleter_DepleteFromUpstream(self, sync);
   } else {
     // Timeout before starting - no need to acquire lock or do any work
@@ -1801,10 +1846,13 @@ static int RPSafeDepleter_Next_Yield(ResultProcessor *base, SearchResult *r) {
   return RS_RESULT_OK;
 }
 
-// Adds a depletion job to the depleters thread pool
+// Adds a depletion job to the configured thread pool.
+// Sets `depletion_scheduled = true` before submitting so the flag is visible
+// even if the BG worker preempts us and completes immediately after submit.
 static inline void RPSafeDepleter_StartDepletionThread(RPSafeDepleter *self) {
-  // Submit the job to the thread pool
-  int rc = redisearch_thpool_add_work(depleterPool, RPSafeDepleter_Deplete, self, THPOOL_PRIORITY_HIGH);
+  RS_ASSERT(!self->depletion_scheduled);
+  self->depletion_scheduled = true;
+  int rc = redisearch_thpool_add_work(self->pool, RPSafeDepleter_Deplete, self, THPOOL_PRIORITY_HIGH);
   RS_ASSERT_ALWAYS(rc == 0);
 }
 
@@ -1881,11 +1929,13 @@ static inline int RPSafeDepleter_WaitForDepletionToComplete(RPSafeDepleter *self
 static int RPSafeDepleter_Next_Dispatch(ResultProcessor *base, SearchResult *r) {
   RPSafeDepleter *self = (RPSafeDepleter *)base;
 
-  // The first call to next will start the depleting thread, and return `RS_RESULT_DEPLETING`.
-  if (self->first_call) {
-    self->first_call = false;
-
-    // Check timeout before attempting to start thread (respecting skipTimeoutChecks flag)
+  // Lazy-start branch: no BG depletion in flight yet. Either schedule one,
+  // or — if the query has already timed out — switch to Yield and report
+  // TIMEDOUT without scheduling. We must not flip depletion_scheduled to
+  // true on the timeout path: WaitForCompletion would otherwise block
+  // forever waiting on a signal that no BG worker will ever send.
+  if (!self->depletion_scheduled) {
+    // Respect skipTimeoutChecks flag
     if (!self->nextThreadCtx->time.skipTimeoutChecks && TimedOut(&self->nextThreadCtx->time.timeout) == TIMED_OUT) {
       base->Next = RPSafeDepleter_Next_Yield;
       self->last_rc = RS_RESULT_TIMEDOUT;
@@ -1912,21 +1962,59 @@ static int RPSafeDepleter_Next_Dispatch(ResultProcessor *base, SearchResult *r) 
 
 /**
  * Constructs a new RPSafeDepleter processor. Consumes the StrongRef given.
+ * The pool argument selects which thread pool depletion jobs are submitted to.
  */
-ResultProcessor *RPSafeDepleter_New(StrongRef sync_ref, RedisSearchCtx *depletingThreadCtx, RedisSearchCtx *nextThreadCtx) {
+ResultProcessor *RPSafeDepleter_New(StrongRef sync_ref, RedisSearchCtx *depletingThreadCtx, RedisSearchCtx *nextThreadCtx, redisearch_thpool_t *pool) {
   RPSafeDepleter *ret = rm_calloc(1, sizeof(*ret));
   ret->results = array_new(SearchResult*, 0);
   ret->base.Next = RPSafeDepleter_Next_Dispatch;
   ret->base.Free = RPSafeDepleter_Free;
   ret->base.type = RP_SAFE_DEPLETER;
-  ret->first_call = true;
   ret->sync_ref = sync_ref;
   ret->depletingThreadCtx = depletingThreadCtx;
   ret->nextThreadCtx = nextThreadCtx;
   ret->depletionTime = 0;  // Initialize depletion time to 0
+  ret->pool = pool;
   // Make sure the sync reference is valid
   RS_LOG_ASSERT(StrongRef_Get(sync_ref), "Invalid sync reference");
+  RS_LOG_ASSERT(pool, "Invalid thread pool");
   return &ret->base;
+}
+
+void RPSafeDepleter_StartDepletion(ResultProcessor *base) {
+  RS_ASSERT(base->type == RP_SAFE_DEPLETER);
+  RPSafeDepleter *self = (RPSafeDepleter *)base;
+  RS_ASSERT(!self->depletion_scheduled);
+  // If the query already timed out, skip submission. The BG worker would
+  // no-op anyway (its own TimedOut check in RPSafeDepleter_Deplete), but
+  // skipping saves a pool slot and the signal/wait round-trip. Leave
+  // depletion_scheduled=false so:
+  //   - RPSafeDepleter_WaitForCompletion no-ops (no signal in flight)
+  //   - a late Next() call re-enters the lazy branch, re-detects the
+  //     timeout, and switches Next to Yield with RS_RESULT_TIMEDOUT.
+  if (!self->nextThreadCtx->time.skipTimeoutChecks &&
+      TimedOut(&self->nextThreadCtx->time.timeout) == TIMED_OUT) {
+    return;
+  }
+  RPSafeDepleter_StartDepletionThread(self);
+}
+
+void RPSafeDepleter_WaitForCompletion(ResultProcessor *base) {
+  RS_ASSERT(base->type == RP_SAFE_DEPLETER);
+  const RPSafeDepleter *self = (RPSafeDepleter *)base;
+  // No BG depletion job in flight: nothing to wait for.
+  if (!self->depletion_scheduled) {
+    return;
+  }
+  DepleterSync *sync = (DepleterSync *)StrongRef_Get(self->sync_ref);
+  RS_ASSERT(sync);
+  pthread_mutex_lock(&sync->mutex);
+  while (!self->done_depleting) {
+    // Broadcast wakes us up on every depleter's completion; loop until ours
+    // is the one that finished.
+    pthread_cond_wait(&sync->cond, &sync->mutex);
+  }
+  pthread_mutex_unlock(&sync->mutex);
 }
 
 static inline bool verifyInvariants(arrayof(ResultProcessor*) safeDepleters, DepleterSync** outSync, RedisSearchCtx** outSearchCtx) {
@@ -1942,7 +2030,9 @@ static inline bool verifyInvariants(arrayof(ResultProcessor*) safeDepleters, Dep
     if (searchCtx && searchCtx != safeDepleter->nextThreadCtx) {
       return false;
     }
-    if (safeDepleter->first_call == false) {
+    // Bulk launch requires all depleters to be in the fresh unscheduled state —
+    // no Next call yet, no prior StartDepletion call.
+    if (safeDepleter->depletion_scheduled) {
       return false;
     }
     sync = depleterSync;
@@ -1979,11 +2069,10 @@ int RPSafeDepleter_DepleteAll(arrayof(ResultProcessor*) safeDepleters, QueryErro
   // (which is not the expected behavior when ON_TIMEOUT is set to RETURN)
 
   const size_t count = array_len(safeDepleters);
-  // Start all depleting threads
+  // Start all depleting threads. StartDepletionThread flips
+  // depletion_scheduled to true for each.
   for (size_t i = 0; i < count; i++) {
     RPSafeDepleter* safeDepleter = (RPSafeDepleter*)safeDepleters[i];
-    safeDepleter->first_call = false;
-    // Try to start the depletion thread
     RPSafeDepleter_StartDepletionThread(safeDepleter);
   }
 
@@ -2017,13 +2106,22 @@ int RPSafeDepleter_DepleteAll(arrayof(ResultProcessor*) safeDepleters, QueryErro
   // after all depleters acquired their locks (or when any failed).
   // This early release prevents deadlock with SafeLoader GIL acquisition.
 
-  // Check if any depleter skipped the lock phase (timeout before start or lock failure)
-  int num_skipped_lock = atomic_load(&sync->num_skipped_lock);
-  if (num_skipped_lock > 0) {
-    // At least one depleter skipped the lock phase
-    QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_SAFE_DEPLETER_FAILURE,
-      "Failed to acquire index lock for background depletion. A write operation may be in progress. Please retry.");
-    return RS_RESULT_ERROR;
+  // Check each depleter's final status for errors or timeouts.
+  // Errors (lock failures) take priority over timeouts.
+  bool anyTimedOut = false;
+  for (size_t i = 0; i < count; i++) {
+    const RPSafeDepleter *safeDepleter = (RPSafeDepleter *)safeDepleters[i];
+    if (safeDepleter->last_rc == RS_RESULT_ERROR) {
+      QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_SAFE_DEPLETER_FAILURE,
+        "Failed to acquire index lock for background depletion. A write operation may be in progress. Please retry.");
+      return RS_RESULT_ERROR;
+    } else if (safeDepleter->last_rc == RS_RESULT_TIMEDOUT) {
+      anyTimedOut = true;
+    }
+  }
+
+  if (anyTimedOut) {
+    return RS_RESULT_TIMEDOUT;
   }
 
   return RS_RESULT_OK;
@@ -2716,6 +2814,15 @@ static int RPDepleter_Next_Accumulate(ResultProcessor *base, SearchResult *r) {
   // Call the sync depletion function directly
   RPDepleter_Deplete(self);
 
+  // Only TimeoutPolicy_Return yields buffered results on timeout; FAIL and
+  // RETURN-STRICT propagate TIMEDOUT immediately since the buffer will be
+  // discarded by the serializer anyway.
+  if (self->last_rc == RS_RESULT_TIMEDOUT &&
+      base->parent->timeoutPolicy != TimeoutPolicy_Return) {
+    self->last_rc = RS_RESULT_EOF;
+    return RS_RESULT_TIMEDOUT;
+  }
+
   // Switch to yield mode
   self->base.Next = RPDepleter_Next_Yield;
 
@@ -2758,13 +2865,16 @@ rs_wall_clock_ns_t RPDepleter_GetDepletionTime(const ResultProcessor *base) {
 }
 
 int RPDepleter_DepleteAll(arrayof(ResultProcessor*) depleters) {
+  bool anyTimedOut = false;
   for (size_t i = 0; i < array_len(depleters); i++) {
     RS_ASSERT(depleters[i]->type == RP_DEPLETER);
     RPDepleter_StartDepletion(depleters[i]);
     const RPDepleter *depleter = (const RPDepleter *)depleters[i];
-    if (depleter->last_rc != RS_RESULT_EOF) {
-      return depleter->last_rc;
+    if (depleter->last_rc == RS_RESULT_ERROR) {
+      return RS_RESULT_ERROR;
+    } else if (depleter->last_rc == RS_RESULT_TIMEDOUT) {
+      anyTimedOut = true;
     }
   }
-  return RS_RESULT_OK;
+  return anyTimedOut ? RS_RESULT_TIMEDOUT : RS_RESULT_OK;
 }

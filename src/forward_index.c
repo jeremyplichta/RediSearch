@@ -7,12 +7,14 @@
  * GNU Affero General Public License v3 (AGPLv3).
 */
 #include "forward_index.h"
+#include "inverted_index_ffi.h"
 #include "tokenize.h"
-#include "util/fnv.h"
+#include "fnv_ffi.h"
 #include "util/logging.h"
 #include <stdio.h>
 #include <sys/param.h>
 #include "rmalloc.h"
+#include "metrics_ffi.h"
 
 typedef struct {
   KHTableEntry khBase;
@@ -195,6 +197,7 @@ static void ForwardIndex_HandleToken(ForwardIndex *idx, const char *tok, size_t 
 
     h->len = tokLen;
     h->freq = 0;
+    h->staged = false;
 
     if (hasOffsets(idx)) {
       h->vw = mempool_get(idx->vvwPool);
@@ -280,13 +283,17 @@ int forwardIndexTokenFunc(ForwardIndexTokenizerCtx *tokCtx, const Token *tokInfo
   return 0;
 }
 
-/** Write a forward-index entry to the index */
-size_t InvertedIndex_WriteForwardIndexEntry(InvertedIndex *idx, ForwardIndexEntry *ent) {
+/** Write a forward-index entry to the index. Returns an `AddRecordOutcome` carrying the memory
+ * growth and the number of new blocks the write created — callers maintaining per-spec
+ * `total_inverted_index_blocks` should add `.blocks_added` to their counter.
+ */
+AddRecordOutcome InvertedIndex_WriteForwardIndexEntry(InvertedIndex *idx, ForwardIndexEntry *ent) {
   RSIndexResult rec = {.data.term_tag = RSResultData_Term,
                        .data.term.borrowed.tag = RSTermRecord_Borrowed,
                        .docId = ent->docId,
                        .freq = ent->freq,
-                       .fieldMask = ent->fieldMask};
+                       .fieldMask = ent->fieldMask,
+                       .metrics = MetricsVec_New()};
 
   if (ent->vw) {
     rec.data.term.borrowed.offsets.data = VVW_GetByteData(ent->vw);

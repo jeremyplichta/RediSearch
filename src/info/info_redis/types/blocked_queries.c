@@ -10,6 +10,7 @@
 #include "rmutil/rm_assert.h"
 #include "redismodule.h"
 #include "rmutil/rm_assert.h"
+#include <inttypes.h>
 
 BlockedQueries *BlockedQueries_Init() {
   BlockedQueries* blockedQueries = rm_calloc(1, sizeof(BlockedQueries));
@@ -39,7 +40,7 @@ static size_t PrintActiveCursors(BlockedQueries *blockedQueries) {
     ++count; // increment regardless if sp is valid, the fact we have a valid node is problematic
     const char *indexName = sp ? IndexSpec_FormatName(sp, RSGlobalConfig.hideUserDataFromLog) : "n/a";
     const char *query = at->query && !RSGlobalConfig.hideUserDataFromLog ? at->query : "n/a";
-    RedisModule_Log(NULL, "warning", "Active cursor %zu, on index %s, query: %s, started at %ld", at->cursorId, indexName, query, at->start);
+    RedisModule_Log(NULL, "warning", "Active cursor %" PRIu64 ", on index %s, query: %s, started at %ld", at->cursorId, indexName, query, at->start);
   }
   return count;
 }
@@ -65,7 +66,8 @@ BlockedQueryNode* BlockedQueries_AddQuery(BlockedQueries* blockedQueries, Strong
   return blockedQueryNode;
 }
 
-BlockedCursorNode* BlockedQueries_AddCursor(BlockedQueries* blockedQueries, WeakRef spec, uint64_t cursorId, QueryAST* ast, size_t count) {
+BlockedCursorNode* BlockedQueries_AddCursor(BlockedQueries* blockedQueries, WeakRef spec, uint64_t cursorId, QueryAST* ast, size_t count,
+                                            void *privdata, BlockedQueryNode_FreePrivData freePrivData) {
   BlockedCursorNode* blockedCursorNode = rm_calloc(1, sizeof(BlockedCursorNode));
   if (spec.rm) {
     // we don't want cursors to block index deletion, so we don't take a strong ref
@@ -79,6 +81,8 @@ BlockedCursorNode* BlockedQueries_AddCursor(BlockedQueries* blockedQueries, Weak
   blockedCursorNode->cursorId = cursorId;
   blockedCursorNode->count = count;
   blockedCursorNode->start = time(NULL);
+  blockedCursorNode->privdata = privdata;
+  blockedCursorNode->freePrivData = freePrivData;
   dllist_prepend(&blockedQueries->cursors, &blockedCursorNode->llnode);
   return blockedCursorNode;
 }

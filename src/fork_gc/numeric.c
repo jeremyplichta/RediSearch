@@ -8,10 +8,12 @@
 */
 
 #include "pipe.h"
+#include "inverted_index_ffi.h"
+#include "numeric_range_tree_ffi.h"
 #include "redis_index.h"
-#include "numeric_index.h"
 #include "rmutil/rm_assert.h"
 #include "obfuscation/hidden.h"
+#include "iterators_ffi.h"
 
 void FGC_childCollectNumeric(ForkGC *gc, RedisSearchCtx *sctx) {
   arrayof(FieldSpec*) numericFields = getFieldsByType(sctx->spec, INDEXFLD_T_NUMERIC | INDEXFLD_T_GEO);
@@ -61,7 +63,7 @@ FGCError FGC_parentHandleNumeric(ForkGC *gc) {
     return FGC_DONE;
   }
   if (status != FGC_COLLECTED) {
-    rm_free(fieldName);
+    FGC_freeBuffer(fieldName, fieldNameLen);
     return status;
   }
 
@@ -84,8 +86,7 @@ FGCError FGC_parentHandleNumeric(ForkGC *gc) {
       status = FGC_CHILD_ERROR;
       goto loop_cleanup;
     }
-    // Check if we received the sentinel terminator value
-    if (nodeLen == SIZE_MAX) {
+    if (nodeLen == NO_MORE_DATA) {
       break;
     }
 
@@ -141,6 +142,8 @@ FGCError FGC_parentHandleNumeric(ForkGC *gc) {
                         r.gc_result.index_gc_info.bytes_freed,
                         r.gc_result.index_gc_info.bytes_allocated,
                         r.gc_result.index_gc_info.ignored_last_block);
+        IndexStats_BlockCountAdd(&_sctx.spec->stats,
+                                 r.gc_result.index_gc_info.block_count_delta);
         break;
       case NodeNotFound:
         gc->stats.gcNumericNodesMissed++;
@@ -163,7 +166,7 @@ FGCError FGC_parentHandleNumeric(ForkGC *gc) {
     StrongRef spec_ref = IndexSpecRef_Promote(gc->index);
     IndexSpec *sp = StrongRef_Get(spec_ref);
     if (!sp) {
-      rm_free(fieldName);
+      FGC_freeBuffer(fieldName, fieldNameLen);
       return FGC_SPEC_DELETED;
     }
     RedisSearchCtx sctx2 = SEARCH_CTX_STATIC(gc->ctx, sp);
@@ -172,10 +175,11 @@ FGCError FGC_parentHandleNumeric(ForkGC *gc) {
     if (r.inverted_index_size_delta < 0) {
       FGC_updateStats(gc, &sctx2, 0, -r.inverted_index_size_delta, 0, 0);
     }
+    IndexStats_BlockCountAdd(&sctx2.spec->stats, r.block_count_delta);
     RedisSearchCtx_UnlockSpec(&sctx2);
     IndexSpecRef_Release(spec_ref);
   }
 
-  rm_free(fieldName);
+  FGC_freeBuffer(fieldName, fieldNameLen);
   return status;
 }

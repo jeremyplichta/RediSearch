@@ -10,8 +10,10 @@
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
-use crate::{BlockCapacity, DecodedBy, Decoder, Encoder, IndexBlock, InvertedIndex, RSIndexResult};
-use ffi::{IndexFlags_Index_DocIdsOnly, t_docId};
+use crate::{BlockCapacity, DecodedBy, Decoder, Encoder, IndexBlock, InvertedIndex};
+use ffi::IndexFlags_Index_DocIdsOnly;
+use index_result::RSIndexResult;
+use rqe_core::DocId;
 use smallvec::SmallVec;
 use thin_vec::{Header, ThinVec};
 
@@ -35,6 +37,7 @@ pub(crate) enum RepairType {
 }
 
 /// Result of scanning the index for garbage collection
+#[cheadergen::config(rename = "InvertedIndexGcDelta")]
 #[derive(Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct GcScanDelta {
     /// The index of the last block in the index at the time of the scan. This is used to ensure
@@ -59,6 +62,19 @@ impl GcScanDelta {
     }
 }
 
+#[cfg(feature = "test_utils")]
+impl GcScanDelta {
+    /// Returns a no-op delta with no block repairs, for use in tests that need
+    /// to encode/decode the wire protocol without exercising GC logic.
+    pub const fn empty_for_testing() -> Self {
+        Self {
+            last_block_idx: 0,
+            last_block_num_entries: 0,
+            deltas: vec![],
+        }
+    }
+}
+
 /// Result of scanning a block for garbage collection
 #[derive(Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub(crate) struct BlockGcScanResult {
@@ -70,6 +86,7 @@ pub(crate) struct BlockGcScanResult {
 }
 
 /// Information about the result of applying a garbage collection scan to the index
+#[cheadergen::config(rename = "II_GCScanStats")]
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Default)]
 #[repr(C)]
 pub struct GcApplyInfo {
@@ -81,6 +98,11 @@ pub struct GcApplyInfo {
 
     /// The number of entries that were removed from the index including duplicates
     pub entries_removed: usize,
+
+    /// Net change in the index's block count for this apply. Positive when blocks were added
+    /// (e.g. a `Replace` repair adding more blocks than it removed), negative when removed.
+    /// Callers maintaining per-spec totals should add this signed value to their counter.
+    pub block_count_delta: i64,
 
     /// Whether or not we ignored the last block in the index, since it changed
     /// compared to the time we performed the scan
@@ -94,7 +116,7 @@ impl IndexBlock {
     /// `None` is returned when there is nothing to repair in this block.
     pub(crate) fn repair<'index, E: Encoder + DecodedBy<Decoder = D>, D: Decoder>(
         &'index self,
-        doc_exist: impl Fn(t_docId) -> bool,
+        doc_exist: impl Fn(DocId) -> bool,
         mut repair: Option<impl FnMut(&RSIndexResult<'index>, &IndexBlock)>,
         _encoder: PhantomData<E>,
     ) -> std::io::Result<Option<RepairType>> {
@@ -158,7 +180,7 @@ impl<E: Encoder + DecodedBy> InvertedIndex<E> {
     /// This function returns a delta if GC is needed, or `None` if no GC is needed.
     pub fn scan_gc<'index>(
         &'index self,
-        doc_exist: impl Fn(t_docId) -> bool,
+        doc_exist: impl Fn(DocId) -> bool,
         mut repair: Option<impl FnMut(&RSIndexResult<'index>, &IndexBlock)>,
     ) -> std::io::Result<Option<GcScanDelta>> {
         let mut results = Vec::new();
@@ -195,8 +217,11 @@ impl<E: Encoder + DecodedBy> InvertedIndex<E> {
             bytes_freed: 0,
             bytes_allocated: 0,
             entries_removed: 0,
+            block_count_delta: 0,
             ignored_last_block: false,
         };
+
+        let blocks_before = self.blocks.len();
 
         // Check if the last block has changed since the scan was performed
         let last_block_changed = self
@@ -278,6 +303,7 @@ impl<E: Encoder + DecodedBy> InvertedIndex<E> {
             }
         }
 
+        info.block_count_delta = self.blocks.len() as i64 - blocks_before as i64;
         self.gc_marker_inc();
 
         info

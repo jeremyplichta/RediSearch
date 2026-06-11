@@ -10,17 +10,19 @@
 use serde::{Deserialize, Serialize};
 use std::{
     marker::PhantomData,
-    sync::atomic::{self, AtomicU32, AtomicUsize},
+    sync::atomic::{self, AtomicU32},
 };
 use thin_vec::ThinVec;
 
 use super::unique_id::IndexUniqueId;
 use crate::{
-    BlockCapacity, Encoder, IdDelta, RSIndexResult,
+    BlockCapacity, Encoder, IdDelta,
     controlled_cursor::ControlledCursor,
     debug::{BlockSummary, Summary},
 };
-use ffi::{IndexFlags, IndexFlags_Index_HasMultiValue, t_docId};
+use ffi::{IndexFlags, IndexFlags_Index_HasMultiValue};
+use index_result::RSIndexResult;
+use rqe_core::DocId;
 
 /// An inverted index is a data structure that maps terms to their occurrences in documents. It is
 /// used to efficiently search for documents that contain specific terms.
@@ -54,20 +56,30 @@ pub struct InvertedIndex<E> {
     pub(crate) _encoder: PhantomData<E>,
 }
 
+/// Outcome of [`InvertedIndex::add_record`]: how the index grew during the write.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[repr(C)]
+pub struct AddRecordOutcome {
+    /// Number of bytes the inverted index's memory usage grew by.
+    pub mem_growth: u32,
+    /// Number of new index blocks this write created.
+    pub blocks_added: u32,
+}
+
 /// Each `IndexBlock` contains a set of entries for a specific range of document IDs. The entries
 /// are ordered by document ID, so the first entry in the block has the lowest document ID, and the
 /// last entry has the highest document ID. The block also contains a buffer that is used to
 /// store the encoded entries. The buffer is dynamically resized as needed when new entries are
 /// added to the block.
-#[derive(Debug, Eq, PartialEq, Serialize)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndexBlock {
     /// The first document ID in this block. This is used to determine the range of document IDs
     /// that this block covers.
-    pub(crate) first_doc_id: t_docId,
+    pub(crate) first_doc_id: DocId,
 
     /// The last document ID in this block. This is used to determine the range of document IDs
     /// that this block covers.
-    pub(crate) last_doc_id: t_docId,
+    pub(crate) last_doc_id: DocId,
 
     /// The total number of non-unique entries in this block
     pub(crate) num_entries: u16,
@@ -76,53 +88,18 @@ pub struct IndexBlock {
     pub(crate) buffer: Vec<u8>,
 }
 
-static TOTAL_BLOCKS: AtomicUsize = AtomicUsize::new(0);
-
-/// Custom deserialization for `IndexBlock` to track the total number of blocks correctly.
-impl<'de> Deserialize<'de> for IndexBlock {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct IB {
-            first_doc_id: t_docId,
-            last_doc_id: t_docId,
-            num_entries: u16,
-            buffer: Vec<u8>,
-        }
-
-        let ib = IB::deserialize(deserializer)?;
-
-        // We are about to create a new `IndexBlock` object, so be sure to increment the global
-        // counter correctly. Without this the `Drop` implementation will eventually cause an
-        // underflow of the counter. This correctly counter balances the decrement in the `Drop`.
-        TOTAL_BLOCKS.fetch_add(1, atomic::Ordering::Relaxed);
-
-        Ok(IndexBlock {
-            first_doc_id: ib.first_doc_id,
-            last_doc_id: ib.last_doc_id,
-            num_entries: ib.num_entries,
-            buffer: ib.buffer,
-        })
-    }
-}
-
 impl IndexBlock {
     pub(crate) const STACK_SIZE: usize = std::mem::size_of::<Self>();
 
     /// Make a new index block with primed with the initial doc ID. The next entry written into
     /// the block should be for this doc ID else the block will contain incoherent data.
-    pub(crate) fn new(doc_id: t_docId) -> Self {
-        let this = Self {
+    pub(crate) const fn new(doc_id: DocId) -> Self {
+        Self {
             first_doc_id: doc_id,
             last_doc_id: doc_id,
             num_entries: 0,
             buffer: Vec::new(),
-        };
-        TOTAL_BLOCKS.fetch_add(1, atomic::Ordering::Relaxed);
-
-        this
+        }
     }
 
     /// Get the memory usage of this block, including the stack size and the capacity of the bytes buffer.
@@ -131,12 +108,12 @@ impl IndexBlock {
     }
 
     /// Get the first document ID in this block. This is only needed for some C tests.
-    pub const fn first_block_id(&self) -> t_docId {
+    pub const fn first_block_id(&self) -> DocId {
         self.first_doc_id
     }
 
     /// Get the last document ID in the block. This is only needed for some C tests.
-    pub const fn last_block_id(&self) -> t_docId {
+    pub const fn last_block_id(&self) -> DocId {
         self.last_doc_id
     }
 
@@ -152,17 +129,6 @@ impl IndexBlock {
 
     pub(crate) const fn writer(&mut self) -> ControlledCursor<'_> {
         ControlledCursor::new(&mut self.buffer)
-    }
-
-    /// Returns the total number of index blocks in existence.
-    pub fn total_blocks() -> usize {
-        TOTAL_BLOCKS.load(atomic::Ordering::Relaxed)
-    }
-}
-
-impl Drop for IndexBlock {
-    fn drop(&mut self) {
-        TOTAL_BLOCKS.fetch_sub(1, atomic::Ordering::Relaxed);
     }
 }
 
@@ -218,9 +184,15 @@ impl<E: Encoder> InvertedIndex<E> {
         blocks_heap + blocks_buffers + stack
     }
 
-    /// Add a new record to the index and return by how much memory grew. It is expected that
-    /// the document ID of the record is greater than or equal the last document ID in the index.
-    pub fn add_record(&mut self, record: &RSIndexResult) -> std::io::Result<usize> {
+    /// Add a new record to the index. Returns an [`AddRecordOutcome`] reporting how many bytes
+    /// the index's memory usage grew by and how many new index blocks the write created (0 in
+    /// the common case, up to 2 when a new block was needed for the encoded delta and/or the
+    /// previous block was full). Callers that maintain a per-spec block counter should add
+    /// `outcome.blocks_added` to it.
+    ///
+    /// It is expected that the document ID of the record is greater than or equal to the last
+    /// document ID in the index.
+    pub fn add_record(&mut self, record: &RSIndexResult) -> std::io::Result<AddRecordOutcome> {
         let doc_id = record.doc_id;
 
         let same_doc = match (
@@ -232,10 +204,12 @@ impl<E: Encoder> InvertedIndex<E> {
                 // Even though we might allow duplicate document IDs, this encoder does not allow
                 // it since it will contain redundant information. Therefore, we are skipping this
                 // record.
-                return Ok(0);
+                return Ok(AddRecordOutcome::default());
             }
             (_, false) => false,
         };
+
+        let blocks_before = self.blocks.len();
 
         // We take ownership of the block since we are going to keep using self. So we can't have a
         // mutable reference to the block we are working with at the same time.
@@ -287,16 +261,26 @@ impl<E: Encoder> InvertedIndex<E> {
             self.flags |= IndexFlags_Index_HasMultiValue;
         }
 
-        Ok(buf_growth + mem_growth)
+        let total_mem_growth = buf_growth + mem_growth;
+        // A single add_record can grow memory by at most one block-buffer doubling plus the
+        // overhead of inserting one new block into the `blocks` ThinVec — comfortably below 4 GiB.
+        debug_assert!(
+            total_mem_growth <= u32::MAX as usize,
+            "AddRecordOutcome::mem_growth overflowed u32 ({total_mem_growth} bytes in one add)"
+        );
+        Ok(AddRecordOutcome {
+            mem_growth: total_mem_growth as u32,
+            blocks_added: (self.blocks.len() - blocks_before) as u32,
+        })
     }
 
     /// Returns the last document ID in the index, if any.
-    pub fn last_doc_id(&self) -> Option<t_docId> {
+    pub fn last_doc_id(&self) -> Option<DocId> {
         self.blocks.last().map(|b| b.last_doc_id)
     }
 
     /// Take a block that can be written to.
-    fn take_block(&mut self, doc_id: t_docId, same_doc: bool) -> IndexBlock {
+    fn take_block(&mut self, doc_id: DocId, same_doc: bool) -> IndexBlock {
         if self.blocks.is_empty()
             || (
                 // If the block is full

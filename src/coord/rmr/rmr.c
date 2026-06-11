@@ -18,6 +18,7 @@
 #include "resp3.h"
 #include "coord/config.h"
 #include "rs_wall_clock.h"
+#include "debug_commands.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,8 +46,6 @@
   RS_DEBUG_LOG_FMT("%s: decreased refCount to == %d", caller, refcount)
 
 #define CEIL_DIV(a, b) ((a + b - 1) / b)
-
-#define CLUSTER_QUERY_ERROR "Could not send query to cluster"
 
 /* A cluster is a pool of IORuntimes. It is owned by the main thread and accessed in the coordinator threads */
 static MRCluster *cluster_g = NULL;
@@ -302,17 +301,12 @@ static void fanoutCallback(redisAsyncContext *c, void *r, void *privdata) {
     ctx->replies[ctx->numReplied++] = r;
   }
 
-  // If we've received the last reply, the fanout/network phase is complete.
-  // Release the RQ slot here before unblocking or handing off to reduction.
+  // If we've received the last reply - unblock the client
   if (ctx->numReplied + ctx->numErrored == ctx->numExpected) {
+    IORuntimeCtx_RequestCompleted(ioRuntime);
     if (!timedOut && ctx->fn) {
       ctx->fn(ctx, ctx->numReplied, ctx->replies);
-      // `ctx->fn` may hand off to an async reducer that can unblock and free `ctx`
-      // before this libuv callback is scheduled again. Complete the RQ request via
-      // the saved ioRuntime instead of reading more state from `ctx` after the handoff.
-      IORuntimeCtx_RequestCompleted(ioRuntime);
     } else {
-      IORuntimeCtx_RequestCompleted(ioRuntime);
       if (!timedOut) {
         RedisModuleBlockedClient *bc = ctx->bc;
         RS_ASSERT(bc);
@@ -374,7 +368,10 @@ static void uvUpdateTopologyRequest(void *p) {
   IORuntimeCtx *ioRuntime = ctx->ioRuntime;
   MRClusterTopology *old_topo = ioRuntime->topo;
   ioRuntime->topo = ctx->new_topo;
-  IORuntimeCtx_UpdateNodesAndConnectAll(ioRuntime);
+  // Report the handshake signal back to topologyAsyncCB via a scratch flag
+  // on the uv runtime. The flag is preset to `true` before the task runs, so
+  // lowering it here is the only way to skip the validation handshake.
+  ioRuntime->uv_runtime.topology_needs_handshake = IORuntimeCtx_UpdateNodes(ioRuntime);
   rm_free(ctx);
   if (old_topo) {
     MRClusterTopology_Free(old_topo);
@@ -615,7 +612,8 @@ void MR_ReplyClusterInfo(RedisModuleCtx *ctx, MRClusterTopology *topo) {
 
 struct MRIteratorCtx {
   MRChannel *chan;
-  MRIteratorCallback cb;
+  MRIteratorCallback successCB;
+  MRIteratorErrorCallback errorCB;  // Optional: callback to execute on error
   short pending;    // Number of shards with more results (not depleted)
   short inProcess;  // Number of currently running commands on shards
   bool timedOut;    // whether the coordinator experienced a timeout
@@ -624,7 +622,8 @@ struct MRIteratorCtx {
   int8_t itRefCount;
   IORuntimeCtx *ioRuntime;
   void (*privateDataDestructor)(void *);  // Destructor for privateData, called in MRIterator_Free
-  void (*privateDataInit)(void *, MRIterator *);  // Init callback for privateData, called from iterStartCb
+  void (*privateDataInit)(void *, const MRIterator *);  // Init callback for privateData, called from iterStartCb
+  MRCommandModifier commandModifier;  // Callback to modify command before sending, called from iterStartCb
 };
 
 struct MRIteratorCallbackCtx {
@@ -639,14 +638,22 @@ struct MRIterator {
   size_t len;
 };
 
+// No-reply termination path: invoke the caller's optional errorCB (notify-only)
+// before the iterator's MRIteratorCallback_Done. Without this hook callers that
+// wait on a private counter (e.g. ProcessHybridCursorMappings) would hang.
+static void mrIteratorCallback_Error(MRIteratorCallbackCtx *ctx) {
+  if (ctx->it->ctx.errorCB) {
+    ctx->it->ctx.errorCB(ctx);
+  }
+  MRIteratorCallback_Done(ctx, 1);
+}
+
 static void mrIteratorRedisCB(redisAsyncContext *c, void *r, void *privdata) {
   MRIteratorCallbackCtx *ctx = privdata;
   if (!r) {
-    MRIteratorCallback_Done(ctx, 1);
-    // ctx->numErrored++;
-    // TODO: report error
+    mrIteratorCallback_Error(ctx);
   } else {
-    ctx->it->ctx.cb(ctx, r);
+    ctx->it->ctx.successCB(ctx, r);
   }
 }
 
@@ -744,8 +751,17 @@ void iterStartCb(void *p) {
     if (!conn) {
       // At least one connection is not established - fail with a single error.
       // it->len/pending/inProcess remain at their initial value of 1.
+      // Run privateDataInit so ShardResponseBarrier (used by FT.AGGREGATE
+      // WITHCOUNT) accepts the synthetic error notification; otherwise its
+      // numShards stays 0, Notify's bounds check short-circuits, and the real
+      // error gets replaced by a misleading timeout message in
+      // shardResponseBarrier_HandleTimeout.
+      void *privateData = MRIteratorCallback_GetPrivateData(&it->cbxs[0]);
+      if (privateData && it->ctx.privateDataInit) {
+        it->ctx.privateDataInit(privateData, it);
+      }
       MRReply *err = MRReply_CreateError(CLUSTER_QUERY_ERROR, sizeof(CLUSTER_QUERY_ERROR) - 1);
-      it->ctx.cb(&it->cbxs[0], err);
+      it->ctx.successCB(&it->cbxs[0], err);
       rm_free(data);
       return;
     }
@@ -768,6 +784,11 @@ void iterStartCb(void *p) {
   // Set the dispatch time value in the prepared placeholder
   MRCommand_SetDispatchTime(cmd);
 
+  // Call command modifier callback if set (e.g., to calculate effectiveK based on actual numShards)
+  if (it->ctx.commandModifier) {
+    it->ctx.commandModifier(cmd, numShards, privateData);
+  }
+
   for (size_t targetShardIdx = 1; targetShardIdx < numShards; targetShardIdx++) {
     it->cbxs[targetShardIdx].it = it;
     it->cbxs[targetShardIdx].cmd = MRCommand_Copy(cmd);
@@ -788,9 +809,16 @@ void iterStartCb(void *p) {
   for (size_t i = 0; i < numShards; i++) {
     if (MRCluster_SendCommand(io_runtime_ctx, &it->cbxs[i].cmd, mrIteratorRedisCB, &it->cbxs[i]) ==
         REDIS_ERR) {
-      MRIteratorCallback_Done(&it->cbxs[i], 1);
+      mrIteratorCallback_Error(&it->cbxs[i]);
     }
   }
+
+#ifdef ENABLE_ASSERT
+  // Sync point (debug): park the IO thread after every shard command has been
+  // dispatched so tests can deterministically fire the blocked-client timeout
+  // knowing the fan-out has happened but no reply has been consumed yet.
+  SyncPoint_Wait(SYNC_POINT_AFTER_ITERATOR_START);
+#endif
 
   rm_free(data);
 }
@@ -850,7 +878,7 @@ void iterCursorMappingCb(void *p) {
   for (size_t i = 0; i < numShardsWithMapping; i++) {
     if (MRCluster_SendCommand(io_runtime_ctx, &it->cbxs[i].cmd,
                               mrIteratorRedisCB, &it->cbxs[i]) == REDIS_ERR) {
-      MRIteratorCallback_Done(&it->cbxs[i], 1);
+      mrIteratorCallback_Error(&it->cbxs[i]);
     }
   }
 
@@ -867,7 +895,7 @@ void iterManualNextCb(void *p) {
     if (!it->cbxs[i].cmd.depleted) {
       if (MRCluster_SendCommand(io_runtime_ctx, &it->cbxs[i].cmd,
                                 mrIteratorRedisCB, &it->cbxs[i]) == REDIS_ERR) {
-        MRIteratorCallback_Done(&it->cbxs[i], 1);
+        mrIteratorCallback_Error(&it->cbxs[i]);
       }
     }
   }
@@ -904,14 +932,10 @@ bool MR_ManuallyTriggerNextIfNeeded(MRIterator *it, size_t channelThreshold) {
   return channelSize > 0;
 }
 
-MRIterator *MR_Iterate(const MRCommand *cmd, MRIteratorCallback cb) {
-  return MR_IterateWithPrivateData(cmd, cb, NULL, NULL, NULL, iterStartCb, NULL);
-}
-
-MRIterator *MR_IterateWithPrivateData(const MRCommand *cmd, MRIteratorCallback cb, void *cbPrivateData,
-                                      void (*cbPrivateDataDestructor)(void *),
-                                      void (*cbPrivateDataInit)(void *, MRIterator *),
-                                      void (*iterStartCb)(void *), StrongRef *iterStartCbPrivateData) {
+MRIterator *MR_IterateWithPrivateData(const MRCommand *cmd, const MRIteratorConfig *config) {
+  // successCB and iterStartCb are required: the per-reply path dereferences
+  // successCB and we unconditionally schedule iterStartCb below.
+  RS_ASSERT(config && config->successCB && config->iterStartCb);
   MRIterator *ret = rm_new(MRIterator);
   // Initial initialization of the iterator.
   // The rest of the initialization is done in the iterator start callback.
@@ -924,14 +948,16 @@ MRIterator *MR_IterateWithPrivateData(const MRCommand *cmd, MRIteratorCallback c
   *ret = (MRIterator){
     .ctx = {
       .chan = MR_NewChannel(),
-      .cb = cb,
+      .successCB = config->successCB,
+      .errorCB = config->errorCB,
       .pending = 1,
       .inProcess = 1,
       .timedOut = false,
       .itRefCount = 2,
       .ioRuntime = MRCluster_GetIORuntimeCtx(cluster_g, MRCluster_AssignRoundRobinIORuntimeIdx(cluster_g)),
-      .privateDataDestructor = cbPrivateDataDestructor,
-      .privateDataInit = cbPrivateDataInit,
+      .privateDataDestructor = config->cbPrivateDataDestructor,
+      .privateDataInit = config->cbPrivateDataInit,
+      .commandModifier = config->commandModifier,
     },
     .cbxs = rm_new(MRIteratorCallbackCtx),
     .len = 1,
@@ -940,17 +966,17 @@ MRIterator *MR_IterateWithPrivateData(const MRCommand *cmd, MRIteratorCallback c
   *ret->cbxs = (MRIteratorCallbackCtx){
     .cmd = MRCommand_Copy(cmd),
     .it = ret,
-    .privateData = cbPrivateData,
+    .privateData = config->cbPrivateData,
   };
 
   // Create data structure with iterator and private data (on heap)
   IteratorData *data = rm_malloc(sizeof(IteratorData));
   data->it = ret;
   data->privateDataRef = (WeakRef){0};
-  if (iterStartCbPrivateData) {
-    data->privateDataRef = StrongRef_Demote(*iterStartCbPrivateData);
+  if (config->iterStartCbPrivateData) {
+    data->privateDataRef = StrongRef_Demote(*config->iterStartCbPrivateData);
   }
-  IORuntimeCtx_Schedule(ret->ctx.ioRuntime, iterStartCb, data);
+  IORuntimeCtx_Schedule(ret->ctx.ioRuntime, config->iterStartCb, data);
   return ret;
 }
 
@@ -962,8 +988,13 @@ MRReply *MRIterator_Next(MRIterator *it) {
   return MRChannel_Pop(it->ctx.chan);
 }
 
-MRReply *MRIterator_NextWithTimeout(MRIterator *it, const struct timespec *abstime, bool *timedOut) {
-  return MRChannel_PopWithTimeout(it->ctx.chan, abstime, timedOut);
+MRReply *MRIterator_NextWithTimeout(MRIterator *it, const struct timespec *abstime,
+                                    atomic_bool *abortFlag, bool *timedOut) {
+  return MRChannel_PopWithTimeout(it->ctx.chan, abstime, abortFlag, timedOut);
+}
+
+struct MRChannel *MRIterator_GetChannel(MRIterator *it) {
+  return it->ctx.chan;
 }
 
 size_t MRIterator_GetChannelSize(const MRIterator *it) {

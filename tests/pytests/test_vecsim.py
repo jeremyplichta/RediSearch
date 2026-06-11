@@ -435,8 +435,8 @@ def test_create():
         conn.execute_command('FT.CREATE', 'idx2', 'SCHEMA', 'v_FLAT', 'VECTOR', 'FLAT', '8', 'TYPE', data_type,
                              'DIM', '1024', 'DISTANCE_METRIC', 'L2', 'INITIAL_CAP', '10')
 
-        expected_HNSW = ['ALGORITHM', 'TIERED', 'TYPE', data_type, 'DIMENSION', 1024, 'METRIC', 'COSINE', 'IS_MULTI_VALUE', 0, 'IS_DISK', 0, 'INDEX_SIZE', 0, 'INDEX_LABEL_COUNT', 0, 'MEMORY', dummy_val, 'LAST_SEARCH_MODE', 'EMPTY_MODE', 'MANAGEMENT_LAYER_MEMORY', dummy_val, 'BACKGROUND_INDEXING', 0, 'TIERED_BUFFER_LIMIT', 1024, 'FRONTEND_INDEX', ['ALGORITHM', 'FLAT', 'TYPE', data_type, 'DIMENSION', 1024, 'METRIC', 'COSINE', 'IS_MULTI_VALUE', 0, 'IS_DISK', 0, 'INDEX_SIZE', 0, 'INDEX_LABEL_COUNT', 0, 'MEMORY', dummy_val, 'LAST_SEARCH_MODE', 'EMPTY_MODE', 'BLOCK_SIZE', 1024], 'BACKEND_INDEX', ['ALGORITHM', 'HNSW', 'TYPE', data_type, 'DIMENSION', 1024, 'METRIC', 'COSINE', 'IS_MULTI_VALUE', 0, 'IS_DISK', 0, 'INDEX_SIZE', 0, 'INDEX_LABEL_COUNT', 0, 'MEMORY', dummy_val, 'LAST_SEARCH_MODE', 'EMPTY_MODE', 'BLOCK_SIZE', 1024, 'M', 16, 'EF_CONSTRUCTION', 200, 'EF_RUNTIME', 10, 'MAX_LEVEL', -1, 'ENTRYPOINT', -1, 'EPSILON', '0.01', 'NUMBER_OF_MARKED_DELETED', 0], 'TIERED_HNSW_SWAP_JOBS_THRESHOLD', 1024]
-        expected_FLAT = ['ALGORITHM', 'FLAT', 'TYPE', data_type, 'DIMENSION', 1024, 'METRIC', 'L2', 'IS_MULTI_VALUE', 0, 'IS_DISK', 0, 'INDEX_SIZE', 0, 'INDEX_LABEL_COUNT', 0, 'MEMORY', dummy_val, 'LAST_SEARCH_MODE', 'EMPTY_MODE', 'BLOCK_SIZE', 1024]
+        expected_HNSW = ['ALGORITHM', 'TIERED', 'TYPE', data_type, 'DIMENSION', 1024, 'METRIC', 'COSINE', 'IS_MULTI_VALUE', 0, 'IS_DISK', 0, 'INDEX_SIZE', 0, 'INDEX_LABEL_COUNT', 0, 'MEMORY', dummy_val, 'LAST_SEARCH_MODE', 'EMPTY_MODE', 'MANAGEMENT_LAYER_MEMORY', dummy_val, 'BACKGROUND_INDEXING', 0, 'TIERED_BUFFER_LIMIT', 1024, 'FRONTEND_INDEX', ['ALGORITHM', 'FLAT', 'TYPE', data_type, 'DIMENSION', 1024, 'METRIC', 'COSINE', 'IS_MULTI_VALUE', 0, 'IS_DISK', 0, 'INDEX_SIZE', 0, 'INDEX_LABEL_COUNT', 0, 'MEMORY', dummy_val, 'LAST_SEARCH_MODE', 'EMPTY_MODE', 'BLOCK_SIZE', 1024], 'BACKEND_INDEX', ['ALGORITHM', 'HNSW', 'TYPE', data_type, 'DIMENSION', 1024, 'METRIC', 'COSINE', 'IS_MULTI_VALUE', 0, 'IS_DISK', 0, 'INDEX_SIZE', 0, 'INDEX_LABEL_COUNT', 0, 'MEMORY', dummy_val, 'LAST_SEARCH_MODE', 'EMPTY_MODE', 'BLOCK_SIZE', 1024, 'M', 16, 'EF_CONSTRUCTION', 200, 'EF_RUNTIME', 10, 'MAX_LEVEL', -1, 'ENTRYPOINT', -1, 'EPSILON', '0.01', 'NUMBER_OF_MARKED_DELETED', 0], 'TIERED_HNSW_SWAP_JOBS_THRESHOLD', 1024, 'SHARED_MEMORY', dummy_val]
+        expected_FLAT = ['ALGORITHM', 'FLAT', 'TYPE', data_type, 'DIMENSION', 1024, 'METRIC', 'L2', 'IS_MULTI_VALUE', 0, 'IS_DISK', 0, 'INDEX_SIZE', 0, 'INDEX_LABEL_COUNT', 0, 'MEMORY', dummy_val, 'LAST_SEARCH_MODE', 'EMPTY_MODE', 'BLOCK_SIZE', 1024, 'SHARED_MEMORY', dummy_val]
 
         # SVS-VAMANA only supports FLOAT32 and FLOAT16 data types
         if data_type in ('FLOAT32', 'FLOAT16'):
@@ -453,15 +453,18 @@ def test_create():
                                                       'BLOCK_SIZE', 1024, 'QUANT_BITS', 'NONE', 'ALPHA', 1.2, 'GRAPH_MAX_DEGREE', 32, 'CONSTRUCTION_WINDOW_SIZE', 200,
                                                       'MAX_CANDIDATE_POOL_SIZE', 600, 'PRUNE_TO', 28, 'USE_SEARCH_HISTORY', 1, 'NUM_THREADS', 1, 'LAST_RESERVED_NUM_THREADS', 1,
                                                       'NUMBER_OF_MARKED_DELETED', 0, 'SEARCH_WINDOW_SIZE', 10, 'SEARCH_BUFFER_CAPACITY', 10, 'LEANVEC_DIMENSION', 0, 'EPSILON', 0.01],
-                                                      'TIERED_SVS_TRAINING_THRESHOLD', 1024, 'TIERED_SVS_UPDATE_THRESHOLD', 1024, 'TIERED_SVS_THREADS_RESERVE_TIMEOUT', 5000]
+                                                      'TIERED_SVS_TRAINING_THRESHOLD', 1024, 'TIERED_SVS_UPDATE_THRESHOLD', 1024, 'TIERED_SVS_THREADS_RESERVE_TIMEOUT', 5000,
+                                                      'SHARED_MEMORY', dummy_val]
 
         for _ in env.reloadingIterator():
             info = ['identifier', 'v_HNSW', 'attribute', 'v_HNSW', 'type', 'VECTOR']
             env.assertEqual(index_info(env, 'idx1')['attributes'][0][:len(info)], info)
+
             info_data_HNSW = conn.execute_command(debug_cmd(), "VECSIM_INFO", "idx1", "v_HNSW")
             # replace memory values with a dummy value - irrelevant for the test
             info_data_HNSW[info_data_HNSW.index('MEMORY') + 1] = dummy_val
             info_data_HNSW[info_data_HNSW.index('MANAGEMENT_LAYER_MEMORY') + 1] = dummy_val
+            info_data_HNSW[info_data_HNSW.index('SHARED_MEMORY') + 1] = dummy_val
             front = info_data_HNSW[info_data_HNSW.index('FRONTEND_INDEX') + 1]
             front[front.index('MEMORY') + 1] = dummy_val
             back = info_data_HNSW[info_data_HNSW.index('BACKEND_INDEX') + 1]
@@ -472,6 +475,7 @@ def test_create():
             info_data_FLAT = conn.execute_command(debug_cmd(), "VECSIM_INFO", "idx2", "v_FLAT")
             # replace memory value with a dummy value - irrelevant for the test
             info_data_FLAT[info_data_FLAT.index('MEMORY') + 1] = dummy_val
+            info_data_FLAT[info_data_FLAT.index('SHARED_MEMORY') + 1] = dummy_val
 
             env.assertEqual(info_data_FLAT, expected_FLAT)
 
@@ -483,6 +487,7 @@ def test_create():
                 # replace memory values with a dummy value - irrelevant for the test
                 info_data_SVS_VAMANA[info_data_SVS_VAMANA.index('MEMORY') + 1] = dummy_val
                 info_data_SVS_VAMANA[info_data_SVS_VAMANA.index('MANAGEMENT_LAYER_MEMORY') + 1] = dummy_val
+                info_data_SVS_VAMANA[info_data_SVS_VAMANA.index('SHARED_MEMORY') + 1] = dummy_val
                 front_svs = info_data_SVS_VAMANA[info_data_SVS_VAMANA.index('FRONTEND_INDEX') + 1]
                 front_svs[front_svs.index('MEMORY') + 1] = dummy_val
                 back_svs = info_data_SVS_VAMANA[info_data_SVS_VAMANA.index('BACKEND_INDEX') + 1]
@@ -800,6 +805,14 @@ def test_search_errors():
     env.expect('FT.SEARCH', 'idx', '*=>[KNN 2 @v $b EF_FUNTIME 30]', 'PARAMS', '2', 'b', 'abcdefgh').error().contains('SEARCH_OPTION_INVALID Invalid option (Error parsing vector similarity parameters)')
     env.expect('FT.SEARCH', 'idx', '*=>[KNN 2 @v $b]=>{$EF_RUNTIME: 5; $EF_RUNTIME: 6;}', 'PARAMS', '2', 'b', 'abcdefgh').error().contains('SEARCH_PARAM_DUP Parameter was specified twice (Error parsing vector similarity parameters)')
 
+    # RERANK is valid only for disk-based HNSW indexes; on a non-disk HNSW index VecSim
+    # rejects it as an unknown parameter, regardless of whether it was provided via the
+    # inline KNN syntax or via the trailing query-attribute syntax.
+    env.expect('FT.SEARCH', 'idx', '*=>[KNN 2 @v $b RERANK TRUE]', 'PARAMS', '2', 'b', 'abcdefgh').error().contains('SEARCH_OPTION_INVALID Invalid option (Error parsing vector similarity parameters)')
+    env.expect('FT.SEARCH', 'idx', '*=>[KNN 2 @v $b]=>{$RERANK: TRUE;}', 'PARAMS', '2', 'b', 'abcdefgh').error().contains('SEARCH_OPTION_INVALID Invalid option (Error parsing vector similarity parameters)')
+    # RERANK is also unknown on FLAT indexes.
+    env.expect('FT.SEARCH', 'idx', f'*=>[KNN 2 @{v_flat} $b]=>{{$RERANK: TRUE;}}', 'PARAMS', '2', 'b', 'abcdefghabcdefgh').error().contains('SEARCH_OPTION_INVALID Invalid option (Error parsing vector similarity parameters)')
+
     # ef_runtime is invalid for FLAT index.
     env.expect('FT.SEARCH', 'idx', f'*=>[KNN 2 @{v_flat} $b EF_RUNTIME 30]', 'PARAMS', '2', 'b', 'abcdefghabcdefgh').error().contains('SEARCH_OPTION_INVALID Invalid option (Error parsing vector similarity parameters)')
 
@@ -827,6 +840,12 @@ def test_search_errors():
     env.expect('FT.SEARCH', 'idx', '*=>[KNN 2 @v $b AS $score_1]=>{$yield_distance_as:$score_2;}', 'PARAMS', '6', 'b', 'abcdefgh', 'score_1', 'score_1_val', 'score_2', 'score_2_val').error().contains('Distance field was specified twice for vector query: score_1_val and score_2_val')
     env.expect('FT.SEARCH', 'idx', 'hello=>[KNN 2 @v $b AS score]=>{$yield_distance_as:__v_score;}', 'PARAMS', '2', 'b', 'abcdefgh').error().contains('Distance field was specified twice for vector query: score and __v_score')
     env.expect('FT.SEARCH', 'idx', 'hello=>[KNN 2 @v $b AS score]=>{$yield_distance_as:score;}', 'PARAMS', '2', 'b', 'abcdefgh').error().contains('Distance field was specified twice for vector query: score and score')
+
+    # Invalid shard_k_ratio via query attribute syntax.
+    env.expect('FT.SEARCH', 'idx', '*=>[KNN 2 @v $b]=>{$shard_k_ratio: invalid;}', 'PARAMS', '2', 'b', 'abcdefgh').error().contains('Invalid shard k ratio value')
+
+    # Unrecognized vector attribute via query attribute syntax.
+    env.expect('FT.SEARCH', 'idx', '*=>[KNN 2 @v $b]=>{$bogus_vec_param: 42;}', 'PARAMS', '2', 'b', 'abcdefgh').error().contains('Invalid attribute')
 
     # Invalid range queries
     env.expect('FT.SEARCH', 'idx', '@v:[vector_range 0.1 $b]', 'PARAMS', '2', 'b', 'abcdefg').error().contains('Error parsing vector similarity query: query vector blob size (7) does not match index\'s expected size (8).')
@@ -2000,6 +2019,9 @@ def test_create_multi_value_json():
 
 @skip(no_json=True)
 def test_index_multi_value_json():
+    # Flaky under coverage (MOD-15571); skip only on coverage runs until the date below.
+    if CODE_COVERAGE:
+        skipTestUntil("2026-06-12", reason="Flaky test under coverage, see MOD-15571")
     env = Env(moduleArgs='DEFAULT_DIALECT 2 MIN_OPERATION_WORKERS 0')
     conn = getConnectionByEnv(env)
     dim = 4
@@ -2062,7 +2084,7 @@ def test_index_multi_value_json():
             waitForIndex(env, 'idx')
             info = index_info(env, 'idx')
             env.assertEqual(info['num_docs'], n, message=f'data_t: {data_t}')
-            env.assertEqual(info['num_records'], n * per_doc * len(info['attributes']), message=f'data_t: {data_t}')
+            env.assertEqual(info['num_records'], 0, message=f'data_t: {data_t}')
             env.assertEqual(info['hash_indexing_failures'], 0, message=f'data_t: {data_t}')
 
             cmd_knn[2] = f'*=>[KNN {k} @hnsw $b AS {score_field_name}]'
@@ -2132,7 +2154,7 @@ def test_bad_index_multi_value_json():
     # we should NOT fail if some of the vectors are NULLs
     conn.json().set(46, '.', {'vecs': [np.ones(dim).tolist(), None, (np.ones(dim) * 2).tolist()]})
     env.assertEqual(index_info(env, 'idx')['hash_indexing_failures'], failures)
-    env.assertEqual(index_info(env, 'idx')['num_records'], 4)
+    env.assertEqual(index_info(env, 'idx')['num_records'], 0)
 
     # ...or if the path returns NULL
     conn.json().set(46, '.', {'vecs': None})

@@ -47,8 +47,6 @@ def test_invalid_field_type(env):
         .error().contains('GEO fields are not supported in Flex indexes')
     env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA', 'field', 'GEOSHAPE') \
         .error().contains('GEOSHAPE fields are not supported in Flex indexes')
-    env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA', 'field', 'NUMERIC') \
-        .error().contains('NUMERIC fields are not supported in Flex indexes')
 
 
 @skip(cluster=True)
@@ -108,7 +106,7 @@ def test_valid_flex_arguments(env):
                'SCORE', '0.5',
                'SCORE_FIELD', 'score',
                'STOPWORDS', '2', 'the', 'and',
-               'SCHEMA', 'title', 'TEXT', 'body', 'TEXT').ok()
+               'SCHEMA', 'title', 'TEXT', 'body', 'TEXT', 'INDEXEMPTY').ok()
 
     # Verify the index was created successfully
     info_result = env.cmd('FT.INFO', 'flex_args_idx')
@@ -159,9 +157,6 @@ def test_unsupported_schema_options(env):
     env.expect('FT.CREATE', 'idx3', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA', 'field', 'TEXT', 'INDEXMISSING') \
         .error().contains('Disk index does not support INDEXMISSING fields')
 
-    # Test INDEXEMPTY is not supported
-    env.expect('FT.CREATE', 'idx4', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA', 'field', 'TEXT', 'INDEXEMPTY') \
-        .error().contains('Disk index does not support INDEXEMPTY fields')
 
 
 @skip(cluster=True)
@@ -174,10 +169,45 @@ def test_missing_skip_initial_scan(env):
 
 @skip(cluster=True)
 @with_simulate_in_flex(True)
-def test_invalid_on_json(env):
-    """Test that ON JSON fails when search-_simulate-in-flex is true"""
-    env.expect('FT.CREATE', 'idx', 'ON', 'JSON', 'SKIPINITIALSCAN', 'SCHEMA', 'field', 'TEXT') \
-        .error().contains('Only HASH is supported as index data type for Flex indexes')
+def test_on_json_is_supported(env):
+    """Test that ON JSON is accepted when search-_simulate-in-flex is true"""
+    env.expect('FT.CREATE', 'idx', 'ON', 'JSON', 'SKIPINITIALSCAN', 'SCHEMA',
+               '$.field', 'AS', 'field', 'TEXT').ok()
+
+
+@skip(cluster=True)
+@with_simulate_in_flex(True)
+def test_disk_json_rejects_multi_value_jsonpath(env):
+    """Test that disk validation rejects non-single JSONPath fields"""
+    env.expect('FT.CREATE', 'idx', 'ON', 'JSON', 'SKIPINITIALSCAN', 'SCHEMA',
+               '$.field[*]', 'AS', 'field', 'TEXT') \
+        .error().contains('Disk JSON index supports only single-value JSONPath fields')
+
+
+@skip(cluster=True)
+@with_simulate_in_flex(True)
+def test_disk_json_ingestion_rejects_array_payload_for_single_path_field(env):
+    """Valid disk JSON schema should be created, but array payload ingestion should fail."""
+
+    env.expect('FT.CREATE', 'idx', 'ON', 'JSON', 'SKIPINITIALSCAN', 'PREFIX', '1', 'doc:',
+               'SCHEMA', '$.name', 'AS', 'name', 'TEXT').ok()
+
+    errs = index_errors(env, 'idx')
+    env.assertEqual(int(errs['indexing failures']), 0)
+
+    env.expect('JSON.SET', 'doc:1', '$', '{"name":["a","b"]}').ok()
+
+    errs = index_errors(env, 'idx')
+    env.assertEqual(int(errs['indexing failures']), 1)
+    env.assertContains('Disk JSON index supports JSON array values only for VECTOR fields',
+                       errs['last indexing error'])
+
+    env.expect('FT.SEARCH', 'idx', '@name:a', 'NOCONTENT').equal([0])
+    env.expect('FT.SEARCH', 'idx', '*', 'NOCONTENT').equal([0])
+
+    # Valid scalar value should be indexed after the failed attempt.
+    env.expect('JSON.SET', 'doc:1', '$.name', '"alice"').ok()
+    env.expect('FT.SEARCH', 'idx', '@name:alice', 'NOCONTENT').equal([1, 'doc:1'])
 
 
 @skip(cluster=True)
@@ -343,7 +373,7 @@ def test_flex_blocks_dict_commands(env):
 
 @skip(cluster=True)
 @with_simulate_in_flex(True)
-def test_flex_disk_hnsw_rerank_requires_true_value(env):
+def test_flex_disk_hnsw_rerank_value(env):
     env.expect(
         'FT.CREATE', 'idx_ok', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA',
         'v', 'VECTOR', 'HNSW', '14',
@@ -354,6 +384,18 @@ def test_flex_disk_hnsw_rerank_requires_true_value(env):
         'EF_CONSTRUCTION', '200',
         'EF_RUNTIME', '10',
         'RERANK', 'TRUE',
+    ).ok()
+
+    env.expect(
+        'FT.CREATE', 'idx_ok_false', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA',
+        'v', 'VECTOR', 'HNSW', '14',
+        'TYPE', 'FLOAT32',
+        'DIM', '2',
+        'DISTANCE_METRIC', 'L2',
+        'M', '16',
+        'EF_CONSTRUCTION', '200',
+        'EF_RUNTIME', '10',
+        'RERANK', 'FALSE',
     ).ok()
 
     env.expect(
@@ -380,7 +422,7 @@ def test_flex_disk_hnsw_rerank_requires_true_value(env):
     ).error().contains('RERANK requires an argument')
 
     env.expect(
-        'FT.CREATE', 'idx_false', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA',
+        'FT.CREATE', 'idx_bad_value', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA',
         'v', 'VECTOR', 'HNSW', '14',
         'TYPE', 'FLOAT32',
         'DIM', '2',
@@ -388,8 +430,8 @@ def test_flex_disk_hnsw_rerank_requires_true_value(env):
         'M', '16',
         'EF_CONSTRUCTION', '200',
         'EF_RUNTIME', '10',
-        'RERANK', 'FALSE',
-    ).error().contains('Syntax error: RERANK only supports TRUE currently')
+        'RERANK', 'MAYBE',
+    ).error().contains('Syntax error: RERANK value must be TRUE or FALSE')
 
     env.expect(
         'FT.CREATE', 'idx_dup', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA',
@@ -403,6 +445,34 @@ def test_flex_disk_hnsw_rerank_requires_true_value(env):
         'RERANK', 'TRUE',
         'RERANK', 'TRUE',
     ).error().contains('Duplicate RERANK parameter')
+
+
+@skip(cluster=True)
+@with_simulate_in_flex(True)
+def test_flex_disk_hnsw_rerank_rdb_roundtrip(env):
+    # _SIMULATE_IN_FLEX validates syntax but does not persist the rerank value
+    # (it is discarded in parseVectorField when sp->diskSpec is NULL), and the
+    # RDB save/load gate is on SearchDisk_IsEnabled() so no byte is written
+    # either. The value-preservation check therefore lives in C/Enterprise CI
+    # where isFlex is true; here we only confirm the dump/reload path stays
+    # error-free across both rerank settings.
+    for idx, rerank_value in [('idx_rerank_true', 'TRUE'), ('idx_rerank_false', 'FALSE')]:
+        env.expect(
+            'FT.CREATE', idx, 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA',
+            'v', 'VECTOR', 'HNSW', '14',
+            'TYPE', 'FLOAT32',
+            'DIM', '2',
+            'DISTANCE_METRIC', 'L2',
+            'M', '16',
+            'EF_CONSTRUCTION', '100',
+            'EF_RUNTIME', '10',
+            'RERANK', rerank_value,
+        ).ok()
+
+    env.dumpAndReload()
+
+    for idx in ('idx_rerank_true', 'idx_rerank_false'):
+        env.expect('FT.INFO', idx).noError()
 
 
 @skip(cluster=True)
@@ -429,10 +499,6 @@ def test_disk_vector_query_validation(env: Env):
 
     query_blob = create_np_array_typed([1.0, 1.0], 'FLOAT32').tobytes()
 
-    env.expect('FT.SEARCH', 'idx', '@v:[VECTOR_RANGE 10 $b]', 'NOCONTENT',
-                'PARAMS', '2', 'b', query_blob).error().contains(
-                    'vector range queries are currently not supported in Redis Flex')
-
     env.expect('FT.SEARCH', 'idx', '@t:hello=>[KNN 2 @v $b]', 'NOCONTENT',
                 'PARAMS', '2', 'b', query_blob).error().contains(
                     'Redis Flex pre-filtered vector queries currently require explicit HYBRID_POLICY')
@@ -448,6 +514,70 @@ def test_disk_vector_query_validation(env: Env):
         res = env.cmd('FT.SEARCH', 'idx', query, 'NOCONTENT', 'PARAMS', '2', 'b', query_blob)
         env.assertEqual(res[0], 2, message=f'Expected 2 results for query "{query}"')
         env.assertEqual(set(res[1:]), {'doc:1', 'doc:2'}, message=f'Expected results doc:1 and doc:2 for query "{query}"')
+
+    # Vector range queries are supported on Flex disk indexes. With L2 (squared)
+    # distance and a query vector of [1.0, 1.0]: doc:1 -> 0, doc:2 -> 2,
+    # doc:3 -> 4802. Radius 10 returns doc:1 and doc:2; radius 0 returns doc:1
+    # only; a very large radius returns all docs.
+    range_cases = [
+        ('@v:[VECTOR_RANGE 10 $b]', {'doc:1', 'doc:2'}),
+        ('@v:[VECTOR_RANGE 0 $b]', {'doc:1'}),
+        ('@v:[VECTOR_RANGE 100000 $b]', {'doc:1', 'doc:2', 'doc:3'}),
+        # Hybrid range with text prefilter exercises the BY_ID intersection path.
+        ('@t:hello @v:[VECTOR_RANGE 10 $b]', {'doc:1', 'doc:2'}),
+        ('@t:goodbye @v:[VECTOR_RANGE 100000 $b]', {'doc:3'}),
+    ]
+
+    for query, expected in range_cases:
+        res = env.cmd('FT.SEARCH', 'idx', query, 'NOCONTENT',
+                      'PARAMS', '2', 'b', query_blob)
+        env.assertEqual(res[0], len(expected),
+                        message=f'Expected {len(expected)} results for query "{query}"')
+        env.assertEqual(set(res[1:]), expected,
+                        message=f'Unexpected results for query "{query}"')
+
+    # Negative radius is still rejected by the vector index validation path.
+    env.expect('FT.SEARCH', 'idx', '@v:[VECTOR_RANGE -1 $b]', 'NOCONTENT',
+               'PARAMS', '2', 'b', query_blob).error()
+
+
+@skip(cluster=True)
+@with_simulate_in_flex(True)
+def test_flex_ft_info_reports_vector_index_memory(env):
+    """Regression test for MOD-14840.
+
+    HNSW vector indexes are kept in memory even in Flex/ROF mode, so
+    FT.INFO must report a non-zero `vector_index_sz_mb` and the vector
+    memory must be included in `total_index_memory_sz_mb`.
+    """
+    dim = 4
+    env.expect(
+        'FT.CREATE', 'idx', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA',
+        't', 'TEXT',
+        'tag', 'TAG',
+        'v', 'VECTOR', 'HNSW', '14',
+        'TYPE', 'FLOAT32', 'DIM', str(dim), 'DISTANCE_METRIC', 'L2',
+        'M', '16', 'EF_CONSTRUCTION', '100', 'EF_RUNTIME', '10', 'RERANK', 'TRUE',
+    ).ok()
+
+    n_docs = 100
+    with env.getClusterConnectionIfNeeded() as conn:
+        for i in range(n_docs):
+            vector = create_np_array_typed([float(i)] * dim, 'FLOAT32').tobytes()
+            conn.execute_command('HSET', f'doc:{i}', 't', f'hello{i}',
+                                 'tag', f'tag{i}', 'v', vector)
+
+    info = index_info(env, 'idx')
+    vector_size_mb = float(info['vector_index_sz_mb'])
+    total_size_mb = float(info['total_index_memory_sz_mb'])
+
+    env.assertGreater(vector_size_mb, 0,
+                      message=f'Expected vector_index_sz_mb > 0 for HNSW index, got {vector_size_mb}')
+    env.assertGreater(total_size_mb, 0,
+                      message=f'Expected total_index_memory_sz_mb > 0, got {total_size_mb}')
+    env.assertGreaterEqual(total_size_mb, vector_size_mb,
+                           message=f'total_index_memory_sz_mb ({total_size_mb}) must include '
+                                   f'vector_index_sz_mb ({vector_size_mb})')
 
 
 @skip(cluster=True)
@@ -562,36 +692,6 @@ def test_flex_blocks_summarize_argument(env):
 
     env.expect('FT.SEARCH', 'idx', 'hello', 'NOCONTENT', 'SUMMARIZE') \
         .error().contains('SUMMARIZE is not supported in Redis Flex')
-
-
-@skip(cluster=True)
-@with_simulate_in_flex(True)
-def test_flex_blocks_tfidf_scorer(env):
-    """Test that TFIDF scorer is blocked in Redis Flex"""
-    _create_flex_search(env)
-
-    env.expect('FT.SEARCH', 'idx', 'hello', 'NOCONTENT', 'SCORER', 'TFIDF') \
-        .error().contains('TFIDF scorer is not supported in Redis Flex')
-
-
-@skip(cluster=True)
-@with_simulate_in_flex(True)
-def test_flex_blocks_tfidf_docnorm_scorer(env):
-    """Test that TFIDF.DOCNORM scorer is blocked in Redis Flex"""
-    _create_flex_search(env)
-
-    env.expect('FT.SEARCH', 'idx', 'hello', 'NOCONTENT', 'SCORER', 'TFIDF.DOCNORM') \
-        .error().contains('TFIDF.DOCNORM scorer is not supported in Redis Flex')
-
-
-@skip(cluster=True)
-@with_simulate_in_flex(True)
-def test_flex_blocks_bm25_scorer(env):
-    """Test that BM25 (deprecated) scorer is blocked in Redis Flex"""
-    _create_flex_search(env)
-
-    env.expect('FT.SEARCH', 'idx', 'hello', 'NOCONTENT', 'SCORER', 'BM25') \
-        .error().contains('BM25 scorer is not supported in Redis Flex')
 
 
 @skip(cluster=True)
@@ -734,46 +834,6 @@ def test_flex_blocks_spellcheck_command(env):
     env.expect('FT.SPELLCHECK', 'idx', 'helo') \
         .error().contains('FT.SPELLCHECK is not supported in Redis Flex')
 
-
-@skip(cluster=True)
-@with_simulate_in_flex(True)
-def test_flex_blocks_prefix_query(env):
-    """Test that prefix queries on TEXT fields are blocked in Flex mode"""
-    _create_flex_search(env)
-
-    # Prefix query using `*` suffix
-    env.expect('FT.SEARCH', 'idx', 'hel*', 'NOCONTENT') \
-        .error().contains('Prefix queries are not supported on Flex indexes')
-
-    # Prefix query scoped to a field
-    env.expect('FT.SEARCH', 'idx', '@t:hel*', 'NOCONTENT') \
-        .error().contains('Prefix queries are not supported on Flex indexes')
-
-
-@skip(cluster=True)
-@with_simulate_in_flex(True)
-def test_flex_blocks_wildcard_pattern_query(env):
-    """Test that wildcard-pattern queries on TEXT fields are blocked in Flex mode"""
-    _create_flex_search(env)
-
-    # Wildcard pattern query using w'...' syntax (dialect 2+)
-    env.expect('FT.SEARCH', 'idx', "w'hel*o'", 'NOCONTENT', 'DIALECT', '2') \
-        .error().contains('Wildcard pattern queries are not supported on Flex indexes')
-
-
-@skip(cluster=True)
-@with_simulate_in_flex(True)
-def test_flex_blocks_fuzzy_query(env):
-    """Test that fuzzy queries on TEXT fields are blocked in Flex mode"""
-    _create_flex_search(env)
-
-    # Single-level fuzzy
-    env.expect('FT.SEARCH', 'idx', '%hello%', 'NOCONTENT') \
-        .error().contains('Fuzzy queries are not supported on Flex indexes')
-
-    # Triple-level fuzzy
-    env.expect('FT.SEARCH', 'idx', '%%%hello%%%', 'NOCONTENT') \
-        .error().contains('Fuzzy queries are not supported on Flex indexes')
 
 def _create_flex_tag(env):
     env.expect('FT.CREATE', 'idx', 'ON', 'HASH', 'SKIPINITIALSCAN', 'SCHEMA', 'tag', 'TAG').ok()

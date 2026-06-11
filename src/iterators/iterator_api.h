@@ -13,9 +13,12 @@
 #include <stdint.h>
 #include "redisearch.h"
 #include "index_result.h" // IWYU pragma: keep
-#include "iterator_type.h"
+#include "rqe_iterator_type.h"
 
 struct RLookupKey; // Forward declaration
+struct IndexSpec;
+typedef struct MapBuilder RsMapBuilder; // Opaque Rust type (redis_reply::MapBuilder)
+typedef struct ProfilePrintCtx RsProfilePrintCtx; // Opaque Rust type (rqe_iterators::profile_print::ProfilePrintCtx)
 
 typedef enum IteratorStatus {
   ITERATOR_OK,
@@ -75,11 +78,12 @@ typedef struct QueryIterator {
    * Called when the iterator is being revalidated after a concurrent index change.
    * The iterator should check if it is still valid.
    *
+   * @param spec The index spec, provided by the caller (result processor).
    * @return VALIDATE_OK if the iterator is still valid
    * @return VALIDATE_MOVED if the iterator is still valid, but the lastDocId has changed (moved forward)
    * @return VALIDATE_ABORTED if the iterator is no longer valid
    */
-  ValidateStatus (*Revalidate)(struct QueryIterator *self);
+  ValidateStatus (*Revalidate)(struct QueryIterator *self, struct IndexSpec *spec);
 
   /* release the iterator's context and free everything needed */
   void (*Free)(struct QueryIterator *self);
@@ -90,10 +94,15 @@ typedef struct QueryIterator {
   /* Recursively wrap every child iterator with a Profile layer.
    * Composite iterators call IntoProfiled() on each child and return `self`.
    * Leaf iterators leave this as NULL (no children to profile). */
-  QueryIterator* (*ProfileChildren)(struct QueryIterator *self);
+  struct QueryIterator* (*ProfileChildren)(struct QueryIterator *self);
+
+  /* Print this iterator's profile as a Redis reply.
+   * Set by Rust iterators at construction time. C iterators set this to a
+   * Rust-exported function. */
+  void (*PrintProfile)(const struct QueryIterator *self, RsMapBuilder *map, RsProfilePrintCtx *ctx);
 } QueryIterator;
 
-static inline ValidateStatus Default_Revalidate(struct QueryIterator *base) {
+static inline ValidateStatus Default_Revalidate(struct QueryIterator *base, struct IndexSpec *spec) {
   // Default implementation does nothing.
   return VALIDATE_OK;
 }

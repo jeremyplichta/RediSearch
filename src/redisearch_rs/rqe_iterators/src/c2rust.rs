@@ -11,14 +11,16 @@
 use ffi::{
     IteratorStatus_ITERATOR_EOF, IteratorStatus_ITERATOR_NOTFOUND, IteratorStatus_ITERATOR_OK,
     IteratorStatus_ITERATOR_TIMEOUT, IteratorType, QueryIterator, ValidateStatus_VALIDATE_ABORTED,
-    ValidateStatus_VALIDATE_MOVED, ValidateStatus_VALIDATE_OK, t_docId,
+    ValidateStatus_VALIDATE_MOVED, ValidateStatus_VALIDATE_OK,
 };
+use rqe_core::DocId;
 
 use crate::{
     RQEIterator, RQEIteratorError, RQEValidateStatus, SkipToOutcome, interop::RQEIteratorWrapper,
-    intersection::Intersection,
+    intersection::Intersection, profile_print,
 };
-use inverted_index::RSIndexResult;
+use index_result::RSIndexResult;
+use index_spec::IndexSpecReadGuard;
 use std::{
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
@@ -209,7 +211,7 @@ impl<'index> RQEIterator<'index> for CRQEIterator {
 
     fn skip_to(
         &mut self,
-        doc_id: t_docId,
+        doc_id: DocId,
     ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError> {
         let callback = self
             .SkipTo
@@ -259,14 +261,18 @@ impl<'index> RQEIterator<'index> for CRQEIterator {
         unsafe { callback(self.header.as_ptr()) };
     }
 
-    fn revalidate(&mut self) -> Result<crate::RQEValidateStatus<'_, 'index>, RQEIteratorError> {
+    fn revalidate(
+        &mut self,
+        spec: &IndexSpecReadGuard,
+    ) -> Result<crate::RQEValidateStatus<'_, 'index>, RQEIteratorError> {
         // SAFETY: Safe thanks to invariant 3. of [`CRQEIterator::header`].
         let callback = unsafe { self.Revalidate.unwrap_unchecked() };
         // SAFETY:
         // - We have a unique handle over this iterator.
         // - The C code must guarantee, by constructor, that callbacks
         //   can be called on types that implement its C iterator API.
-        let status = unsafe { callback(self.header.as_ptr()) };
+        // - spec.as_mut_ptr() is valid for the duration of this call.
+        let status = unsafe { callback(self.header.as_ptr(), spec.as_mut_ptr()) };
         #[expect(non_upper_case_globals)]
         let status = match status {
             ValidateStatus_VALIDATE_ABORTED => RQEValidateStatus::Aborted,
@@ -290,7 +296,7 @@ impl<'index> RQEIterator<'index> for CRQEIterator {
         unsafe { callback(self.header.as_ptr()) }
     }
 
-    fn last_doc_id(&self) -> t_docId {
+    fn last_doc_id(&self) -> DocId {
         self.lastDocId
     }
 
@@ -341,9 +347,21 @@ impl<'index> RQEIterator<'index> for CRQEIterator {
             }
             IteratorType::Union if prioritize_union_children => {
                 let ptr = std::ptr::from_ref(self.as_ref());
-                // SAFETY: `type_` guarantees `ptr` points to a `UnionIterator` whose first field
-                // is the `QueryIterator` base — the cast is valid by C struct layout.
-                let n = unsafe { (*ptr.cast::<ffi::UnionIterator>()).num as usize };
+                // SAFETY:
+                // - `type_ == Union` guarantees `ptr` was produced by
+                //   `RQEIteratorWrapper::boxed_new_inner` with
+                //   `UnionOpaque<CRQEIterator>` as the inner type
+                //   (`NewUnionIterator` is the sole constructor of a C wrapped union).
+                // - `ref_from_header_ptr` uses the compiler-computed field offset for `inner`
+                //   rather than manual `size_of` arithmetic, making it immune to alignment
+                //   padding between `header` and `inner` in `RQEIteratorWrapper`.
+                let n = unsafe {
+                    RQEIteratorWrapper::<super::UnionOpaque<'_, CRQEIterator>>::ref_from_header_ptr(
+                        ptr,
+                    )
+                    .inner
+                    .num_children_active()
+                };
                 n.max(1) as f64
             }
             IteratorType::InvIdxNumeric => 1.0,
@@ -365,6 +383,7 @@ impl<'index> RQEIterator<'index> for CRQEIterator {
             IteratorType::MetricSortedByScore => 1.0,
             IteratorType::Profile => 1.0,
             IteratorType::Optimus => 1.0,
+            IteratorType::GeoShape => 1.0,
             IteratorType::Mock => 1.0,
             IteratorType::Max => 1.0,
         }
@@ -422,5 +441,46 @@ impl CRQEIterator {
         // 3. `boxed_new` populates all required callbacks (Read, Free, Rewind, etc.).
         // 4. Callbacks are implemented by `RQEIteratorWrapper` and are safe to call.
         unsafe { CRQEIterator::new(ptr) }
+    }
+}
+
+/// Call [`PrintProfile`](QueryIterator::PrintProfile) on a raw
+/// [`QueryIterator`] pointer.
+///
+/// # Safety
+///
+/// `it` must be a valid pointer to a [`QueryIterator`] whose
+/// `PrintProfile` vtable entry is set.
+pub unsafe fn call_print_profile(
+    it: NonNull<QueryIterator>,
+    map: &mut redis_reply::MapBuilder<'_>,
+    ctx: &mut profile_print::ProfilePrintCtx<'_>,
+) {
+    // SAFETY: it is valid per precondition.
+    let print_fn = unsafe { (*it.as_ptr()).PrintProfile }
+        .expect("PrintProfile vtable entry not set on QueryIterator");
+    // SAFETY: print_fn was set at construction time to a function that
+    // interprets the opaque pointers as &mut MapBuilder and
+    // &mut ProfilePrintCtx respectively.
+    unsafe {
+        print_fn(
+            it.as_ptr(),
+            std::ptr::from_mut(map).cast(),
+            std::ptr::from_mut(ctx).cast(),
+        );
+    }
+}
+
+impl profile_print::ProfilePrint for CRQEIterator {
+    fn print_profile(
+        &self,
+        map: &mut redis_reply::MapBuilder<'_>,
+        ctx: &mut profile_print::ProfilePrintCtx<'_>,
+    ) {
+        let ptr = std::ptr::NonNull::from(self.as_ref());
+        // SAFETY: ptr is valid (owned by self) and its PrintProfile vtable
+        // entry was set at construction time by RQEIteratorWrapper::boxed_new
+        // or by the C iterator constructor.
+        unsafe { call_print_profile(ptr, map, ctx) };
     }
 }

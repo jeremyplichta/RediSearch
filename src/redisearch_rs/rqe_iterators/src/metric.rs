@@ -10,17 +10,21 @@
 //! Supporting types for [`Metric`].
 
 use crate::{
-    IteratorType, RQEIterator, RQEIteratorError, RQEValidateStatus, SkipToOutcome, id_list::IdList,
+    IteratorType, RQEIterator, RQEIteratorError, RQEValidateStatus, SkipToOutcome,
+    id_list::IdList,
+    profile_print::{ProfilePrint, ProfilePrintCtx},
     utils::OwnedSlice,
 };
-use ffi::{RLookupKey, RLookupKeyHandle, t_docId};
-use inverted_index::RSIndexResult;
+use ffi::{RLookupKey, RLookupKeyHandle};
+use index_result::RSIndexResult;
+use index_spec::IndexSpecReadGuard;
+use rqe_core::DocId;
 
 /// The different types of metrics.
 /// At the moment, only vector distance is supported.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-/// cbindgen:rename-all=ScreamingSnakeCase
+#[cheadergen::config(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MetricType {
     VectorDistance,
 }
@@ -66,21 +70,22 @@ fn set_result_metrics(result: &mut RSIndexResult, val: f64, key: *mut RLookupKey
     if let Some(num) = result.as_numeric_mut() {
         *num = val;
     } else {
-        // Safety: we created a metric result, which is numeric, in the constructor
         panic!("Result is not numeric");
     }
 
-    // SAFETY: `result` is a valid, mutable reference to an `RSIndexResult`
-    // and `key` is either null or a valid pointer to an `RLookupKey`
-    // (both upheld by the callers in `read` and `skip_to`).
-    unsafe { ffi::ResetAndPushMetricData(result as *mut _ as *mut ffi::RSIndexResult, val, key) };
+    let metrics = result.metrics_mut();
+    metrics.reset();
+    if key.is_null() {
+        metrics.push_without_key(val);
+    } else {
+        // SAFETY: `key` is non-null per the check above, and a valid `RLookupKey`
+        // pointer that outlives this result (upheld by callers in `read` and `skip_to`).
+        metrics.push_with_key(unsafe { &*key }, val);
+    };
 }
 
 impl<'index, const SORTED_BY_ID: bool> Metric<'index, SORTED_BY_ID> {
-    pub fn new(
-        ids: impl Into<OwnedSlice<t_docId>>,
-        metric_data: impl Into<OwnedSlice<f64>>,
-    ) -> Self {
+    pub fn new(ids: impl Into<OwnedSlice<DocId>>, metric_data: impl Into<OwnedSlice<f64>>) -> Self {
         let ids = ids.into();
         let metric_data = metric_data.into();
 
@@ -140,7 +145,7 @@ impl<'index, const SORTED_BY_ID: bool> RQEIterator<'index> for Metric<'index, SO
 
     fn skip_to(
         &mut self,
-        doc_id: t_docId,
+        doc_id: DocId,
     ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError> {
         let Some(found) = self.base._skip_to(doc_id) else {
             return Ok(None);
@@ -171,7 +176,7 @@ impl<'index, const SORTED_BY_ID: bool> RQEIterator<'index> for Metric<'index, SO
     }
 
     #[inline(always)]
-    fn last_doc_id(&self) -> t_docId {
+    fn last_doc_id(&self) -> DocId {
         self.base.last_doc_id()
     }
 
@@ -181,8 +186,11 @@ impl<'index, const SORTED_BY_ID: bool> RQEIterator<'index> for Metric<'index, SO
     }
 
     #[inline(always)]
-    fn revalidate(&mut self) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
-        self.base.revalidate()
+    fn revalidate(
+        &mut self,
+        spec: &IndexSpecReadGuard,
+    ) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
+        self.base.revalidate(spec)
     }
 
     #[inline(always)]
@@ -196,5 +204,30 @@ impl<'index, const SORTED_BY_ID: bool> RQEIterator<'index> for Metric<'index, SO
 
     fn intersection_sort_weight(&self, _prioritize_union_children: bool) -> f64 {
         1.0
+    }
+}
+
+impl<const SORTED_BY_ID: bool> ProfilePrint for Metric<'_, SORTED_BY_ID> {
+    fn print_profile(&self, map: &mut redis_reply::MapBuilder<'_>, ctx: &mut ProfilePrintCtx<'_>) {
+        let metric_type = self.metric_type();
+
+        let type_prefix = if SORTED_BY_ID {
+            "METRIC SORTED BY ID"
+        } else {
+            "METRIC SORTED BY SCORE"
+        };
+        let type_str = match metric_type {
+            MetricType::VectorDistance => {
+                format!("{type_prefix} - VECTOR DISTANCE")
+            }
+        };
+        let type_cstr = std::ffi::CString::new(type_str).unwrap();
+        map.kv_simple_string(c"Type", &type_cstr);
+
+        ctx.print_optional_counters(map);
+
+        if matches!(metric_type, MetricType::VectorDistance) {
+            map.kv_simple_string(c"Vector search mode", c"RANGE_QUERY");
+        }
     }
 }

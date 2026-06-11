@@ -20,7 +20,7 @@ extern "C" {
 #endif
 #include "common.h"
 #include "query_test_utils.h"
-#include "iterators_rs.h"
+#include "iterators_ffi.h"
 
 #include "gtest/gtest.h"
 
@@ -136,14 +136,11 @@ TEST_F(QueryTest, testDiskVectorQueryRestrictions) {
       "@title:hello=>[KNN 2 @vec_field $BLOB]=>{$HYBRID_POLICY:BATCHES;}";
 
   {
-    // Disk-backed specs reject VECTOR_RANGE during parsing.
+    // Disk-backed specs accept VECTOR_RANGE during parsing.
     QASTCXX ast;
     ast.setContext(&ctx);
-    ASSERT_FALSE(ast.parse(range_query, version));
-    ASSERT_NE(ast.getError(), nullptr);
-    ASSERT_NE(strstr(ast.getError(), "vector range queries are currently not supported in Redis Flex"),
-              nullptr)
-        << ast.getError();
+    ASSERT_TRUE(ast.parse(range_query, version))
+        << (ast.getError() ? ast.getError() : "");
   }
 
   SearchOptionsCXX opts;
@@ -166,7 +163,7 @@ TEST_F(QueryTest, testDiskVectorQueryRestrictions) {
   ASSERT_FALSE(QueryError_HasError(&iterErr)) << QueryError_GetUserError(&iterErr);
 
   // Disk-backed pre-filtered KNN requires explicit HYBRID_POLICY during iteration setup.
-  QueryIterator *it = QAST_Iterate(&ast, &opts, &ctx, 0, &iterErr);
+  QueryIterator *it = QAST_Iterate(&ast, &opts, &ctx, 0, NULL, &iterErr);
   ASSERT_NE(it, nullptr);
   ASSERT_TRUE(QueryError_HasError(&iterErr));
   ASSERT_NE(strstr(QueryError_GetUserError(&iterErr), "require explicit HYBRID_POLICY"), nullptr)
@@ -206,7 +203,7 @@ TEST_F(QueryTest, testDiskVectorQueryRestrictions) {
 
   // Query attributes syntax without HYBRID_POLICY still raises the same error.
   QueryIterator *it_missing_attrs =
-      QAST_Iterate(&ast_missing_attrs, &opts_missing_attrs, &ctx, 0, &iterErrMissingAttrs);
+      QAST_Iterate(&ast_missing_attrs, &opts_missing_attrs, &ctx, 0, NULL, &iterErrMissingAttrs);
   ASSERT_NE(it_missing_attrs, nullptr);
   ASSERT_TRUE(QueryError_HasError(&iterErrMissingAttrs));
   ASSERT_NE(strstr(QueryError_GetUserError(&iterErrMissingAttrs), "require explicit HYBRID_POLICY"), nullptr)
@@ -239,7 +236,7 @@ TEST_F(QueryTest, testDiskVectorQueryRestrictions) {
   ASSERT_FALSE(QueryError_HasError(&iterErrAttrs)) << QueryError_GetUserError(&iterErrAttrs);
 
   // Query attributes syntax also satisfies the explicit HYBRID_POLICY requirement.
-  QueryIterator *it_attrs = QAST_Iterate(&ast_attrs, &opts_attrs, &ctx, 0, &iterErrAttrs);
+  QueryIterator *it_attrs = QAST_Iterate(&ast_attrs, &opts_attrs, &ctx, 0, NULL, &iterErrAttrs);
   ASSERT_NE(it_attrs, nullptr);
   ASSERT_FALSE(QueryError_HasError(&iterErrAttrs)) << QueryError_GetUserError(&iterErrAttrs);
 
@@ -957,8 +954,8 @@ TEST_F(QueryTest, testFieldSpec_v1) {
   ASSERT_EQ(n->type, QN_NUMERIC);
   ASSERT_EQ(n->nn.nf->min, 0.4);
   ASSERT_EQ(n->nn.nf->max, 500.0);
-  ASSERT_EQ(n->nn.nf->minInclusive, 1);
-  ASSERT_EQ(n->nn.nf->maxInclusive, 0);
+  ASSERT_EQ(n->nn.nf->minInclusive, true);
+  ASSERT_EQ(n->nn.nf->maxInclusive, false);
   IndexSpec_RemoveFromGlobals(ref, false);
 }
 
@@ -1016,8 +1013,8 @@ TEST_F(QueryTest, testFieldSpec_v2) {
   ASSERT_EQ(n->type, QN_NUMERIC);
   ASSERT_EQ(n->nn.nf->min, 0.4);
   ASSERT_EQ(n->nn.nf->max, 500.0);
-  ASSERT_EQ(n->nn.nf->minInclusive, 1);
-  ASSERT_EQ(n->nn.nf->maxInclusive, 0);
+  ASSERT_EQ(n->nn.nf->minInclusive, true);
+  ASSERT_EQ(n->nn.nf->maxInclusive, false);
   IndexSpec_RemoveFromGlobals(ref, false);
 }
 

@@ -13,7 +13,8 @@
 #include "cursor.h"
 #include "info/indexes_info.h"
 #include "util/units.h"
-#include "module_init.h"
+#include <inttypes.h>
+#include "module_init_ffi.h"
 #include "info/info_redis/types/blocked_queries.h"
 #include "info/info_redis/threads/current_thread.h"
 #include "info/info_redis/threads/main_thread.h"
@@ -241,6 +242,7 @@ void AddToInfo_Indexes(RedisModuleInfoCtx *ctx, TotalIndexesInfo *total_info) {
   RedisModule_InfoAddFieldULongLong(ctx, "total_active_write_threads", total_info->total_active_write_threads);
   RedisModule_InfoAddFieldDouble(ctx, "total_indexing_time", (float)total_info->indexing_time / (float)CLOCKS_PER_MILLISEC);
   RedisModule_InfoAddFieldULongLong(ctx, "total_num_docs_in_indexes", total_info->total_num_docs_in_indexes);
+  RedisModule_InfoAddFieldULongLong(ctx, "total_inverted_index_blocks", total_info->total_inverted_index_blocks);
 }
 
 static inline void AddToInfo_IndexesEmpty(RedisModuleInfoCtx *ctx) {
@@ -252,6 +254,7 @@ static inline void AddToInfo_IndexesEmpty(RedisModuleInfoCtx *ctx) {
   RedisModule_InfoAddFieldULongLong(ctx, "total_active_write_threads", 0);
   RedisModule_InfoAddFieldDouble(ctx, "total_indexing_time", 0);
   RedisModule_InfoAddFieldULongLong(ctx, "total_num_docs_in_indexes", 0);
+  RedisModule_InfoAddFieldULongLong(ctx, "total_inverted_index_blocks", 0);
 }
 
 void AddToInfo_Memory(RedisModuleInfoCtx *ctx, TotalIndexesInfo *total_info) {
@@ -394,6 +397,8 @@ void AddToInfo_RSConfig(RedisModuleInfoCtx *ctx) {
   RedisModule_InfoAddFieldLongLong(ctx, "max_search_results", RSGlobalConfig.maxSearchResults);
   RedisModule_InfoAddFieldLongLong(ctx, "max_aggregate_results",
                                    RSGlobalConfig.maxAggregateResults);
+  RedisModule_InfoAddFieldLongLong(ctx, "max_aggregate_groups",
+                                   RSGlobalConfig.maxAggregateGroups);
   RedisModule_InfoAddFieldLongLong(ctx, "gc_scan_size", RSGlobalConfig.gcConfigParams.gcScanSize);
   RedisModule_InfoAddFieldLongLong(ctx, "min_phonetic_term_length",
                                    RSGlobalConfig.minPhoneticTermLen);
@@ -461,7 +466,7 @@ static void AddCursorsToInfo(RedisModuleInfoCtx *ctx, BlockedQueries* activeQuer
     BlockedCursorNode *at = DLLIST_ITEM(node, BlockedCursorNode, llnode);
     IndexSpec *spec = StrongRef_Get(at->spec);
     char buffer[21]; // 20 is the max length of a uint64_t
-    snprintf(buffer, sizeof(buffer), "%zu", at->cursorId);
+    snprintf(buffer, sizeof(buffer), "%" PRIu64, at->cursorId);
     RedisModule_InfoBeginDictField(ctx, buffer);
     RedisModule_InfoAddFieldCString(ctx, "index", spec ? IndexSpec_FormatName(spec, RSGlobalConfig.hideUserDataFromLog) : "n/a");
     RedisModule_InfoAddFieldULongLong(ctx, "started_at", at->start);

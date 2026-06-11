@@ -21,7 +21,8 @@
 #include "cursor.h"
 #include "search_disk.h"
 #include "doc_id_meta.h"
-#include "iterators_rs.h"
+#include "iterators_ffi.h"
+#include "module_init_ffi.h"
 
 #define JSON_LEN 5 // length of string "json."
 RedisModuleString *global_RenameFromKey = NULL;
@@ -113,7 +114,7 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
     case loaded_cmd:
       // on loaded event the key is stack allocated so to use it to load the
       // document we must copy it
-      if (!IS_SST_RDB_IN_PROCESS(ctx)) {
+      if (!IS_SST_RDB_LOADING(ctx)) {
         key = RedisModule_CreateStringFromString(ctx, key);
         Indexes_UpdateMatchingWithSchemaRules(ctx, key, getDocTypeFromString(key), hashFields); //TODO: avoid getDocTypeFromString ?
         RedisModule_FreeString(ctx, key);
@@ -126,14 +127,36 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
     case hincrby_cmd:
     case hincrbyfloat_cmd:
     case hdel_cmd:
-    case hexpired_cmd:
-      if (!IS_SST_RDB_IN_PROCESS(ctx)) {
+      if (!IS_SST_RDB_LOADING(ctx)) {
         Indexes_UpdateMatchingWithSchemaRules(ctx, key, DocumentType_Hash, hashFields);
+      }
+      break;
+    case hexpired_cmd:
+      if (!SearchDisk_IsEnabled()) {
+        Indexes_UpdateMatchingWithSchemaRules(ctx, key, DocumentType_Hash, hashFields);
+      } else {
+        static bool hexpired_warned = false;
+        if (!hexpired_warned && Indexes_Count() > 0) {
+          RedisModule_Log(ctx, "warning", "HEXPIRED event is not supported on Search when Flex is enabled. Ignoring HEXPIRED on Search");
+          hexpired_warned = true;
+        }
       }
       break;
 
     case expire_cmd:
     case persist_cmd:
+      // EXPIRE/PERSIST only change the key's TTL; the document content,
+      // schema-rule filters and inverted indexes are all unaffected. In the
+      // in-memory flow we only need to refresh the doc-level expiration on
+      // the matching DMDs. Disk-backed indexes still take the full reindex
+      // path until they grow an equivalent fast path.
+      if (SearchDisk_IsEnabled()) {
+        Indexes_UpdateMatchingWithSchemaRules(ctx, key, getDocTypeFromString(key), hashFields);
+      } else {
+        Indexes_UpdateMatchingDocExpiration(ctx, key, getDocTypeFromString(key));
+      }
+      break;
+
     case restore_cmd:
     case copy_to_cmd:
       Indexes_UpdateMatchingWithSchemaRules(ctx, key, getDocTypeFromString(key), hashFields);
@@ -164,9 +187,17 @@ int HashNotificationCallback(RedisModuleCtx *ctx, int type, const char *event,
  ********************************************************/
     case hexpire_cmd:
     case hpersist_cmd:
-      // We do not support field-TTL metadata changes in the disk flow.
+      // HEXPIRE/HPERSIST only change per-field TTL metadata, so refresh the
+      // matching specs' TTL tables without re-indexing the document. Disk-
+      // backed indexes do not support field-TTL metadata and are skipped.
       if (!SearchDisk_IsEnabled()) {
-        Indexes_UpdateMatchingWithSchemaRules(ctx, key, getDocTypeFromString(key), hashFields);
+        Indexes_UpdateMatchingHashFieldExpiration(ctx, key, getDocTypeFromString(key));
+      } else {
+        static bool hpexpire_warned = false;
+        if (!hpexpire_warned && Indexes_Count() > 0) {
+          RedisModule_Log(ctx, "warning", "Field-level expiration is not supported on Search when Flex is enabled. Ignoring HPEXPIRE/HPERSIST on Search");
+          hpexpire_warned = true;
+        }
       }
       break;
 
@@ -258,6 +289,13 @@ void CommandFilterCallback(RedisModuleCommandFilterCtx *filter) {
   } else if (!strcasecmp("HDEL", cmdStr)) {
     // Nothing to do
   } else {
+    // TODO: HEXPIRE/HPEXPIRE/HEXPIREAT/HPEXPIREAT/HPERSIST also carry an
+    // explicit `FIELDS numfields field [field ...]` list. Capturing it here
+    // (scan argv for the FIELDS keyword, parse numfields, retain each field)
+    // would let Indexes_UpdateMatchingHashFieldExpiration in src/spec.c skip
+    // specs whose schema does not reference any of the affected fields,
+    // saving a HashFieldMinExpire + per-indexed-field HashGet pass on wide
+    // schemas where HEXPIRE only touches unindexed fields.
     return;
   }
 
@@ -495,15 +533,14 @@ static void ServerReadyEvent(RedisModuleCtx *ctx, RedisModuleEvent eid, uint64_t
   REDISMODULE_NOT_USED(eid);
   REDISMODULE_NOT_USED(subevent);
   REDISMODULE_NOT_USED(data);
+  RS_ASSERT(SearchDisk_IsEnabled());
   RedisModule_Log(ctx, "notice", "Got Server ready event.");
-  if (SearchDisk_IsEnabled()) {
-    bool disk_initialized = SearchDisk_Initialize(ctx);
-    RS_LOG_ASSERT(disk_initialized, "Search Disk is enabled but could not be initialized")
-    if (RSGlobalConfig.numWorkerThreads == 0) {
-      RSGlobalConfig.numWorkerThreads = DEFAULT_WORKER_THREADS_FLEX;
-      workersThreadPool_SetNumWorkers();
-      RedisModule_Log(ctx, "notice", "WORKERS set to 1 (Flex mode default)");
-    }
+  bool disk_initialized = SearchDisk_Initialize(ctx);
+  RS_LOG_ASSERT(disk_initialized, "Search Disk is enabled but could not be initialized")
+  if (RSGlobalConfig.numWorkerThreads == 0) {
+    RSGlobalConfig.numWorkerThreads = DEFAULT_WORKER_THREADS_FLEX;
+    workersThreadPool_SetNumWorkers();
+    RedisModule_Log(ctx, "notice", "WORKERS set to 1 (Flex mode default)");
   }
 }
 
@@ -513,25 +550,65 @@ void ShutdownEvent(RedisModuleCtx *ctx, RedisModuleEvent eid, uint64_t subevent,
   RedisModule_Log(ctx, "notice", "%s", "End releasing RediSearch resources");
 }
 
+// Latched true when a foreground hot-restart save runs (SYNC_RDB_START with SST,
+// see PersistenceEvent). On a successful save it stays set, because the save is
+// immediately followed by process exit and the shutdown handler below reads it
+// to decide whether the on-disk DBs must be preserved for the restart. It is
+// cleared again if the save fails (PERSISTENCE_FAILED): the process keeps
+// running after a failed save, so a later ordinary shutdown must not mistake the
+// stale latch for a successful hot restart and skip the on-disk index deletion.
+static bool g_hotRestartSave = false;
+
+// Delete every disk-backed index's on-disk database on a normal shutdown.
+//
+// Why an *explicit* close (and not just a mark) is required here:
+//
+// The actual file deletion lives in the Rust side, in the database's Drop.
+// The catch is *ownership*: the Rust index handle is owned by
+// the C IndexSpec as a raw pointer (sp->diskSpec, a Box::into_raw), and the
+// ONLY thing that ever drops that Box is SearchDisk_CloseIndex.
+static void DeleteDiskIndexesOnShutdown(RedisModuleCtx *ctx) {
+  if (!specDict_g) {
+    return;
+  }
+  dictIterator *iter = dictGetIterator(specDict_g);
+  dictEntry *entry = NULL;
+  while ((entry = dictNext(iter))) {
+    StrongRef spec_ref = dictGetRef(entry);
+    IndexSpec *sp = StrongRef_Get(spec_ref);
+    if (sp && sp->diskSpec) {
+      // Unregister must always precede close (see SearchDisk_CloseIndex docs).
+      SearchDisk_UnregisterIndex(ctx, sp);
+      SearchDisk_MarkIndexForDeletion(sp->diskSpec);
+      SearchDisk_CloseIndex(sp->diskSpec);
+      sp->diskSpec = NULL;
+    }
+  }
+  dictReleaseIterator(iter);
+}
+
 void ShutdownDiskClose(RedisModuleCtx *ctx, RedisModuleEvent eid, uint64_t subevent, void *data) {
   RedisModule_Log(ctx, "notice", "%s", "Begin releasing RediSearch DiskAPI resources on shutdown");
+  if (!g_hotRestartSave) {
+    RedisModule_Log(ctx, "notice", "%s",
+                    "Deleting on-disk search indexes on shutdown (not a hot restart)");
+    DeleteDiskIndexesOnShutdown(ctx);
+  }
   SearchDisk_Close(ctx);
   RedisModule_Log(ctx, "notice", "%s", "End releasing RediSearch DiskAPI resources");
 }
 
 #define HIDE_USER_DATA_FROM_LOGS "hide-user-data-from-log"
 #define BIGREDIS_MAX_RAM "bigredis-max-ram"
+#define REDIS_LOGLEVEL "loglevel"
 
 bool getHideUserDataFromLogs() {
-  char *value = getRedisConfigValue(RSDummyContext, HIDE_USER_DATA_FROM_LOGS);
-  RedisModule_Assert(value);
-  const bool hideUserData = !strcasecmp(value, "yes");
-  rm_free(value);
-  return hideUserData;
+  return getRedisConfigBool(RSDummyContext, HIDE_USER_DATA_FROM_LOGS, false);
 }
 
 void onUpdatedHideUserDataFromLogs(RedisModuleCtx *ctx) {
   RSGlobalConfig.hideUserDataFromLog = getHideUserDataFromLogs();
+  SearchDisk_UpdateLogObfuscation();
   if (RSGlobalConfig.hideUserDataFromLog) {
     RedisModule_Log(ctx, "notice", "Hide user data from search logs is now enabled, "
                    "search entity names (such as indexes and fields) in the logs will now be obfuscated");
@@ -539,6 +616,15 @@ void onUpdatedHideUserDataFromLogs(RedisModuleCtx *ctx) {
     RedisModule_Log(ctx, "notice", "Hide user data from search logs is now disabled, "
                    "search entity names (such as indexes and fields) in the logs will now be visible");
   }
+}
+
+static void onUpdatedLogLevel(RedisModuleCtx *ctx) {
+  RedisModuleString *level = getRedisConfigValue(ctx, REDIS_LOGLEVEL);
+  if (!level) {
+    return;
+  }
+  TracingRedisModule_SetLogLevel(RedisModule_StringPtrLen(level, NULL));
+  RedisModule_FreeString(ctx, level);
 }
 
 void ConfigChangedCallback(RedisModuleCtx *ctx, RedisModuleEvent eid, uint64_t event, void *data) {
@@ -555,6 +641,9 @@ void ConfigChangedCallback(RedisModuleCtx *ctx, RedisModuleEvent eid, uint64_t e
     if (!strcmp(conf, BIGREDIS_MAX_RAM)) {
       RS_ASSERT(SearchDisk_IsInitialized());
       SearchDisk_UpdateBufferBudget(ctx, (int)RSGlobalConfig.diskBufferPercentage);
+    }
+    if (strcmp(conf, REDIS_LOGLEVEL) == 0) {
+      onUpdatedLogLevel(ctx);
     }
   }
 }
@@ -578,23 +667,159 @@ void Initialize_KeyspaceNotifications() {
   }
 }
 
+// Iterate every live IndexSpec with a disk-backed companion and invoke `fn`
+// against the IndexSpec. This must be called from the main thread
+static void ForEachIndex(void (*fn)(IndexSpec *)) {
+  if (!specDict_g) {
+    return;
+  }
+  dictIterator *iter = dictGetIterator(specDict_g);
+  dictEntry *entry = NULL;
+  while ((entry = dictNext(iter))) {
+    StrongRef spec_ref = dictGetRef(entry);
+    IndexSpec *sp = StrongRef_Get(spec_ref);
+    if (sp) {
+      RS_ASSERT(sp->diskSpec);
+      fn(sp);
+    }
+  }
+  dictReleaseIterator(iter);
+}
+
+//Keeps track to know if SST replication holds the lock avoiding background vector index building jobs from running
+static bool vecsimdisk_sst_consistency_lock_held = false;
+
+// Begin a consistent on-disk save window.
+// Shared by the SST replication fork (flush = SearchDisk_PreFork) and the
+// foreground hot-restart save (flush = SearchDisk_PreCheckpoint), so the two
+// callers cannot drift apart on the lock/flag protocol. Pairs with
+// DiskConsistencyWindow_End.
+static void DiskConsistencyWindow_Begin(void (*flush)(IndexSpec *)) {
+  VecSimDisk_AcquireConsistencyLock();
+  vecsimdisk_sst_consistency_lock_held = true;
+  ForEachIndex(flush);
+}
+
+// End the consistent on-disk save window opened by DiskConsistencyWindow_Begin.
+//
+// The caller must check vecsimdisk_sst_consistency_lock_held before calling
+// this on a path where the window may never have been opened (e.g. SST ABORT).
+static void DiskConsistencyWindow_End(void (*finalize)(IndexSpec *)) {
+  ForEachIndex(finalize);
+  VecSimDisk_ReleaseConsistencyLock();
+  vecsimdisk_sst_consistency_lock_held = false;
+}
+
+// SST replication event handler.
+//
+// Dispatches each replication sub-event to the matching per-spec wrapper in
+// search_disk.h
+//
+static void SSTReplicationEvent(RedisModuleCtx *ctx, RedisModuleEvent eid,
+                                uint64_t subevent, void *data) {
+  REDISMODULE_NOT_USED(eid);
+  REDISMODULE_NOT_USED(data);
+  RS_ASSERT(SearchDisk_IsEnabled());
+
+  if (!SearchDisk_IsInitialized()) {
+    return;
+  }
+
+  switch (subevent) {
+    case REDISMODULE_SUBEVENT_SST_REPL_PRE_CHECKPOINT:
+      RedisModule_Log(ctx, "notice", "SST replication: PRE_CHECKPOINT");
+      ForEachIndex(SearchDisk_PreCheckpoint);
+      break;
+    case REDISMODULE_SUBEVENT_SST_REPL_POST_CHECKPOINT:
+      RedisModule_Log(ctx, "notice", "SST replication: POST_CHECKPOINT");
+      break;
+    case REDISMODULE_SUBEVENT_SST_REPL_PRE_FORK:
+      RedisModule_Log(ctx, "notice", "SST replication: PRE_FORK");
+      DiskConsistencyWindow_Begin(SearchDisk_PreFork);
+      break;
+    case REDISMODULE_SUBEVENT_SST_REPL_POST_FORK:
+      RedisModule_Log(ctx, "notice", "SST replication: POST_FORK");
+      RS_ASSERT(vecsimdisk_sst_consistency_lock_held);
+      DiskConsistencyWindow_End(SearchDisk_PostFork);
+      break;
+    case REDISMODULE_SUBEVENT_SST_REPL_ABORT:
+      RedisModule_Log(ctx, "notice", "SST replication: ABORT");
+      // The abort can fire before PRE_FORK opened the window, so the lock may
+      // not be held. Always run ReplicationAbort; only unwind the window when
+      // it was actually opened.
+      if (vecsimdisk_sst_consistency_lock_held) {
+        DiskConsistencyWindow_End(SearchDisk_ReplicationAbort);
+      } else {
+        ForEachIndex(SearchDisk_ReplicationAbort);
+      }
+      break;
+    default:
+      RS_LOG_ASSERT_FMT(false, "Received unknown sub-event %llu for SST replication", (unsigned long long)subevent);
+      RedisModule_Log(ctx, "warning",
+                      "SST replication: unknown sub-event %llu",
+                      (unsigned long long)subevent);
+      break;
+  }
+}
+
 // Persistence event handler.
 // Called on BGSAVE/AOF rewrite start and end.
 static void PersistenceEvent(RedisModuleCtx *ctx, RedisModuleEvent eid,
                              uint64_t subevent, void *data) {
   REDISMODULE_NOT_USED(eid);
   REDISMODULE_NOT_USED(data);
+  RS_ASSERT(SearchDisk_IsEnabled());
+  bool useSst = IS_SST_RDB_IN_PROCESS(ctx);
 
   switch (subevent) {
   case REDISMODULE_SUBEVENT_PERSISTENCE_RDB_START:
+    // Async (fork child) save: BGSAVE / replication. This can never be a hot
+    // restart (those only happen in the foreground, main-process SYNC_ variant)
+    if (!useSst) {
+      RedisModule_Log(ctx, "notice", "Persistence started");
+      DocIdMeta_SetForgetDocIdMetadata(true);
+    }
+    break;
   case REDISMODULE_SUBEVENT_PERSISTENCE_SYNC_RDB_START:
-    RedisModule_Log(ctx, "notice", "Persistence started");
-    DocIdMeta_SetPersistenceInProgress(true);
+    if (!useSst) {
+      RedisModule_Log(ctx, "notice", "Persistence started");
+      DocIdMeta_SetForgetDocIdMetadata(true);
+    } else {
+      // Hot restart: a RAM-only RDB (restart.rdb) is being saved in the
+      // foreground alongside the on-disk state. The replication
+      // SST_REPL_PRE_FORK consistency hook never fires for a foreground save,
+      // so open the consistency window here instead (flushing via PreCheckpoint).
+      RedisModule_Log(ctx, "notice", "Hot-restart save started (SST + RAM-only RDB)");
+      // Latch so the upcoming shutdown keeps the on-disk DBs (see ShutdownDiskClose).
+      g_hotRestartSave = true;
+      DiskConsistencyWindow_Begin(SearchDisk_PreCheckpoint);
+    }
     break;
   case REDISMODULE_SUBEVENT_PERSISTENCE_ENDED:
+    if (vecsimdisk_sst_consistency_lock_held) {
+      // Unwind the hot-restart consistency window opened at SYNC_RDB_START,
+      // re-enabling compactions via PostFork on success.
+      DiskConsistencyWindow_End(SearchDisk_PostFork);
+      RedisModule_Log(ctx, "notice", "Hot-restart save ended");
+    } else if (!useSst) {
+      RedisModule_Log(ctx, "notice", "Persistence ended");
+      DocIdMeta_SetForgetDocIdMetadata(false);
+    }
+    break;
   case REDISMODULE_SUBEVENT_PERSISTENCE_FAILED:
-    RedisModule_Log(ctx, "notice", "Persistence ended");
-    DocIdMeta_SetPersistenceInProgress(false);
+    if (vecsimdisk_sst_consistency_lock_held) {
+      // Unwind the hot-restart consistency window opened at SYNC_RDB_START,
+      // re-enabling compactions defensively via ReplicationAbort on failure.
+      DiskConsistencyWindow_End(SearchDisk_ReplicationAbort);
+      // Clear the latch: the save failed, so the process keeps running and a
+      // later ordinary shutdown must still delete the on-disk indexes rather
+      // than treat this as a successful hot restart (see ShutdownDiskClose).
+      g_hotRestartSave = false;
+      RedisModule_Log(ctx, "warning", "Hot-restart save failed");
+    } else if (!useSst) {
+      RedisModule_Log(ctx, "notice", "Persistence ended");
+      DocIdMeta_SetForgetDocIdMetadata(false);
+    }
     break;
   }
 }
@@ -635,6 +860,9 @@ void Initialize_ServerEventNotifications(RedisModuleCtx *ctx) {
 
     RedisModule_Log(ctx, "notice", "Subscribe to persistence events");
     RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_Persistence, PersistenceEvent);
+
+    RedisModule_Log(ctx, "notice", "Subscribe to SST replication events");
+    RedisModule_SubscribeToServerEvent(ctx, RedisModuleEvent_SSTReplication, SSTReplicationEvent);
   }
 }
 
@@ -717,30 +945,89 @@ void Initialize_RoleChangeNotifications(RedisModuleCtx *ctx) {
   RedisModule_Log(ctx, "notice", "Enabled role change notification");
 }
 
+// Latch set at LOADING/RDB_START when a partial-RDB (SST) load is staged.
+//
+// The SST_RDB context flag is reliably ON at RDB_START, but for a hot restart
+// the server clears it *before* firing LOADING_ENDED (unlike replication, which
+// keeps it ON across the event). Latching here lets the LOADING_ENDED handler
+// run the finish step regardless of the flag's clear-timing.
+static bool g_partialRdbLoadStaged = false;
+
 // This function is called in case the server is started or
 // when the replica is loading the RDB file from the master.
 void RDB_LoadingEvent(RedisModuleCtx *ctx, RedisModuleEvent eid, uint64_t subevent, void *data) {
+  bool useSst = IS_SST_RDB_IN_PROCESS(ctx);
+
   switch (subevent) {
   case REDISMODULE_SUBEVENT_LOADING_RDB_START:
+    if (useSst) {
+      // Latch that a partial-RDB (SST) load is staged; the flag is reliably ON
+      // here but may be cleared before LOADING_ENDED (hot restart).
+      g_partialRdbLoadStaged = true;
+    }
   case REDISMODULE_SUBEVENT_LOADING_AOF_START:
   case REDISMODULE_SUBEVENT_LOADING_REPL_START:
+    // Symmetric counterpart to the save-side decision in PersistenceEvent.
+    // During an SST + RDB sync the master streams RAM-resident keys together
+    // with their DocIdMeta, and the disk state arrives via the SST files, so
+    // the replica must KEEP the meta it loads (forget = false). For any other
+    // load (plain RDB / AOF / legacy RDB-only replication) the index is rebuilt
+    // from the keyspace and the stale docIds are meaningless, so we FORGET.
+    DocIdMeta_SetForgetDocIdMetadata(!useSst);
     Indexes_StartRDBLoadingEvent(ctx);
     workersThreadPool_OnEventStart();
-    RedisModule_Log(RSDummyContext, "notice", "Loading event started");
+    RedisModule_Log(RSDummyContext, "notice", "Loading RDB event started");
     break;
-  case REDISMODULE_SUBEVENT_LOADING_ENDED:
-    Indexes_EndRDBLoadingEvent(ctx);
+  case REDISMODULE_SUBEVENT_LOADING_SST_START:
+    RedisModule_Log(RSDummyContext, "notice", "Loading SST event started");
+    break;
+  case REDISMODULE_SUBEVENT_LOADING_SST_ENDED:
+    RedisModule_Log(RSDummyContext, "notice", "Loading SST event ended");
+    break;
+  case REDISMODULE_SUBEVENT_LOADING_RDB_ENDED:
+    RedisModule_Log(RSDummyContext, "notice", "Loading RDB event ended");
+    break;
+  case REDISMODULE_SUBEVENT_LOADING_ENDED: {
+    // For a hot restart the server clears the SST_RDB flag before firing this
+    // event, so IS_SST_RDB_IN_PROCESS is false here even though we staged a
+    // partial-RDB load. Fall back to the latch set at RDB_START. Replication
+    // keeps the flag ON, so useSst still covers it.
+    bool finishSst = useSst || g_partialRdbLoadStaged;
+    g_partialRdbLoadStaged = false;
+    // Re-enable the DocIdMeta RDB callbacks now that this load is done.
+    DocIdMeta_SetForgetDocIdMetadata(false);
+    if (!SearchDisk_IsEnabled()) {
+      // This only handles legacy indices that are not available in disk
+      Indexes_EndRDBLoadingEvent(ctx);
+    } else if (finishSst) {
+      RedisModule_Log(RSDummyContext, "notice", "Loading event ended (SST + RDB ready). Finish loading");
+      Indexes_FinishSSTReplication(ctx);
+    }
     workersThreadPool_OnEventEnd(true);
     Indexes_EndLoading();
-    RedisModule_Log(RSDummyContext, "notice", "Loading event ended successfully");
+    if (!SearchDisk_IsEnabled() || !finishSst) {
+      RedisModule_Log(RSDummyContext, "notice", "Loading event ended successfully");
+    } else {
+      RedisModule_Log(RSDummyContext, "notice", "Loading event ended successfully (SST + RDB ready). Finished loading successfully");
+    }
     break;
+  }
   case REDISMODULE_SUBEVENT_LOADING_FAILED:
+    // If the failure happens in the middle of an SST replication round (master
+    // aborted, network dropped, validation rejected, etc.) Redis fires LOADING_FAILED. Tear down anything we
+    // staged for the round so the next attempt starts from a clean slate.
+    // No-op when no specs are staged.
+    g_partialRdbLoadStaged = false;
+    DocIdMeta_SetForgetDocIdMetadata(false);
+    if (SearchDisk_IsEnabled()) {
+      Indexes_AbortSSTReplicationLoading(ctx);
+    }
     workersThreadPool_OnEventEnd(true);
     Indexes_EndLoading();
     RedisModule_Log(RSDummyContext, "notice", "Loading event failed");
     break;
   default:
-    RS_LOG_ASSERT_FMT(0, "Unknown sub-event %d", subevent);
+    RS_LOG_ASSERT_FMT(0, "Unknown sub-event %llu", (unsigned long long)subevent);
     break;
   }
 }

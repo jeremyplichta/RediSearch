@@ -11,9 +11,7 @@
 
 #include "module.h"
 #include "config.h"
-#include "redisearch_api.h"
 #include <assert.h>
-#include <ctype.h>
 #include <dlfcn.h>
 #include "concurrent_ctx.h"
 #include "cursor.h"
@@ -22,7 +20,6 @@
 #include "notifications.h"
 #include "aggregate/aggregate.h"
 #include "ext/default.h"
-#include "rwlock.h"
 #include "json.h"
 #include "VecSim/vec_sim.h"
 #include "util/workers.h"
@@ -55,46 +52,21 @@ static int validateAofSettings(RedisModuleCtx *ctx) {
     return rc;
   }
 
-  // Can't execute commands on the loading context, so make a new one
-  RedisModuleCallReply *reply =
-      RedisModule_Call(RSDummyContext, "CONFIG", "cc", "GET", "aof-use-rdb-preamble");
-  RS_ASSERT(reply);
-  RS_ASSERT(RedisModule_CallReplyType(reply) == REDISMODULE_REPLY_ARRAY);
-  RS_ASSERT(RedisModule_CallReplyLength(reply) == 2);
-  const char *value =
-      RedisModule_CallReplyStringPtr(RedisModule_CallReplyArrayElement(reply, 1), NULL);
-
-  // I tried using strcasecmp, but it seems that the yes/no replies have a trailing
-  // embedded newline in them
-  if (tolower(*value) == 'n') {
+  // Can't execute commands on the loading context, so use the dummy one
+  if (!getRedisConfigBool(RSDummyContext, "aof-use-rdb-preamble", false)) {
     RedisModule_Log(RSDummyContext, "warning", "FATAL: aof-use-rdb-preamble required if AOF is used!");
     rc = 0;
   }
-  RedisModule_FreeCallReply(reply);
   return rc;
 }
 
 static int initAsModule(RedisModuleCtx *ctx) {
-  if (RediSearch_ExportCapi(ctx) != REDISMODULE_OK) {
-    RedisModule_Log(ctx, "warning", "Could not initialize low level api");
-  } else {
-    RedisModule_Log(ctx, "notice", "Low level api version %d initialized successfully",
-                    REDISEARCH_CAPI_VERSION);
-  }
-
   if (!validateAofSettings(ctx)) {
     return REDISMODULE_ERR;
   }
 
   GetJSONAPIs(ctx, 1);
 
-  return REDISMODULE_OK;
-}
-
-static int initAsLibrary(RedisModuleCtx *ctx) {
-  RSGlobalConfig.iteratorsConfigParams.minTermPrefix = 0;
-  RSGlobalConfig.iteratorsConfigParams.maxPrefixExpansions = LONG_MAX;
-  RSGlobalConfig.iteratorsConfigParams.minStemLength = DEFAULT_MIN_STEM_LENGTH;
   return REDISMODULE_OK;
 }
 
@@ -109,17 +81,13 @@ static inline const char* RS_GetExtraVersion() {
 int RS_Initialized = 0;
 RedisModuleCtx *RSDummyContext = NULL;
 
-int RediSearch_Init(RedisModuleCtx *ctx, int mode) {
-#define DO_LOG(...)                                 \
-  do {                                              \
-    if (ctx && (mode != REDISEARCH_INIT_LIBRARY)) { \
-      RedisModule_Log(ctx, ##__VA_ARGS__);          \
-    }                                               \
+int RediSearch_Init(RedisModuleCtx *ctx) {
+#define DO_LOG(...)                        \
+  do {                                     \
+    if (ctx) {                             \
+      RedisModule_Log(ctx, ##__VA_ARGS__); \
+    }                                      \
   } while (false)
-
-  if (RediSearch_LockInit(ctx) != REDISMODULE_OK) {
-    return REDISMODULE_ERR;
-  }
 
   // Print version string!
   DO_LOG("notice", "RediSearch version %d.%d.%d (Git=%s)", REDISEARCH_VERSION_MAJOR,
@@ -136,9 +104,7 @@ int RediSearch_Init(RedisModuleCtx *ctx, int mode) {
     RSDummyContext = RedisModule_GetDetachedThreadSafeContext(ctx);
   }
 
-  if (mode == REDISEARCH_INIT_MODULE && initAsModule(ctx) != REDISMODULE_OK) {
-    return REDISMODULE_ERR;
-  } else if (mode == REDISEARCH_INIT_LIBRARY && initAsLibrary(ctx) != REDISMODULE_OK) {
+  if (initAsModule(ctx) != REDISMODULE_OK) {
     return REDISMODULE_ERR;
   }
 

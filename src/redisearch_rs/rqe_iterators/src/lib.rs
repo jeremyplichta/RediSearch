@@ -7,16 +7,32 @@
  * GNU Affero General Public License v3 (AGPLv3).
 */
 
-use ffi::t_docId;
+// Stub `AREQ_CheckTimedOut` for lib unit tests so the linker doesn't pull
+// `query.c.o` (and its C/coord/SSL transitive closure) from
+// `libredisearch_all.a`. The flag is only ever set by Redis on the main
+// thread, which doesn't exist here. Integration tests use the real symbol.
+#[cfg(test)]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn AREQ_CheckTimedOut(_areq: *mut ffi::AREQ) -> bool {
+    false
+}
+
 use std::sync::OnceLock;
+
+use index_spec::IndexSpecReadGuard;
+use rqe_core::{DocId, FieldIndex};
 use thiserror::Error;
 
-use ::inverted_index::{RSIndexResult, t_fieldMask};
+use ::inverted_index::FieldMask;
+use index_result::RSIndexResult;
+pub use query_error::QueryError;
 use query_term::RSQueryTerm;
 
 pub mod c2rust;
+pub mod config;
 pub mod empty;
 pub mod expiration_checker;
+pub mod geo_shape;
 pub mod id_list;
 pub mod interop;
 pub mod intersection;
@@ -30,26 +46,34 @@ pub mod optional;
 pub mod optional_optimized;
 pub mod optional_reducer;
 pub mod profile;
+pub mod profile_print;
 pub mod union;
 mod union_flat;
 mod union_heap;
+pub mod union_opaque;
 pub mod union_reducer;
+mod union_trimmed;
 pub mod utils;
 pub mod wildcard;
 
+pub use config::IteratorsConfig;
 pub use empty::Empty;
 pub use expiration_checker::{ExpirationChecker, FieldExpirationChecker, NoOpChecker};
+pub use geo_shape::{GeoShape, MemTracker, NoTracker};
 pub use id_list::IdList;
 pub use intersection::{Intersection, NewIntersectionIterator, new_intersection_iterator};
-pub use inverted_index::{Missing, Numeric, Tag, Term};
-pub use metric::Metric;
-pub use not::NotIterator;
-pub use optional::OptionalIterator;
+pub use inverted_index::{
+    GeoRangeError, InvalidGeoInput, Missing, Numeric, NumericIteratorVariant, Tag, Term,
+    build_geo_numeric_filters, extract_geo_unit_factor, new_geo_range_iterator,
+    open_numeric_or_geo_index,
+};
 pub use rqe_iterator_type::IteratorType;
 pub use union::{
     Union, UnionFlat, UnionFullFlat, UnionFullHeap, UnionHeap, UnionQuickFlat, UnionQuickHeap,
+    UnionTrimmed,
 };
-pub use wildcard::{Wildcard, WildcardIterator};
+pub use union_opaque::{UnionOpaque, UnionVariant};
+pub use wildcard::{NewWildcardIterator, Wildcard, WildcardIterator};
 
 #[derive(Debug, PartialEq)]
 /// The outcome of [`RQEIterator::skip_to`].
@@ -121,13 +145,22 @@ pub trait RQEIterator<'index> {
     /// if the iterator found a result greater than `docId`. `None` will be returned if the iterator has reached the end of the index.
     fn skip_to(
         &mut self,
-        doc_id: t_docId,
+        doc_id: DocId,
     ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError>;
 
     /// Called when the iterator is being revalidated after a concurrent index change.
     ///
-    /// The iterator should check if it is still valid.
-    fn revalidate(&mut self) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError>;
+    /// The iterator should check if it is still valid by comparing its stored state
+    /// against the current index state.
+    ///
+    /// # Locking
+    ///
+    /// The caller must hold the spec read lock, represented by [`IndexSpecReadGuard`].
+    /// The lock ensures the spec remains valid and unchanged during this call.
+    fn revalidate(
+        &mut self,
+        spec: &IndexSpecReadGuard,
+    ) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError>;
 
     /// Rewind the iterator to the beginning and reset its properties.
     fn rewind(&mut self);
@@ -138,7 +171,7 @@ pub trait RQEIterator<'index> {
     /**************** properties ****************/
 
     /// Returns the last doc id that was read or skipped to.
-    fn last_doc_id(&self) -> t_docId;
+    fn last_doc_id(&self) -> DocId;
 
     /// Returns `false` if the iterator can yield more results.
     /// The iterator implementation must ensure that [`at_eof`](Self::at_eof) returns `true`
@@ -168,10 +201,10 @@ pub trait RQEIterator<'index> {
     fn intersection_sort_weight(&self, prioritize_union_children: bool) -> f64;
 }
 
-/// Blanket [`RQEIterator`] impl for `Box<I>` where `I` is a concrete iterator type.
+/// [`RQEIterator`] impl for boxed iterators, including type-erased `dyn` variants.
 ///
-/// All core methods delegate to the inner iterator.
-impl<'index, I: RQEIterator<'index> + 'index> RQEIterator<'index> for Box<I> {
+/// All methods delegate through the vtable to the concrete type's implementation.
+impl<'index, I: RQEIterator<'index> + ?Sized + 'index> RQEIterator<'index> for Box<I> {
     fn current(&mut self) -> Option<&mut RSIndexResult<'index>> {
         (**self).current()
     }
@@ -182,13 +215,16 @@ impl<'index, I: RQEIterator<'index> + 'index> RQEIterator<'index> for Box<I> {
 
     fn skip_to(
         &mut self,
-        doc_id: t_docId,
+        doc_id: DocId,
     ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError> {
         (**self).skip_to(doc_id)
     }
 
-    fn revalidate(&mut self) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
-        (**self).revalidate()
+    fn revalidate(
+        &mut self,
+        spec: &IndexSpecReadGuard,
+    ) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
+        (**self).revalidate(spec)
     }
 
     fn rewind(&mut self) {
@@ -199,7 +235,7 @@ impl<'index, I: RQEIterator<'index> + 'index> RQEIterator<'index> for Box<I> {
         (**self).num_estimated()
     }
 
-    fn last_doc_id(&self) -> t_docId {
+    fn last_doc_id(&self) -> DocId {
         (**self).last_doc_id()
     }
 
@@ -221,58 +257,13 @@ impl<'index, I: RQEIterator<'index> + 'index> RQEIterator<'index> for Box<I> {
     }
 }
 
-/// [`RQEIterator`] impl for type-erased iterators.
-///
-/// All methods — including profiling — delegate through the vtable to the
-/// concrete type's implementation.
-impl<'index> RQEIterator<'index> for Box<dyn RQEIterator<'index> + 'index> {
-    fn current(&mut self) -> Option<&mut RSIndexResult<'index>> {
-        (**self).current()
-    }
+/// Combined trait for iterators that implement both [`RQEIterator`] and
+/// [`ProfilePrint`](profile_print::ProfilePrint).
+pub trait RQEIteratorPrintable<'index>: RQEIterator<'index> + profile_print::ProfilePrint {}
 
-    fn read(&mut self) -> Result<Option<&mut RSIndexResult<'index>>, RQEIteratorError> {
-        (**self).read()
-    }
-
-    fn skip_to(
-        &mut self,
-        doc_id: t_docId,
-    ) -> Result<Option<SkipToOutcome<'_, 'index>>, RQEIteratorError> {
-        (**self).skip_to(doc_id)
-    }
-
-    fn revalidate(&mut self) -> Result<RQEValidateStatus<'_, 'index>, RQEIteratorError> {
-        (**self).revalidate()
-    }
-
-    fn rewind(&mut self) {
-        (**self).rewind()
-    }
-
-    fn num_estimated(&self) -> usize {
-        (**self).num_estimated()
-    }
-
-    fn last_doc_id(&self) -> t_docId {
-        (**self).last_doc_id()
-    }
-
-    fn at_eof(&self) -> bool {
-        (**self).at_eof()
-    }
-
-    #[inline(always)]
-    fn type_(&self) -> IteratorType {
-        (**self).type_()
-    }
-
-    fn as_c_iterator(&self) -> Option<&c2rust::CRQEIterator> {
-        (**self).as_c_iterator()
-    }
-
-    fn intersection_sort_weight(&self, prioritize_union_children: bool) -> f64 {
-        (**self).intersection_sort_weight(prioritize_union_children)
-    }
+impl<'index, T> RQEIteratorPrintable<'index> for T where
+    T: RQEIterator<'index> + profile_print::ProfilePrint
+{
 }
 
 /// Global holder for APIs to get iterators for SearchEnterprise. This allows `rqe_iterators`
@@ -285,30 +276,60 @@ pub static SEARCH_ENTERPRISE_ITERATORS: OnceLock<Box<dyn SearchEnterpriseIterato
 pub trait SearchEnterpriseIterators: Send + Sync {
     /// Iterate over all the documents in the index. Each document in the iterator will have the
     /// given weight.
+    ///
+    /// On failure, the implementation populates `status` (when present) with the cause before
+    /// returning `Err`.
     fn new_wildcard_on_disk<'index>(
         &self,
-        index: &'index ffi::RedisSearchDiskIndexSpec,
+        index: &'index mut ffi::RedisSearchDiskIndexSpec,
         weight: f64,
-    ) -> Result<Box<dyn RQEIterator<'index> + 'index>, Box<dyn std::error::Error>>;
+        status: Option<&mut QueryError>,
+    ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
 
-    /// Iterate over all the terms in the index. Each document in the iterator will have the term
-    /// inside the given query_term and will have the given weight. The iterator will also filter
-    /// the results according to the given field mask.
-    fn new_term_on_disk<'index>(
+    /// Iterate over all the terms in the index, loading offset data for each document.
+    ///
+    /// Each document in the iterator will have the term inside the given `query_term` and will
+    /// have the given weight. The iterator will also filter the results according to the given
+    /// field mask. Use this variant for phrase queries, slop constraints, or any query that needs
+    /// term positions.
+    fn new_term_on_disk_with_offsets<'index>(
         &self,
-        index: &'index ffi::RedisSearchDiskIndexSpec,
+        index: &'index mut ffi::RedisSearchDiskIndexSpec,
         query_term: Box<RSQueryTerm>,
-        field_mask: t_fieldMask,
+        field_mask: FieldMask,
         weight: f64,
-    ) -> Result<Box<dyn RQEIterator<'index> + 'index>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
+
+    /// Iterate over all the terms in the index, skipping offset data for efficiency.
+    ///
+    /// Each document in the iterator will have the term inside the given `query_term` and will
+    /// have the given weight. The iterator will also filter the results according to the given
+    /// field mask. Use this variant for BM25_STD queries or any query that doesn't need term
+    /// positions.
+    fn new_term_on_disk_without_offsets<'index>(
+        &self,
+        index: &'index mut ffi::RedisSearchDiskIndexSpec,
+        query_term: Box<RSQueryTerm>,
+        field_mask: FieldMask,
+        weight: f64,
+    ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
 
     /// Iterate over all the tags (tokens) in the index at the given field index. Each document in
     /// then iterator will have the given weight.
     fn new_tag_on_disk<'index>(
         &self,
-        index: &'index ffi::RedisSearchDiskIndexSpec,
+        index: &'index mut ffi::RedisSearchDiskIndexSpec,
         token: &ffi::RSToken,
-        field_index: ffi::t_fieldIndex,
+        field_index: FieldIndex,
         weight: f64,
-    ) -> Result<Box<dyn RQEIterator<'index> + 'index>, Box<dyn std::error::Error>>;
+    ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
+
+    /// Iterate over the entries of the numeric index at the given field index whose value
+    /// matches `filter`.
+    fn new_numeric_on_disk<'index>(
+        &self,
+        index: &'index mut ffi::RedisSearchDiskIndexSpec,
+        filter: &ffi::NumericFilter,
+        field_index: ffi::t_fieldIndex,
+    ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
 }

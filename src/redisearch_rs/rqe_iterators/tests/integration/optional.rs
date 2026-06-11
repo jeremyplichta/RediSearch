@@ -7,7 +7,7 @@
  * GNU Affero General Public License v3 (AGPLv3).
 */
 
-use ffi::{RS_FIELDMASK_ALL, t_docId};
+use rqe_core::{DocId, RS_FIELDMASK_ALL};
 use rqe_iterators::{
     IteratorType, RQEIterator, RQEValidateStatus, SkipToOutcome, empty::Empty, optional::Optional,
     wildcard::Wildcard,
@@ -61,14 +61,12 @@ mod optional_iterator_skip_backward_panics {
 mod optional_iterator_tests {
     use super::*;
 
-    const MAX_DOC_ID: t_docId = 100;
+    const MAX_DOC_ID: DocId = 100;
     const WEIGHT: f64 = 2.;
 
     const NUM_DOCS: usize = 5;
-    const CHILD_DOCS: [t_docId; NUM_DOCS] = [10, 20, 30, 50, 80];
+    const CHILD_DOCS: [DocId; NUM_DOCS] = [10, 20, 30, 50, 80];
 
-    // C-Code: port of OptionalIteratorTest::SetUp
-    // as found in tests/cpptests/test_cpp_iterator_optional.cpp
     fn setup_optional_iterator_with_mock_child<'index>()
     -> Optional<'index, utils::Mock<'index, NUM_DOCS>> {
         // Create child iterator with specific docIds
@@ -128,7 +126,7 @@ mod optional_iterator_tests {
     fn test_skip_to_real_hit() {
         let mut it = setup_optional_iterator_with_mock_child();
 
-        const SKIP_TO_DOC_ID: t_docId = 20;
+        const SKIP_TO_DOC_ID: DocId = 20;
 
         // Skip to a docId that exists in child
         match it
@@ -157,7 +155,7 @@ mod optional_iterator_tests {
     fn test_skip_to_virtual_hit() {
         let mut it = setup_optional_iterator_with_mock_child();
 
-        const SKIP_TO_DOC_ID: t_docId = 25;
+        const SKIP_TO_DOC_ID: DocId = 25;
 
         // Skip to a docId that doesn't exist in child
         match it
@@ -187,7 +185,7 @@ mod optional_iterator_tests {
         let mut it = setup_optional_iterator_with_mock_child();
 
         // Test skipping to various docIds in sequence
-        const TARGETS: [t_docId; 10] = [5, 15, 25, 35, 45, 55, 65, 75, 85, 95];
+        const TARGETS: [DocId; 10] = [5, 15, 25, 35, 45, 55, 65, 75, 85, 95];
 
         for target in TARGETS {
             // Skip to the target docId
@@ -344,14 +342,12 @@ mod optional_iterator_tests {
 mod optional_iterator_timeout_tests {
     use super::*;
 
-    const MAX_DOC_ID: t_docId = 100;
+    const MAX_DOC_ID: DocId = 100;
     const WEIGHT: f64 = 2.;
 
     const NUM_DOCS: usize = 3;
-    const CHILD_DOCS: [t_docId; NUM_DOCS] = [10, 20, 30];
+    const CHILD_DOCS: [DocId; NUM_DOCS] = [10, 20, 30];
 
-    // C-Code: port of OptionalIteratorTimeoutTest::SetUp
-    // as found in tests/cpptests/test_cpp_iterator_optional.cpp
     fn setup_optional_iterator_with_mock_child<'index>()
     -> Optional<'index, utils::Mock<'index, NUM_DOCS>> {
         // Create child iterator with specific docIds
@@ -466,11 +462,9 @@ mod optional_iterator_timeout_tests {
 mod optional_iterator_with_empty_child_test {
     use super::*;
 
-    const MAX_DOC_ID: t_docId = 50;
+    const MAX_DOC_ID: DocId = 50;
     const WEIGHT: f64 = 3.;
 
-    // C-Code: port of OptionalIteratorWithEmptyChildTest::SetUp
-    // as found in tests/cpptests/test_cpp_iterator_optional.cpp
     fn setup_optional_iterator_with_empty_child<'index>() -> Optional<'index, Empty> {
         // Create empty child iterator
         let child = Empty::default();
@@ -518,7 +512,7 @@ mod optional_iterator_with_empty_child_test {
         let mut it = setup_optional_iterator_with_empty_child();
 
         // Skip to various docIds - all should be virtual hits
-        const TARGETS: [t_docId; 5] = [5, 15, 25, 35, 45];
+        const TARGETS: [DocId; 5] = [5, 15, 25, 35, 45];
 
         for target in TARGETS {
             match it
@@ -652,14 +646,12 @@ mod optional_iterator_with_empty_child_test {
 mod optional_iterator_revalidate_test {
     use super::*;
 
-    const MAX_DOC_ID: t_docId = 100;
+    const MAX_DOC_ID: DocId = 100;
     const WEIGHT: f64 = 2.;
 
     const NUM_DOCS: usize = 5;
-    const CHILD_DOCS: [t_docId; NUM_DOCS] = [10, 20, 30, 50, 80];
+    const CHILD_DOCS: [DocId; NUM_DOCS] = [10, 20, 30, 50, 80];
 
-    // C-Code: port of OptionalIteratorRevalidateTest::SetUp
-    // as found in tests/cpptests/test_cpp_iterator_optional.cpp
     fn setup_optional_iterator_with_mock_child_and_data<'index>() -> (
         Optional<'index, utils::Mock<'index, NUM_DOCS>>,
         utils::MockData,
@@ -675,6 +667,7 @@ mod optional_iterator_revalidate_test {
 
     #[test]
     fn test_revalidate_ok() {
+        let mock_ctx = rqe_iterators_test_utils::MockContext::new(0, 0);
         let (mut it, mut data) = setup_optional_iterator_with_mock_child_and_data();
 
         // Child returns VALIDATE_OK
@@ -691,7 +684,9 @@ mod optional_iterator_revalidate_test {
             .expect("read some result, be it virtual or real");
 
         // Revalidate should return VALIDATE_OK
-        let status = it.revalidate().expect("revalidate without error");
+        let status = it
+            .revalidate(&*mock_ctx.spec_read())
+            .expect("revalidate without error");
         assert!(matches!(status, RQEValidateStatus::Ok));
 
         // Verify child was revalidated
@@ -706,6 +701,7 @@ mod optional_iterator_revalidate_test {
 
     #[test]
     fn test_revalidate_aborted() {
+        let mock_ctx = rqe_iterators_test_utils::MockContext::new(0, 0);
         let (mut it, mut data) = setup_optional_iterator_with_mock_child_and_data();
 
         // Child returns VALIDATE_ABORTED
@@ -718,7 +714,9 @@ mod optional_iterator_revalidate_test {
             .expect("read some result, be it virtual or real");
 
         // Optional iterator handles child abort gracefully by replacing with empty iterator
-        let status = it.revalidate().expect("revalidate without error");
+        let status = it
+            .revalidate(&*mock_ctx.spec_read())
+            .expect("revalidate without error");
         assert!(matches!(status, RQEValidateStatus::Ok)); // Optional iterator continues even when child is aborted
 
         // Should be able to continue reading (now all virtual hits)
@@ -731,13 +729,14 @@ mod optional_iterator_revalidate_test {
 
     #[test]
     fn test_revalidate_moved() {
+        let mock_ctx = rqe_iterators_test_utils::MockContext::new(0, 0);
         let (mut it, mut data) = setup_optional_iterator_with_mock_child_and_data();
 
         // Child returns VALIDATE_MOVED
         data.set_revalidate_result(utils::MockRevalidateResult::Move);
 
         // Read to a real hit (document from child)
-        const DOC_ID: t_docId = 10;
+        const DOC_ID: DocId = 10;
         match it
             .skip_to(DOC_ID)
             .expect("no error to be returned while skipping")
@@ -752,7 +751,9 @@ mod optional_iterator_revalidate_test {
         assert_eq!(it.last_doc_id(), DOC_ID);
 
         // Revalidate should handle child movement
-        let status = it.revalidate().expect("revalidate without error");
+        let status = it
+            .revalidate(&*mock_ctx.spec_read())
+            .expect("revalidate without error");
         // Should be MOVED (as real result was affected)
         assert!(matches!(status, RQEValidateStatus::Moved { .. }));
 
@@ -766,13 +767,14 @@ mod optional_iterator_revalidate_test {
 
     #[test]
     fn test_revalidate_moved_virtual_result() {
+        let mock_ctx = rqe_iterators_test_utils::MockContext::new(0, 0);
         let (mut it, mut data) = setup_optional_iterator_with_mock_child_and_data();
 
         // Child returns VALIDATE_MOVED
         data.set_revalidate_result(utils::MockRevalidateResult::Move);
 
         // Read to a virtual hit (document not in child)
-        const DOC_ID: t_docId = 15;
+        const DOC_ID: DocId = 15;
         match it
             .skip_to(DOC_ID)
             .expect("no error to be returned while skipping")
@@ -787,7 +789,9 @@ mod optional_iterator_revalidate_test {
         assert_eq!(it.last_doc_id(), DOC_ID);
 
         // Since current result is virtual, revalidate should return OK
-        let status = it.revalidate().expect("revalidate without error");
+        let status = it
+            .revalidate(&*mock_ctx.spec_read())
+            .expect("revalidate without error");
         assert!(matches!(status, RQEValidateStatus::Ok));
 
         // Should be able to continue reading
@@ -802,13 +806,14 @@ mod optional_iterator_revalidate_test {
 mod optional_iterator_revalidate_after_abort {
     use super::*;
 
-    const MAX_DOC_ID: t_docId = 20;
+    const MAX_DOC_ID: DocId = 20;
     const WEIGHT: f64 = 2.;
 
     /// After child abort + a second revalidate, the child is `None` and
     /// `revalidate` should return `Ok` immediately.
     #[test]
     fn test_revalidate_twice_after_abort() {
+        let mock_ctx = rqe_iterators_test_utils::MockContext::new(0, 0);
         let child = utils::Mock::new([5, 10, 15]);
         let mut data = child.data();
         let mut it = Optional::new(MAX_DOC_ID, WEIGHT, child);
@@ -819,11 +824,11 @@ mod optional_iterator_revalidate_after_abort {
 
         // First revalidate with abort: child is dropped
         data.set_revalidate_result(utils::MockRevalidateResult::Abort);
-        let status = it.revalidate().unwrap();
+        let status = it.revalidate(&*mock_ctx.spec_read()).unwrap();
         assert!(matches!(status, RQEValidateStatus::Ok));
 
         // Second revalidate: child is None, should return Ok immediately
-        let status = it.revalidate().unwrap();
+        let status = it.revalidate(&*mock_ctx.spec_read()).unwrap();
         assert!(matches!(status, RQEValidateStatus::Ok));
 
         // Should still be able to read (all virtual)
@@ -836,6 +841,7 @@ mod optional_iterator_revalidate_after_abort {
     /// When child is `None`, the skip_to falls through to the virtual result path.
     #[test]
     fn test_skip_to_after_abort() {
+        let mock_ctx = rqe_iterators_test_utils::MockContext::new(0, 0);
         let child = utils::Mock::new([5, 10, 15]);
         let mut data = child.data();
         let mut it = Optional::new(MAX_DOC_ID, WEIGHT, child);
@@ -846,7 +852,7 @@ mod optional_iterator_revalidate_after_abort {
 
         // Abort the child
         data.set_revalidate_result(utils::MockRevalidateResult::Abort);
-        let _ = it.revalidate().unwrap();
+        let _ = it.revalidate(&*mock_ctx.spec_read()).unwrap();
 
         // skip_to with child=None should yield a virtual Found result
         match it.skip_to(8).unwrap().unwrap() {
@@ -866,6 +872,7 @@ mod optional_iterator_revalidate_after_abort {
     /// After child abort, rewind should work correctly with child=None.
     #[test]
     fn test_rewind_after_abort() {
+        let mock_ctx = rqe_iterators_test_utils::MockContext::new(0, 0);
         let child = utils::Mock::new([5, 10, 15]);
         let mut data = child.data();
         let mut it = Optional::new(MAX_DOC_ID, WEIGHT, child);
@@ -878,7 +885,7 @@ mod optional_iterator_revalidate_after_abort {
 
         // Abort the child
         data.set_revalidate_result(utils::MockRevalidateResult::Abort);
-        let _ = it.revalidate().unwrap();
+        let _ = it.revalidate(&*mock_ctx.spec_read()).unwrap();
 
         // Rewind with child=None
         it.rewind();
@@ -896,32 +903,30 @@ mod optional_iterator_non_sequential_reads {
     use super::*;
 
     struct ReadStepIterator<'index, const N: usize> {
-        read_steps: [t_docId; N],
+        read_steps: [DocId; N],
         read_step: usize,
-        result: inverted_index::RSIndexResult<'index>,
+        result: index_result::RSIndexResult<'index>,
     }
 
     impl<'index, const N: usize> ReadStepIterator<'index, N> {
-        fn new(read_steps: [t_docId; N]) -> Self {
+        fn new(read_steps: [DocId; N]) -> Self {
             Self {
                 read_steps,
                 read_step: 0,
-                result: inverted_index::RSIndexResult::build_numeric(42.).build(),
+                result: index_result::RSIndexResult::build_numeric(42.).build(),
             }
         }
     }
 
     impl<'index, const N: usize> RQEIterator<'index> for ReadStepIterator<'index, N> {
-        fn current(&mut self) -> Option<&mut inverted_index::RSIndexResult<'index>> {
+        fn current(&mut self) -> Option<&mut index_result::RSIndexResult<'index>> {
             Some(&mut self.result)
         }
 
         fn read(
             &mut self,
-        ) -> Result<
-            Option<&mut inverted_index::RSIndexResult<'index>>,
-            rqe_iterators::RQEIteratorError,
-        > {
+        ) -> Result<Option<&mut index_result::RSIndexResult<'index>>, rqe_iterators::RQEIteratorError>
+        {
             if self.at_eof() {
                 return Ok(None);
             }
@@ -933,7 +938,7 @@ mod optional_iterator_non_sequential_reads {
 
         fn skip_to(
             &mut self,
-            doc_id: ffi::t_docId,
+            doc_id: DocId,
         ) -> Result<Option<SkipToOutcome<'_, 'index>>, rqe_iterators::RQEIteratorError> {
             while !self.at_eof() && self.result.doc_id < doc_id {
                 self.result.doc_id = self.read_steps[self.read_step];
@@ -956,7 +961,7 @@ mod optional_iterator_non_sequential_reads {
             unimplemented!()
         }
 
-        fn last_doc_id(&self) -> ffi::t_docId {
+        fn last_doc_id(&self) -> DocId {
             self.result.doc_id
         }
 
@@ -966,6 +971,7 @@ mod optional_iterator_non_sequential_reads {
 
         fn revalidate(
             &mut self,
+            _spec: &index_spec::IndexSpecReadGuard,
         ) -> Result<RQEValidateStatus<'_, 'index>, rqe_iterators::RQEIteratorError> {
             Ok(RQEValidateStatus::Ok)
         }
@@ -982,7 +988,7 @@ mod optional_iterator_non_sequential_reads {
 
     fn assert_numeric_read<'index>(
         it: &mut impl RQEIterator<'index>,
-        expected_id: t_docId,
+        expected_id: DocId,
         expected_weight: f64,
     ) {
         assert!(!it.at_eof());
@@ -1002,7 +1008,7 @@ mod optional_iterator_non_sequential_reads {
         assert_eq!(it.last_doc_id(), expected_id);
     }
 
-    fn assert_virtual_read<'index>(it: &mut impl RQEIterator<'index>, expected_id: t_docId) {
+    fn assert_virtual_read<'index>(it: &mut impl RQEIterator<'index>, expected_id: DocId) {
         assert!(!it.at_eof());
         let outcome = it
             .read()

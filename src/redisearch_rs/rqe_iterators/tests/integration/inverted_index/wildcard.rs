@@ -9,19 +9,20 @@
 
 //! Tests for the wildcard inverted index iterator.
 
-use ffi::{IndexFlags_Index_DocIdsOnly, RS_FIELDMASK_ALL, t_docId};
-use inverted_index::{RSIndexResult, doc_ids_only::DocIdsOnly};
+use ffi::IndexFlags_Index_DocIdsOnly;
+use index_result::RSIndexResult;
+use inverted_index::doc_ids_only::DocIdsOnly;
+use rqe_core::{DocId, RS_FIELDMASK_ALL};
 use rqe_iterators::{IteratorType, RQEIterator, inverted_index::Wildcard};
 
 use crate::inverted_index::utils::BaseTest;
-use rqe_iterators_test_utils::MockContext;
 
 pub struct WildcardBaseTest {
     test: BaseTest<DocIdsOnly>,
 }
 
 impl WildcardBaseTest {
-    fn expected_record(doc_id: t_docId) -> RSIndexResult<'static> {
+    fn expected_record(doc_id: DocId) -> RSIndexResult<'static> {
         RSIndexResult::build_virt()
             .doc_id(doc_id)
             .field_mask(RS_FIELDMASK_ALL)
@@ -41,10 +42,7 @@ impl WildcardBaseTest {
     }
 
     pub(crate) fn create_iterator(&self) -> Wildcard<'_, DocIdsOnly> {
-        let reader = self.test.ii.reader();
-        // SAFETY: `mock_ctx` provides a valid `RedisSearchCtx` with a valid `spec`
-        // that outlives the returned iterator.
-        unsafe { Wildcard::new(reader, self.test.mock_ctx.sctx(), 1.0) }
+        Wildcard::new(self.test.ii.reader(), 1.0)
     }
 }
 
@@ -72,12 +70,8 @@ fn wildcard_skip_to() {
 #[test]
 fn wildcard_empty_index() {
     let ii = inverted_index::InvertedIndex::<DocIdsOnly>::new(IndexFlags_Index_DocIdsOnly);
-    let mock_ctx = MockContext::new(0, 0);
 
-    let reader = ii.reader();
-    // SAFETY: `mock_ctx` provides a valid `RedisSearchCtx` with a valid `spec`
-    // that outlives the iterator.
-    let mut it = unsafe { Wildcard::new(reader, mock_ctx.sctx(), 1.0) };
+    let mut it = Wildcard::new(ii.reader(), 1.0);
 
     // Should immediately be at EOF
     assert!(it.read().expect("read failed").is_none());
@@ -96,7 +90,7 @@ mod not_miri {
     }
 
     impl WildcardRevalidateTest {
-        fn expected_record(doc_id: t_docId) -> RSIndexResult<'static> {
+        fn expected_record(doc_id: DocId) -> RSIndexResult<'static> {
             RSIndexResult::build_virt()
                 .doc_id(doc_id)
                 .field_mask(RS_FIELDMASK_ALL)
@@ -119,7 +113,7 @@ mod not_miri {
             let ii = DocIdsOnly::from_opaque(self.test.context.wildcard_inverted_index());
             // SAFETY: `self.test.context` provides a valid `RedisSearchCtx` with a valid
             // `spec` and `existingDocs` that outlive the returned iterator.
-            unsafe { Wildcard::new(ii.reader(), self.test.context.sctx, 1.0) }
+            Wildcard::new(ii.reader(), 1.0)
         }
     }
 
@@ -143,40 +137,41 @@ mod not_miri {
         let mut it = test.create_iterator();
 
         // Verify the iterator works normally and read at least one document
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Ok
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Ok);
         assert!(it.read().expect("failed to read").is_some());
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Ok
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Ok);
 
         // Simulate existingDocs being garbage collected and recreated by
         // pointing spec.existingDocs to a different inverted index.
         let new_ii = Box::into_raw(Box::new(inverted_index::opaque::InvertedIndex::DocIdsOnly(
             inverted_index::InvertedIndex::<DocIdsOnly>::new(IndexFlags_Index_DocIdsOnly),
         )));
-        let old_existing_docs;
-        unsafe {
-            let spec = test.test.context.spec.as_ptr();
-            old_existing_docs = (*spec).existingDocs;
-            (*spec).existingDocs = new_ii.cast();
-        }
+        let old_existing_docs = test.test.context.spec_read().existing_docs_ptr();
+        test.test
+            .context
+            .spec_write()
+            .set_existing_docs_ptr(new_ii.cast());
 
         // Revalidate should return Aborted because existingDocs no longer
         // points to the same index the reader was created from.
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Aborted
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Aborted);
 
         // Restore original existingDocs and free the temporary index for
         // proper cleanup.
+        test.test
+            .context
+            .spec_write()
+            .set_existing_docs_ptr(old_existing_docs);
         unsafe {
-            let spec = test.test.context.spec.as_ptr();
-            (*spec).existingDocs = old_existing_docs;
             drop(Box::from_raw(new_ii));
         }
     }
@@ -199,30 +194,29 @@ mod not_miri {
 
         // Read at least one document so the iterator has a position.
         assert!(it.read().expect("failed to read").is_some());
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Ok
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Ok);
 
         // Simulate the garbage collector setting existingDocs to NULL after
         // collecting all documents.
-        let old_existing_docs;
-        unsafe {
-            let spec = test.test.context.spec.as_ptr();
-            old_existing_docs = (*spec).existingDocs;
-            (*spec).existingDocs = std::ptr::null_mut();
-        }
+        let old_existing_docs = test.test.context.spec_read().existing_docs_ptr();
+        test.test
+            .context
+            .spec_write()
+            .set_existing_docs_ptr(std::ptr::null_mut());
 
-        assert_eq!(
-            it.revalidate().expect("revalidate failed"),
-            RQEValidateStatus::Aborted
-        );
+        let status = it
+            .revalidate(&*test.test.context.spec_read())
+            .expect("revalidate failed");
+        assert_eq!(status, RQEValidateStatus::Aborted);
 
         // Restore for proper cleanup.
-        unsafe {
-            let spec = test.test.context.spec.as_ptr();
-            (*spec).existingDocs = old_existing_docs;
-        }
+        test.test
+            .context
+            .spec_write()
+            .set_existing_docs_ptr(old_existing_docs);
     }
 
     /// Test that `reader()` returns a reference to the underlying reader.

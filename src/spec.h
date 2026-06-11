@@ -15,22 +15,22 @@
 #include "redismodule.h"
 #include "config.h"
 #include "doc_table.h"
-#include "trie/trie_type.h"
+#include "trie/trie.h"
 #include "sortable.h"
 #include "stopwords.h"
 #include "gc.h"
 #include "synonym_map.h"
-#include "query_error.h"
 #include "field_spec.h"
 #include "util/dict.h"
 #include "util/references.h"
-#include "redisearch_api.h"
 #include "rules.h"
 #include <pthread.h>
 #include "info/index_error.h"
 #include "obfuscation/hidden.h"
 #include "search_disk_api.h"
 #include "rs_wall_clock.h"
+
+typedef struct QueryError QueryError;
 
 #ifdef __cplusplus
 extern "C" {
@@ -117,6 +117,8 @@ struct IndexesScanner;
 
 #define SPEC_MAX_FIELDS 1024
 #define SPEC_MAX_FIELD_ID (sizeof(t_fieldMask) * 8)
+#define MAX_SYNONYM_TERMS 1000000     // reasonable limit for synonym map terms
+#define MAX_SYNONYM_GROUP_IDS 4096    // reasonable limit for group IDs per term
 
 // The threshold after which we move to a special encoding for wide fields
 #define SPEC_WIDEFIELD_THRESHOLD 32
@@ -163,11 +165,25 @@ typedef struct {
   size_t offsetVecsSize;
   size_t offsetVecRecords;
   size_t termsSize;
+  // Number of inverted-index blocks currently owned by this spec; reported by FT.INFO as
+  // `total_inverted_index_blocks`. Writes must go through `IndexStats_BlockCountAdd` (signed
+  // delta, atomic). Reads must use `__atomic_load_n`.
+  size_t totalInvertedIndexBlocks;
   rs_wall_clock_ns_t totalIndexTime;
   IndexError indexError;
   uint32_t activeQueries;
   uint32_t activeWrites;
 } IndexStats;
+
+// Atomically apply `delta` to `stats->totalInvertedIndexBlocks`. Accepts signed deltas:
+// negative values wrap via size_t two's-complement, producing the correct unsigned
+// subtraction.
+static inline void IndexStats_BlockCountAdd(IndexStats *stats, int64_t delta) {
+  if (delta) {
+    __atomic_add_fetch(&stats->totalInvertedIndexBlocks,
+                       (size_t)delta, __ATOMIC_RELAXED);
+  }
+}
 
 typedef enum {
   Index_StoreTermOffsets = 0x01,
@@ -186,7 +202,6 @@ typedef enum {
   Index_HasPhonetic = 0x400,
   Index_Async = 0x800,
   Index_SkipInitialScan = 0x1000,
-  Index_FromLLAPI = 0x2000,
   Index_HasFieldAlias = 0x4000,
   Index_HasVecSim = 0x8000,
   Index_HasSuffixTrie = 0x10000,
@@ -225,13 +240,11 @@ typedef uint16_t FieldSpecDedupeArray[SPEC_MAX_FIELDS];
 #define INDEX_DEFAULT_FLAGS \
   Index_StoreFreqs | Index_StoreTermOffsets | Index_StoreFieldFlags | Index_StoreByteOffsets
 
-#define INDEX_STORAGE_MASK                                                                  \
-  (Index_StoreFreqs | Index_StoreFieldFlags | Index_StoreTermOffsets | Index_StoreNumeric | \
-   Index_WideSchema)
-
-#define INDEX_CURRENT_VERSION 26
+#define INDEX_CURRENT_VERSION 27
+#define INDEX_VECTOR_RERANK_VERSION 27
 #define INDEX_DISK_VERSION 26
 #define INDEX_VECSIM_SVS_VAMANA_VERSION 25
+#define INDEX_ASM_PROPAGATE_DEFINITIONS_VERSION INDEX_VECSIM_SVS_VAMANA_VERSION
 #define INDEX_INDEXALL_VERSION 24
 #define INDEX_GEOMETRY_VERSION 23
 #define INDEX_VECSIM_TIERED_VERSION 22
@@ -303,8 +316,8 @@ typedef struct IndexSpec {
   char *obfuscatedName;           // Index hashed name
   uint64_t specId;                // Unique monotonically increasing ID for this spec incarnation
   FieldSpec *fields;              // Fields in the index schema
-  int16_t numFields;              // Number of fields
-  int16_t numSortableFields;      // Number of sortable fields
+  uint16_t numFields;             // Number of fields
+  uint16_t numSortableFields;     // Number of sortable fields
 
   IndexFlags flags;               // Flags
   IndexStats stats;               // Statistics of memory used and quantities
@@ -323,7 +336,7 @@ typedef struct IndexSpec {
   SynonymMap *smap;               // List of synonym
   HiddenString **aliases;         // Aliases to self-remove when the index is deleted
 
-  struct SchemaRule *rule;        // Contains schema rules for follow-the-hash/JSON
+  struct SchemaRule *rule;        // Contains schema rules for follow-the-hash/JSON. It must always be set
   struct IndexesScanner *scanner; // Scans new hash/JSON documents or rescan
   // can be true even if scanner == NULL, in case of a scan being cancelled
   // in favor on a newer, pending scan
@@ -342,10 +355,6 @@ typedef struct IndexSpec {
 
   // bitarray of dialects used by this index
   uint_least8_t used_dialects;
-
-  // For criteria tester
-  RSGetValueCallback getValue;
-  void *getValueCtx;
 
   // Count the number of times the index was used
   long long counter;
@@ -369,6 +378,11 @@ typedef struct IndexSpec {
 
   // Disk index handle (NULL for memory-only indexes)
   RedisSearchDiskIndexSpec *diskSpec;
+
+  // Disk RDB state (NULL for memory-only indexes), pending to be applied at
+  // replication ending. Vector index state is stored inline in each field.
+  RedisSearchDiskRdbState *pendingDiskRdbState;
+  bool diskRegistered;
 } IndexSpec;
 
 typedef enum SpecOp { SpecOp_Add, SpecOp_Del } SpecOp;
@@ -534,18 +548,20 @@ int IndexSpec_Deserialize(const RedisModuleString *serialized, int encver);
 
 /* Start the garbage collection loop on the index spec */
 void IndexSpec_StartGC(StrongRef spec_ref, IndexSpec *sp, GCPolicy gcPolicy);
-void IndexSpec_StartGCFromSpec(StrongRef spec_ref, IndexSpec *sp, uint32_t gcPolicy);
 
-/* Same as above but with ordinary strings, to allow unit testing */
-StrongRef IndexSpec_Parse(RedisModuleCtx *ctx, const HiddenString *name, const char **argv, int argc, QueryError *status);
-// Calls IndexSpec_Parse after wrapping name with a hidden string
+/* Same as IndexSpec_Parse, but takes a NUL-terminated C-string name and wraps it in a HiddenString
+ * internally. Intended for unit tests only.
+ * Do not use in production or new code: the wrapping requires an extra strlen() over the name,
+ * which IndexSpec_Parse avoids by taking a HiddenString directly. */
 StrongRef IndexSpec_ParseC(RedisModuleCtx *ctx, const char *name, const char **argv, int argc, QueryError *status);
 
 FieldSpec *IndexSpec_CreateField(IndexSpec *sp, const char *name, const char *path);
 
 // Delete a document from the index by its key name.
-// Looks up the docId via DocIdMeta_Get on the key, then removes the document
-// from the DocTable and cleans up associated metadata (DocIdMeta_Delete).
+// In disk mode, looks up the docId via DocIdMeta_Get on the key, removes the
+// document from disk by that id, and deletes the DocIdMeta key→docId mapping so
+// it stays authoritative (an entry exists iff the doc is indexed). In memory
+// mode, pops the document metadata from the DocTable.
 // Requires a RedisModuleCtx to access the key's metadata.
 // This function locks the spec for writing.
 int IndexSpec_DeleteDoc(IndexSpec *spec, RedisModuleCtx *ctx, RedisModuleString *key);
@@ -741,6 +757,19 @@ size_t Indexes_Count();
 void Indexes_Propagate(RedisModuleCtx *ctx);
 void Indexes_UpdateMatchingWithSchemaRules(RedisModuleCtx *ctx, RedisModuleString *key, DocumentType type,
                                            RedisModuleString **hashFields);
+// Refresh the per-field TTL entries on every spec that indexes `key`: reads
+// the hash's current per-field expiration timestamps and writes them onto
+// the matching specs' TTL tables, without re-tokenizing the document or
+// rebuilding inverted indexes. In-memory flow only; callers must use
+// Indexes_UpdateMatchingWithSchemaRules for disk-backed indexes.
+void Indexes_UpdateMatchingHashFieldExpiration(RedisModuleCtx *ctx, RedisModuleString *key,
+                                               DocumentType type);
+// Fast path for keyspace events that only change the document-level TTL
+// (EXPIRE/PERSIST): re-reads the key's absolute expiration and writes it
+// directly onto the matching DMDs, without re-running schema-rule filters or
+// re-indexing the document. In-memory flow only; callers must fall back to
+// Indexes_UpdateMatchingWithSchemaRules for disk-backed indexes.
+void Indexes_UpdateMatchingDocExpiration(RedisModuleCtx *ctx, RedisModuleString *key, DocumentType type);
 void Indexes_DeleteMatchingWithSchemaRules(RedisModuleCtx *ctx, RedisModuleString *key,
                                            DocumentType type,
                                            RedisModuleString **hashFields);
@@ -776,6 +805,20 @@ void Indexes_EndRDBLoadingEvent(RedisModuleCtx *ctx);
 
 // This function is to be called when loading finishes (failed or not)
 void Indexes_EndLoading();
+
+// Replica-side SST replication completion.
+//
+// Upon SST and RDB replication ending, complete the binding
+void Indexes_FinishSSTReplication(RedisModuleCtx *ctx);
+
+// Replica-side SST replication abort.
+//
+// Tear down everything staged for SST replication. Frees any pending disk RDB
+// state, closes any opened-but-unregistered disk specs, and unregisters +
+// closes any specs that had already been registered. Removes the affected
+// specs from specDict_g. Called from the REDISMODULE_SUBEVENT_SST_REPL_ABORT
+// handler.
+void Indexes_AbortSSTReplicationLoading(RedisModuleCtx *ctx);
 
 // =============================================================================
 // Compaction FFI Functions (called by Rust during GC)

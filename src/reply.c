@@ -8,8 +8,8 @@
 */
 #include "reply.h"
 #include "resp3.h"
-#include "query_error.h"
-#include "value.h"
+#include "query_error_ffi.h"
+#include "value_ffi.h"
 
 #include "rmutil/rm_assert.h"
 
@@ -151,6 +151,10 @@ static void _RedisModule_Reply_Next(RedisModule_Reply *reply) {
     count = &reply->count;
   }
   ++*count;
+}
+
+void RedisModule_Reply_TrackExternalElement(RedisModule_Reply *reply) {
+  _RedisModule_Reply_Next(reply);
 }
 
 static void _RedisModule_Reply_Push(RedisModule_Reply *reply, int type) {

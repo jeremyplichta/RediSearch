@@ -14,10 +14,8 @@ use criterion::{
     measurement::WallTime,
 };
 use ffi::IndexFlags_Index_DocIdsOnly;
-use inverted_index::{IndexBlock, InvertedIndex, RSIndexResult, numeric::Numeric};
-
-#[allow(unused_imports)] // We need this symbol for C binding
-use inverted_index_bencher::ResultMetrics_Free;
+use index_result::RSIndexResult;
+use inverted_index::{IndexBlock, InvertedIndex, numeric::Numeric};
 
 fn benchmark_garbage_collection(c: &mut Criterion) {
     let mut group = c.benchmark_group("GC");

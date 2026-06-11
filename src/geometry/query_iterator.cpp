@@ -8,12 +8,27 @@
 */
 #include "query_iterator.hpp"
 #include "doc_table.h"
+#include "iterators_ffi.h"
+#include "search_ctx.h"
+#include "spec.h"
 #include "util/timeout.h"
+#include "rqe_iterator_type.h"
+#include "types_ffi.h"
 
 #include <iterator>   // ranges::distance
 
 namespace RediSearch {
 namespace GeoShape {
+
+bool CPPQueryIterator::should_check_field_expiration(const RedisSearchCtx *sctx,
+                                                     const FieldFilterContext *filterCtx) noexcept {
+  // Mirrors the hoisted gate in HybridIterator / InvIndIterator: all inputs are
+  // iterator-invariant, so snapshot the AND once here. A non-NULL `ttl` is a
+  // sufficient and tight gate by itself: the table holds field-level entries
+  // only and is destroyed when the last one leaves the index.
+  return sctx && filterCtx->field.index != RS_INVALID_FIELD_INDEX &&
+         sctx->spec->docs.ttl;
+}
 
 auto CPPQueryIterator::base() noexcept -> QueryIterator * {
   return &base_;
@@ -21,11 +36,14 @@ auto CPPQueryIterator::base() noexcept -> QueryIterator * {
 
 IteratorStatus CPPQueryIterator::read_single() noexcept {
   if (!has_next()) {
+    base_.atEOF = true;
     return ITERATOR_EOF;
   }
   t_docId docId = iter_[index_++];
-  const t_fieldIndex fieldIndex = filterCtx_.field.index;
-  if (sctx_ && fieldIndex != RS_INVALID_FIELD_INDEX && !DocTable_CheckFieldExpirationPredicate(&sctx_->spec->docs, docId, fieldIndex, filterCtx_.predicate, &sctx_->time.current)) {
+  if (check_field_expiration_
+      && !DocTable_CheckFieldExpirationPredicate(&sctx_->spec->docs, docId,
+                                                 filterCtx_.field.index,
+                                                 filterCtx_.predicate, &sctx_->time.current)) {
     return ITERATOR_NOTFOUND;
   }
 
@@ -57,14 +75,33 @@ IteratorStatus CPPQueryIterator::skip_to(t_docId docId) {
   const auto it = std::ranges::lower_bound(std::ranges::next(std::ranges::begin(iter_), index_),
                                            std::ranges::end(iter_), docId);
   index_ = std::ranges::distance(std::ranges::begin(iter_), it + 1);
+
+  const t_docId found = *it;
+  if (check_field_expiration_
+      && !DocTable_CheckFieldExpirationPredicate(&sctx_->spec->docs, found,
+                                                 filterCtx_.field.index,
+                                                 filterCtx_.predicate, &sctx_->time.current)) {
+    // The matched entry's field has expired. Fall back to read(), which loops
+    // past expired entries to the next valid one (updating current/lastDocId,
+    // and setting atEOF on EOF), so the iterator never settles on an expired
+    // doc. read() resumes from index_, i.e. the entry right after this expired
+    // match.
+    const IteratorStatus rc = read();
+    if (rc == ITERATOR_OK) {
+      // A valid entry beyond docId was found; the target itself did not match.
+      return ITERATOR_NOTFOUND;
+    }
+    return rc;
+  }
+
   if (!has_next()) {
     base_.atEOF = true;
   }
 
-  base_.current->docId = *it;
-  base_.lastDocId = *it;
+  base_.current->docId = found;
+  base_.lastDocId = found;
 
-  if (*it == docId) {
+  if (found == docId) {
     return ITERATOR_OK;
   }
   return ITERATOR_NOTFOUND;
@@ -105,21 +142,28 @@ std::size_t QIter_NumEstimated(const QueryIterator *ctx) {
 void QIter_Rewind(QueryIterator *ctx) {
   reinterpret_cast<CPPQueryIterator *>(ctx)->rewind();
 }
+ValidateStatus QIter_Revalidate(QueryIterator *ctx, IndexSpec *) {
+  auto *qi = reinterpret_cast<CPPQueryIterator *>(ctx);
+  qi->check_field_expiration_ =
+      CPPQueryIterator::should_check_field_expiration(qi->sctx_, &qi->filterCtx_);
+  return VALIDATE_OK;
+}
 
 }  // anonymous namespace
 
 QueryIterator CPPQueryIterator::init_base() {
   return QueryIterator{
-      .type = ID_LIST_SORTED_ITERATOR,
+      .type = IteratorType_GeoShape,
       .atEOF = false,
       .lastDocId = 0,
       .current = NewVirtualResult(0, RS_FIELDMASK_ALL),
       .NumEstimated = QIter_NumEstimated,
       .Read = QIter_Read,
       .SkipTo = QIter_SkipTo,
-      .Revalidate = Default_Revalidate,
+      .Revalidate = QIter_Revalidate,
       .Free = QIter_Free,
       .Rewind = QIter_Rewind,
+      .PrintProfile = GeoShape_PrintProfile,
   };
 }
 }  // namespace GeoShape
