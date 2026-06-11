@@ -1,108 +1,75 @@
-# Design: TQ-FLAT Vector Index
+# Design: TQ Flat Backend (Internal)
 
 ## Overview
 
-`TQ-FLAT` is a new exact flat vector index mode backed by the vendored VecSim TurboQuant-style compressed scan implementation.
+> **Status (2026-06-11):** the TQ flat backend is **internal-only**. The standalone
+> `TQ-FLAT` algorithm name that earlier drafts exposed on `FT.CREATE` was dropped per
+> maintainer review. Users cannot create a TQ flat index; the only user-facing TQ
+> surface is `HNSW ... COMPRESSION TQ8|TQ4|TQ2` (see [tq_hnsw.md](tq_hnsw.md)).
 
-At the RediSearch layer, the goal is to make it feel like the existing vector algorithms:
+The TQ flat backend (`VecSimAlgo_TQ`) is an exact flat vector index inside the vendored
+VecSim TurboQuant-style compressed scan implementation. It remains in the codebase as a
+building block: it serves as the compressed brute-force component of the tiered
+TQ-HNSW composition (tiered frontend role) and is exercised directly by VecSim-level
+tests and benchmarks.
 
-- users create the index with `FT.CREATE`
-- users write raw vectors into documents
-- users query with raw vectors through `FT.SEARCH`
+Engine behavior is unchanged by the API rework:
+
+- each inserted vector is rotated and quantized once at insertion time
+- queries scan every entry using the TQ distance kernels (asymmetric by default)
 - VecSim owns the internal preprocessing and compressed storage
 
-## User-Facing Schema
+## Internal Parameters
 
-`TQ-FLAT` is accepted anywhere `VECTOR` fields are accepted in `FT.CREATE`.
+The backend is configured through `TQFlatParams` (VecSim-side), never through
+`FT.CREATE`. The former user knobs were deliberately removed from the API per review
+and are now fixed internal defaults:
 
-Example:
-
-```redis
-FT.CREATE idx SCHEMA vec VECTOR TQ-FLAT 14 \
-  TYPE FLOAT32 \
-  DIM 768 \
-  DISTANCE_METRIC COSINE \
-  BITS 8 \
-  PROJECTIONS 384 \
-  SEED 7 \
-  ROTATION ON
-```
-
-Supported parameters in v1:
-
-- `TYPE`
-- `DIM`
-- `DISTANCE_METRIC`
-- `INITIAL_CAP`
-- `BLOCK_SIZE`
-- `BITS`
-- `PROJECTIONS`
-- `SEED`
-- `ROTATION`
-
-Defaults:
-
-- `BITS=8`
-- `PROJECTIONS=max(1, DIM / 2)`
-- `SEED=7`
-- `ROTATION=ON`
+- bits: taken from the compression name of the owning index (`TQ8`=8, `TQ4`=4, `TQ2`=2)
+- projections: `max(1, DIM / 2)`
+- seed: `7`
+- rotation: always on (disabling exists VecSim-side for diagnostics/parity only)
+- block size: fixed at 1024 vectors per block (`BLOCK_SIZE` / `INITIAL_CAP` are
+  deprecated args and not part of the TQ surface)
 
 ## Current Constraints
 
-The initial RediSearch integration intentionally keeps the surface narrow:
-
-- `TYPE FLOAT32` only
+- `FLOAT32` only
 - single-value vectors only
-- not supported for disk-backed indexes
+- not available on disk-backed indexes (the owning `COMPRESSION` argument is rejected
+  there at parse time)
 
-Unsupported forms should fail during schema validation rather than being accepted and degraded later.
+These are enforced at schema validation time on the user-facing `HNSW` +
+`COMPRESSION TQ<bits>` surface rather than being accepted and degraded later.
 
-## Query Semantics
+## Role in Query Semantics
 
-`TQ-FLAT` is exposed through the standard vector query syntax.
-
-KNN example:
-
-```redis
-FT.SEARCH idx "*=>[KNN 10 @vec $blob AS dist]" PARAMS 2 blob <raw-f32-bytes> SORTBY dist DIALECT 2
-```
-
-Range query example:
-
-```redis
-FT.SEARCH idx "@vec:[VECTOR_RANGE 0.2 $blob]=>{$yield_distance_as: dist}" PARAMS 2 blob <raw-f32-bytes> SORTBY dist DIALECT 2
-```
-
-The query vector stays raw. The index handles its own preprocessing internally.
+The backend is never queried directly by users. Within a tiered TQ-compressed HNSW
+index, it participates in the standard tiered query merge: results from the flat
+frontend buffer are merged with the TQ-HNSW backend results, exactly as for plain
+`HNSW`. Query vectors stay raw FP32; the index handles its own preprocessing
+internally.
 
 ## Introspection
 
-`FT.INFO` reports `TQ-FLAT` as the algorithm and exposes the TQ-specific configuration:
+There is no user-visible TQ-flat introspection:
 
-- `algorithm`
-- `data_type`
-- `dim`
-- `distance_metric`
-- `bits`
-- `projections`
-- `seed`
-- `rotation`
-
-`INFO MODULES` also counts `TQ_FLAT` vector fields separately from `FLAT`, `HNSW`, and `SVS-VAMANA`.
+- `FT.INFO` never reports a `TQ-FLAT` algorithm; TQ-compressed fields report
+  `algorithm=HNSW` plus a `compression` line (`TQ8`/`TQ4`/`TQ2`).
+- `INFO MODULES` no longer has a `TQ_FLAT` counter (it was removed along with the
+  standalone index); TQ-compressed HNSW fields count in the existing `HNSW` bucket.
 
 ## Persistence
 
-`TQ-FLAT` is supported by the current RDB save/load path.
-
-Older encoding versions do not understand the new algorithm and are expected to reject it rather than load partially valid state.
+There is no standalone TQ RDB branch anymore; the backend's state is persisted as
+part of the tiered-`TQ_HNSW` v4 branch (see [tq_hnsw.md](tq_hnsw.md)). Older encoding
+versions do not understand the new algorithm enum and fail closed.
 
 ## Testing Focus
 
-The expected coverage areas for the RediSearch layer are:
+Coverage for this backend now lives at two levels:
 
-- schema parsing and validation
-- `FT.INFO` rendering
-- KNN and `VECTOR_RANGE`
-- JSON single-value vs multi-value behavior
-- RDB and AOF round-trips
-- INFO MODULES accounting
+- VecSim-side: TurboQuant parity harness (Rust oracle), SIMD kernel parity, and
+  backend unit tests
+- RediSearch-side: indirectly via `tests/pytests/test_tq.py`, which exercises the
+  tiered TQ-compressed HNSW path (create/info/KNN/range/persistence/negative cases)
