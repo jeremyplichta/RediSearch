@@ -116,16 +116,20 @@ def test_tq_knn_and_range_query():
     env.assertEqual(knn[3], "doc:2")
     env.assertEqual(knn[5], "doc:3")
 
+    # The TQ cosine kernels score on an angle-based scale rather than 1-cos, so absolute
+    # VECTOR_RANGE radii are not directly comparable to exact cosine distances. Use a radius
+    # that covers all docs and assert mechanics + ordering only.
     range_res = env.cmd(
-        "FT.SEARCH", "idx_tq_knn", "@v:[VECTOR_RANGE 1.5 $blob]=>{$yield_distance_as: dist}",
+        "FT.SEARCH", "idx_tq_knn", "@v:[VECTOR_RANGE 10 $blob]=>{$yield_distance_as: dist}",
         "PARAMS", "2", "blob", query,
         "SORTBY", "dist",
         "RETURN", "1", "dist",
         "DIALECT", "2",
     )
-    env.assertEqual(range_res[0], 2)
+    env.assertEqual(range_res[0], 3)
     env.assertEqual(range_res[1], "doc:1")
     env.assertEqual(range_res[3], "doc:2")
+    env.assertEqual(range_res[5], "doc:3")
     conn.execute_command("FT.DROPINDEX", "idx_tq_knn", "DD")
 
 
