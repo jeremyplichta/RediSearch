@@ -13,7 +13,7 @@
 | 2   | 0.2     | 2026-05-13    | Clarify §5.6 dataset is the Cohere-embedded MS MARCO v2.1 variant (HF card linked) |
 | 3   | 0.3     | 2026-05-13    | Link file references to the GitHub fork branch; surface branch links in the header |
 | 4   | 0.4     | 2026-06-11    | API reworked per review: TQ exposed via HNSW `COMPRESSION` argument (`TQ2`/`TQ4`/`TQ8`); standalone `TQ-FLAT`/`TQ-HNSW` algorithm names and `BITS`/`PROJECTIONS`/`SEED`/`ROTATION` knobs removed |
-| 5   | 0.5     | 2026-07-08    | Synced with branch state after merging latest master (twice); all suites green (C 742+130, Python 2140, VecSim TQ 14, bench harness 16); added Risk 9 (cosine distance scale) |
+| 5   | 0.5     | 2026-07-08    | Synced with branch state after merging latest master (twice); suites green (C 742+130, Python 2139/2140 — remaining failure is a local-env TLS port conflict, unrelated to TQ; VecSim TQ 14, bench harness 16); added Risk 9 (cosine distance scale) |
 
 ## Table of Contents
 
