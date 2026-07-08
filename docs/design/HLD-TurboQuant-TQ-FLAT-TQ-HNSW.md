@@ -3,7 +3,7 @@
 | **PRD**             | TBD                                                            |
 | ------------------- | -------------------------------------------------------------- |
 | **Document owner**  | Jeremy Plichta                                                 |
-| **Document status** | DRAFT (pre-review)                                             |
+| **Document status** | DRAFT v0.5 (review feedback incorporated, re-review requested) |
 | **RediSearch branch** | [jeremyplichta/RediSearch @ feat/tq-vector-quantization](https://github.com/jeremyplichta/RediSearch/tree/feat/tq-vector-quantization) |
 | **VecSim branch**   | [jeremyplichta/VectorSimilarity @ feat/tq-vector-quantization](https://github.com/jeremyplichta/VectorSimilarity/tree/feat/tq-vector-quantization) |
 
@@ -13,6 +13,7 @@
 | 2   | 0.2     | 2026-05-13    | Clarify §5.6 dataset is the Cohere-embedded MS MARCO v2.1 variant (HF card linked) |
 | 3   | 0.3     | 2026-05-13    | Link file references to the GitHub fork branch; surface branch links in the header |
 | 4   | 0.4     | 2026-06-11    | API reworked per review: TQ exposed via HNSW `COMPRESSION` argument (`TQ2`/`TQ4`/`TQ8`); standalone `TQ-FLAT`/`TQ-HNSW` algorithm names and `BITS`/`PROJECTIONS`/`SEED`/`ROTATION` knobs removed |
+| 5   | 0.5     | 2026-07-08    | Synced with branch state after merging latest master (twice); all suites green (C 742+130, Python 2140, VecSim TQ 14, bench harness 16); added Risk 9 (cosine distance scale) |
 
 ## Table of Contents
 
@@ -424,6 +425,7 @@ Test gaps to close before merge (see §9):
 | Risk 6 | **VecSim API surface widened.** New factory paths, virtual dispatch in tiered algos, `static_assert`s on TQ param prefixes. Risk of misuse from other consumers of VecSim.            | Build break or runtime UB in `vecsim_disk` / micro-benchmarks if they construct params zero-initialized. | All new enums are zero (`VecSimAlgo_TQ`, `VecSimAlgo_TQ_HNSW` follow the existing enum tail). Coordinate the VecSim bump with consumers; the API-hardening commit covers most of the obvious traps. |
 | Risk 7 | **Benchmarks are not in the merge gate.** Numbers below are anecdotal until we run `vector-db-benchmark`.                                                                              | We could ship a regression vs the existing path on some datasets.                       | Block merge on at least one end-to-end recall + throughput benchmark; capture results in this HLD before flipping the doc to APPROVED.                                                    |
 | Risk 8 | **Branch hygiene.** The `feat/tq-vector-quantization` branch was cut from an older master and accumulated unrelated drift (CI, coord, aggregate, etc.).                                | Hard to review TQ in isolation.                                                         | Largely addressed: current master has since been merged into the branch. Before opening a PR, do a final pass to confirm the diff against master is TQ-only (the RediSearch TQ commits + the VecSim submodule bump). |
+| Risk 9 | **Cosine distances are reported on an angle-based scale.** The TQ cosine kernels (compact-angle / polar path) score on a monotonic angle-based scale rather than exact `1 - cos`. KNN ordering is correct, but absolute `VECTOR_RANGE` radii and yielded distances are a surrogate, and the scale can differ between SIMD paths. | `VECTOR_RANGE` radius semantics and user-visible distances differ from exact cosine distance. | Documented; flow tests assert ordering, not absolute radii. Follow-up before GA: normalize the reported score back to `1 - cos` (or document the scale as part of the API contract). |
 
 ---
 
