@@ -17,19 +17,23 @@ unsafe extern "C" fn AREQ_CheckTimedOut(_areq: *mut ffi::AREQ) -> bool {
     false
 }
 
+use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use index_spec::IndexSpecReadGuard;
+use ref_mode::{Active, Ref};
 use rqe_core::{DocId, FieldIndex};
 use thiserror::Error;
 
-use ::inverted_index::FieldMask;
-use index_result::RSIndexResult;
+use ::inverted_index::{FieldMask, NumericFilter};
+use index_result::{RSIndexResult, RawIndexResult};
 pub use query_error::QueryError;
 use query_term::RSQueryTerm;
 
+pub mod boxed;
 pub mod c2rust;
 pub mod config;
+pub mod deferred;
 pub mod empty;
 pub mod expiration_checker;
 pub mod geo_shape;
@@ -47,6 +51,7 @@ pub mod optional_optimized;
 pub mod optional_reducer;
 pub mod profile;
 pub mod profile_print;
+pub mod resume_outcome;
 pub mod union;
 mod union_flat;
 mod union_heap;
@@ -56,6 +61,10 @@ mod union_trimmed;
 pub mod utils;
 pub mod wildcard;
 
+pub use boxed::{
+    RQEDynIterator, RQEDynSuspendedIterator, RQEIteratorBoxed, RQESuspendedIterator,
+    TypeErasedRQEIterator, TypeErasedRQESuspendedIterator,
+};
 pub use config::IteratorsConfig;
 pub use empty::Empty;
 pub use expiration_checker::{ExpirationChecker, FieldExpirationChecker, NoOpChecker};
@@ -64,9 +73,10 @@ pub use id_list::IdList;
 pub use intersection::{Intersection, NewIntersectionIterator, new_intersection_iterator};
 pub use inverted_index::{
     GeoRangeError, InvalidGeoInput, Missing, Numeric, NumericIteratorVariant, Tag, Term,
-    build_geo_numeric_filters, extract_geo_unit_factor, new_geo_range_iterator,
-    open_numeric_or_geo_index,
+    build_geo_numeric_filters, build_numeric_filter_iterator, extract_geo_unit_factor,
+    new_geo_range_iterator, open_numeric_or_geo_index,
 };
+pub use resume_outcome::ResumeOutcome;
 pub use rqe_iterator_type::IteratorType;
 pub use union::{
     Union, UnionFlat, UnionFullFlat, UnionFullHeap, UnionHeap, UnionQuickFlat, UnionQuickHeap,
@@ -75,15 +85,39 @@ pub use union::{
 pub use union_opaque::{UnionOpaque, UnionVariant};
 pub use wildcard::{NewWildcardIterator, Wildcard, WildcardIterator};
 
-#[derive(Debug, PartialEq)]
-/// The outcome of [`RQEIterator::skip_to`].
-pub enum SkipToOutcome<'iterator, 'index> {
+#[derive(Debug)]
+/// The outcome of [`RQEIterator::skip_to`], generic over the [`Ref`] mode.
+pub enum SkipToOutcomeRaw<'iterator, Rf: Ref> {
     /// The iterator has a valid entry for the requested `doc_id`.
-    Found(&'iterator mut RSIndexResult<'index>),
+    Found(&'iterator mut RawIndexResult<Rf>),
 
     /// The iterator doesn't have an entry for the requested `doc_id`, but there are entries with an id greater than the requested one.
-    NotFound(&'iterator mut RSIndexResult<'index>),
+    NotFound(&'iterator mut RawIndexResult<Rf>),
 }
+
+/// Manual `PartialEq` impl with a transitive bound on
+/// `RawIndexResult<Rf>: PartialEq` — only [`Active`] satisfies this
+/// (see [`ref_mode`]).
+impl<'iterator, Rf: Ref> PartialEq for SkipToOutcomeRaw<'iterator, Rf>
+where
+    RawIndexResult<Rf>: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Found(a), Self::Found(b)) => a == b,
+            (Self::NotFound(a), Self::NotFound(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// The outcome of [`RQEIterator::skip_to`] when the iterator holds [`Active`]
+/// references into the index. This is the only instantiation that's
+/// constructible from trait-impl code today; the more general
+/// [`SkipToOutcomeRaw`] exists so the iterator structs can store function
+/// pointers whose signatures are uniform across `Active`/`Suspended`
+/// instantiations.
+pub type SkipToOutcome<'iterator, 'index> = SkipToOutcomeRaw<'iterator, Active<'index>>;
 
 #[derive(Debug, Error)]
 /// An iterator failure indications
@@ -273,6 +307,12 @@ pub static SEARCH_ENTERPRISE_ITERATORS: OnceLock<Box<dyn SearchEnterpriseIterato
 
 /// A trait to allow SearchEnterprise to provide iterators for on-disk search. The actual
 /// implementation will provide iterators `rqe_iterators` does not know about.
+///
+/// Each iterator constructor requires a `snapshot` handle. It must be a
+/// [`RedisSearchDiskSnapshot`](ffi::RedisSearchDiskSnapshot) returned from the disk API's
+/// `createSnapshot` for the same `index`, and it must remain valid for the lifetime of the
+/// returned iterator. This is what guarantees every iterator created for one query observes
+/// the same database state — there is no live-database fallback.
 pub trait SearchEnterpriseIterators: Send + Sync {
     /// Iterate over all the documents in the index. Each document in the iterator will have the
     /// given weight.
@@ -283,6 +323,7 @@ pub trait SearchEnterpriseIterators: Send + Sync {
         &self,
         index: &'index mut ffi::RedisSearchDiskIndexSpec,
         weight: f64,
+        snapshot: NonNull<ffi::RedisSearchDiskSnapshot>,
         status: Option<&mut QueryError>,
     ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
 
@@ -298,6 +339,7 @@ pub trait SearchEnterpriseIterators: Send + Sync {
         query_term: Box<RSQueryTerm>,
         field_mask: FieldMask,
         weight: f64,
+        snapshot: NonNull<ffi::RedisSearchDiskSnapshot>,
     ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
 
     /// Iterate over all the terms in the index, skipping offset data for efficiency.
@@ -312,6 +354,7 @@ pub trait SearchEnterpriseIterators: Send + Sync {
         query_term: Box<RSQueryTerm>,
         field_mask: FieldMask,
         weight: f64,
+        snapshot: NonNull<ffi::RedisSearchDiskSnapshot>,
     ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
 
     /// Iterate over all the tags (tokens) in the index at the given field index. Each document in
@@ -322,6 +365,7 @@ pub trait SearchEnterpriseIterators: Send + Sync {
         token: &ffi::RSToken,
         field_index: FieldIndex,
         weight: f64,
+        snapshot: NonNull<ffi::RedisSearchDiskSnapshot>,
     ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
 
     /// Iterate over the entries of the numeric index at the given field index whose value
@@ -329,7 +373,8 @@ pub trait SearchEnterpriseIterators: Send + Sync {
     fn new_numeric_on_disk<'index>(
         &self,
         index: &'index mut ffi::RedisSearchDiskIndexSpec,
-        filter: &ffi::NumericFilter,
-        field_index: ffi::t_fieldIndex,
+        filter: &NumericFilter,
+        field_index: FieldIndex,
+        snapshot: NonNull<ffi::RedisSearchDiskSnapshot>,
     ) -> Result<Box<dyn RQEIteratorPrintable<'index> + 'index>, Box<dyn std::error::Error>>;
 }

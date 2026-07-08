@@ -158,6 +158,8 @@ static void handleCollectSortBy(const ArgParser *parser, const void *value, void
 // ----- LIMIT -----
 
 // Parses: LIMIT <offset> <count>
+//   Both must be non-negative integers; on user-facing requests they are also
+//   bounded by search-max-aggregate-results.
 static void handleCollectLimit(const ArgParser *parser, const void *value, void *user_data) {
   (void)parser;
   CollectParseCtx *pctx = (CollectParseCtx *)user_data;
@@ -177,15 +179,24 @@ static void handleCollectLimit(const ArgParser *parser, const void *value, void 
       "LIMIT count must be a positive integer");
     return;
   }
-  if (offset > MAX_AGGREGATE_REQUEST_RESULTS) {
-    QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_LIMIT,
-      "LIMIT offset exceeds maximum of %llu", MAX_AGGREGATE_REQUEST_RESULTS);
-    return;
-  }
-  if (count > MAX_AGGREGATE_REQUEST_RESULTS) {
-    QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_LIMIT,
-      "LIMIT count exceeds maximum of %llu", MAX_AGGREGATE_REQUEST_RESULTS);
-    return;
+  const size_t maxResults = RSGlobalConfig.maxAggregateResults;
+  if (!ReducerOpts_IsInternal(pctx->options)) {
+    if (offset > maxResults) {
+      QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_LIMIT,
+        "LIMIT offset exceeds maximum of %zu", maxResults);
+      return;
+    }
+    if (count > maxResults) {
+      QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_LIMIT,
+        "LIMIT count exceeds maximum of %zu", maxResults);
+      return;
+    }
+  } else {
+    // Internal shard requests fetch the full offset+count window from row 0 so
+    // the coordinator can apply the offset and trim; that window may exceed the
+    // cap, so we assert the rewrite's invariants instead of re-checking it.
+    RS_ASSERT(offset == 0);
+    RS_ASSERT(count / 2 <= maxResults);
   }
   // Overflow guard for `offset + count`. Redundant given the individual bounds
   // above and a sane MAX, but cheap insurance against future MAX changes.
@@ -206,14 +217,11 @@ bool CollectArgs_Parse(const ReducerOptions *options, CollectArgs *out) {
   RS_ASSERT(options && out);
   out->sortAscMap = SORTASCMAP_INIT;
 
-  if (!RSGlobalConfig.enableUnstableFeatures) {
-    QueryError_SetError(options->status, QUERY_ERROR_CODE_INVAL,
-      "`COLLECT` is unavailable when `ENABLE_UNSTABLE_FEATURES` is off. "
-      "Enable it with `CONFIG SET search-enable-unstable-features yes`");
-    return false;
-  }
+  // COLLECT always requires field/sort names to carry an `@` prefix.
+  ReducerOptions strict_opts = *options;
+  strict_opts.strictPrefix = true;
 
-  CollectParseCtx pctx = {.args = out, .options = options};
+  CollectParseCtx pctx = {.args = out, .options = &strict_opts};
 
   ArgsCursor *ac = options->args;
   ArgParser *parser = ArgParser_New(ac, NULL);
@@ -247,6 +255,10 @@ bool CollectArgs_Parse(const ReducerOptions *options, CollectArgs *out) {
     ARG_OPT_OPTIONAL,
     ARG_OPT_CALLBACK, handleCollectLimit, &pctx,
     ARG_OPT_END);
+
+  ArgParser_AddFlag(parser, "DISTINCT",
+    "Deduplicate by projected fields",
+    &pctx.args->distinct);
 
   ArgParseResult result = ArgParser_Parse(parser);
 
@@ -329,7 +341,8 @@ Reducer *RDCRCollect_New(const ReducerOptions *options) {
       args.sortAscMap,
       args.has_limit,
       args.limit_offset,
-      args.limit_count
+      args.limit_count,
+      args.distinct
     );
   } else {
     arrayof(const RLookupKey *) field_keys = NULL;
@@ -360,7 +373,8 @@ Reducer *RDCRCollect_New(const ReducerOptions *options) {
       args.has_limit,
       args.limit_offset,
       args.limit_count,
-      ReducerOpts_IsInternal(options)
+      ReducerOpts_IsInternal(options),
+      args.distinct
     );
     array_free(field_keys);
     array_free(sort_keys);

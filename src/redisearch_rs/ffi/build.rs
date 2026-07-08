@@ -28,25 +28,82 @@ struct HeaderAllowlist {
 /// Bindgen inputs. Each entry both feeds clang and constrains which symbols
 /// bindgen emits. Sorted alphabetically by `path` for easy scanning.
 const HEADERS: &[HeaderAllowlist] = &[
+    // `c_wrappers/vecsim`: query replies and their iterators.
+    HeaderAllowlist {
+        path: "deps/VectorSimilarity/src/VecSim/query_results.h",
+        fns: &[
+            "VecSimBatchIterator_Free",
+            "VecSimBatchIterator_HasNext",
+            "VecSimBatchIterator_Next",
+            "VecSimQueryReply_Free",
+            "VecSimQueryReply_GetCode",
+            "VecSimQueryReply_GetIterator",
+            "VecSimQueryReply_IteratorFree",
+            "VecSimQueryReply_IteratorNext",
+            "VecSimQueryResult_GetId",
+            "VecSimQueryResult_GetScore",
+        ],
+        types: &[
+            "VecSimQueryReply",
+            "VecSimQueryReply_Code",
+            "VecSimQueryReply_Iterator",
+            "VecSimQueryReply_Order",
+        ],
+        vars: &[],
+    },
+    // `c_wrappers/vecsim`: index handle + adhoc-BF / batch-iterator entry points.
+    HeaderAllowlist {
+        path: "deps/VectorSimilarity/src/VecSim/vec_sim.h",
+        fns: &[
+            "VecSimBatchIterator_New",
+            "VecSimIndex_AddVector",
+            "VecSimIndex_AdhocBfCtx_Free",
+            "VecSimIndex_AdhocBfCtx_GetDistanceFrom",
+            "VecSimIndex_AdhocBfCtx_GetExactDistances",
+            "VecSimIndex_AdhocBfCtx_New",
+            "VecSimIndex_BasicInfo",
+            "VecSimIndex_Free",
+            "VecSimIndex_GetDistanceFrom_Unsafe",
+            "VecSimIndex_IndexSize",
+            "VecSimIndex_New",
+            "VecSimIndex_PreferAdHocSearch",
+            "VecSimIndex_TopKQuery",
+            "VecSimParams_GetQueryBlobSize",
+            "VecSimTieredIndex_AcquireSharedLocks",
+            "VecSimTieredIndex_ReleaseSharedLocks",
+            "VecSim_Normalize",
+        ],
+        types: &["VecSimBatchIterator", "VecSimIndex"],
+        vars: &[],
+    },
     // RSE: `ThrottleCB` and `VecSimParamsDisk` are consumed by the disk
     // vector-index API exposed through `src/search_disk_api.h`.
     HeaderAllowlist {
         path: "deps/VectorSimilarity/src/VecSim/vec_sim_common.h",
         fns: &[],
-        types: &["ThrottleCB", "VecSimParamsDisk"],
+        types: &[
+            "ThrottleCB",
+            "VecSimIndexBasicInfo",
+            "VecSimParamsDisk",
+            "VecSimQueryParams",
+        ],
         vars: &[],
     },
     HeaderAllowlist {
         path: "deps/hiredis/sds.h",
-        fns: &["sdscatlen"],
+        fns: &["sdscatlen", "sdsnewlen", "sdsfree"],
         types: &[],
         vars: &[],
     },
     HeaderAllowlist {
         path: "src/aggregate/aggregate.h",
         fns: &["AREQ_CheckTimedOut"],
-        types: &[],
-        vars: &[],
+        types: &[
+            // Disk async loader checks QEXEC_S_HAS_LOAD to decide whether to
+            // set the LOAD flag on a new pipeline.
+            "QEStateFlags",
+        ],
+        vars: &["QEXEC_S_HAS_LOAD"],
     },
     HeaderAllowlist {
         path: "src/aggregate/reducer.h",
@@ -68,7 +125,12 @@ const HEADERS: &[HeaderAllowlist] = &[
     },
     HeaderAllowlist {
         path: "src/doc_table.h",
-        fns: &["DMD_Free", "DocTable_Exists"],
+        fns: &[
+            "DMD_Free",
+            "DocTable_Exists",
+            "DocTable_GetId",
+            "DocTable_Put",
+        ],
         types: &[],
         vars: &[],
     },
@@ -85,6 +147,22 @@ const HEADERS: &[HeaderAllowlist] = &[
         vars: &[],
     },
     HeaderAllowlist {
+        path: "src/indexes.h",
+        fns: &[
+            "Indexes_Init",
+            "Indexes_RemoveSpecFromGlobals",
+            "Spec_AddToDict",
+        ],
+        types: &[],
+        vars: &["specDict_g", "specIdDict_g"],
+    },
+    HeaderAllowlist {
+        path: "src/info/index_error.h",
+        fns: &["IndexError_GlobalCleanup"],
+        types: &[],
+        vars: &[],
+    },
+    HeaderAllowlist {
         path: "src/iterators/hybrid_reader.h",
         fns: &[
             "HybridIterator_GetChild",
@@ -94,7 +172,10 @@ const HEADERS: &[HeaderAllowlist] = &[
             "HybridIterator_GetSearchModeString",
             "HybridIterator_IsBatchMode",
         ],
-        types: &[],
+        // `vector_score_source` owns a `TimeoutCtx` (an absolute `timespec`
+        // deadline) handed to VecSim. Exposed via this already-included header
+        // rather than a dedicated `timeout.h` bindgen root.
+        types: &["TimeoutCtx", "timespec"],
         vars: &[],
     },
     HeaderAllowlist {
@@ -143,8 +224,8 @@ const HEADERS: &[HeaderAllowlist] = &[
     },
     HeaderAllowlist {
         path: "src/query.h",
-        fns: &["tag_strtolower"],
-        types: &["QueryEvalCtx"],
+        fns: &["Query_EvalNode", "tag_strtolower"],
+        types: &["QueryAST", "QueryEvalCtx"],
         vars: &[],
     },
     HeaderAllowlist {
@@ -186,12 +267,22 @@ const HEADERS: &[HeaderAllowlist] = &[
         fns: &[],
         // RSE: `RedisModuleIO` is referenced by the RDB save/load entry points
         // in `src/search_disk_api.h`.
-        types: &["RedisModuleIO", "RedisModuleString"],
+        types: &[
+            "RedisModuleIO",
+            "RedisModuleString",
+            // RSE: callback typedef used in the `RedisModule_SwapPrefetchKey`
+            // function-pointer signature; bindgen pulls it in transitively but
+            // we allow it explicitly so it is stable across header changes.
+            "RedisModuleSwapPrefetchCB",
+        ],
         vars: &[
             "REDISMODULE_ERR",
             "REDISMODULE_OK",
             "REDISMODULE_POSTPONED_ARRAY_LEN",
             "REDISMODULE_POSTPONED_LEN",
+            // RSE: flag constant for `RedisModule_SwapPrefetchKey` — value 0
+            // means "prefetch for anyone / no restrictions".
+            "REDISMODULE_SWAP_PREFETCH_FLAG_NOONE",
             "RedisModule_Alloc",
             "RedisModule_Free",
             "RedisModule_FreeString",
@@ -217,8 +308,20 @@ const HEADERS: &[HeaderAllowlist] = &[
             "RedisModule_ReplyWithMap",
             "RedisModule_ReplyWithSimpleString",
             "RedisModule_ReplyWithStringBuffer",
+            "RedisModule_IsKeyInRam",
+            // RSE: used by `redisearch_disk` to schedule async swap-prefetch
+            // for a key before blocking on disk I/O.
+            "RedisModule_SwapPrefetchKey",
             "RedisModule_StringPtrLen",
+            "RedisModule_ThreadSafeContextLock",
+            "RedisModule_ThreadSafeContextUnlock",
         ],
+    },
+    HeaderAllowlist {
+        path: "src/doc_id_meta.h",
+        fns: &["DocIdMeta_Get"],
+        types: &[],
+        vars: &[],
     },
     HeaderAllowlist {
         path: "src/result_processor.h",
@@ -228,8 +331,13 @@ const HEADERS: &[HeaderAllowlist] = &[
     },
     HeaderAllowlist {
         path: "src/rlookup_load_document.h",
-        fns: &["loadIndividualKeys", "sdslen_rust"],
-        types: &[],
+        fns: &[
+            "loadIndividualKeys",
+            "RLookup_LoadDocumentAll",
+            "RLookup_LoadDocumentIndividual",
+            "sdslen_rust",
+        ],
+        types: &["RLookupLoadOptions"],
         vars: &[],
     },
     HeaderAllowlist {
@@ -246,7 +354,19 @@ const HEADERS: &[HeaderAllowlist] = &[
     },
     HeaderAllowlist {
         path: "src/search_ctx.h",
-        fns: &["NewSearchCtxC", "SearchCtx_Free"],
+        fns: &[
+            "NewSearchCtxC",
+            "SearchCtx_Free",
+            // RSE: the disk async loader checks request timeout between disk
+            // reads via this main-thread-owned flag accessor.
+            "SearchTime_IsTimedOut",
+        ],
+        types: &[],
+        vars: &["APIVERSION_RETURN_MULTI_CMP_FIRST"],
+    },
+    HeaderAllowlist {
+        path: "src/search_disk.h",
+        fns: &["SearchDisk_GetMaxDocId"],
         types: &[],
         vars: &[],
     },
@@ -269,10 +389,17 @@ const HEADERS: &[HeaderAllowlist] = &[
             "RedisSearchDiskAPI",
             "RedisSearchDiskAsyncReadPool",
             "RedisSearchDiskRdbState",
+            "RedisSearchDiskSnapshot",
             "SearchDiskCompactionCallbacks",
             "SearchDiskWriteBatchHandle",
             "VectorDiskAPI",
         ],
+        vars: &[],
+    },
+    HeaderAllowlist {
+        path: "src/search_options.h",
+        fns: &[],
+        types: &["RSSearchFlags"],
         vars: &[],
     },
     HeaderAllowlist {
@@ -284,15 +411,12 @@ const HEADERS: &[HeaderAllowlist] = &[
             "IndexSpec_GetFieldWithLength",
             "IndexSpec_ParseC",
             "IndexSpec_ReleaseWriteLock",
-            "IndexSpec_RemoveFromGlobals",
             "IndexSpecCache_Decref",
             "IndexSpecRef_Promote",
             "IndexSpecRef_Release",
-            "Indexes_Init",
-            "Spec_AddToDict",
         ],
         types: &[],
-        vars: &["isCrdt", "specDict_g", "specIdDict_g"],
+        vars: &["isCrdt"],
     },
     HeaderAllowlist {
         path: "src/stopwords.h",
@@ -304,7 +428,7 @@ const HEADERS: &[HeaderAllowlist] = &[
         path: "src/suffix.h",
         fns: &[],
         types: &[],
-        vars: &["MIN_SUFFIX"],
+        vars: &["SUFFIX_STARRED_ANCHOR_PENALTY"],
     },
     HeaderAllowlist {
         path: "src/tag_index.h",
@@ -325,19 +449,10 @@ const HEADERS: &[HeaderAllowlist] = &[
         vars: &[],
     },
     HeaderAllowlist {
-        path: "src/ttl_table/ttl_table.h",
-        fns: &[
-            "TimeToLiveTable_Add",
-            "TimeToLiveTable_VerifyDocAndField",
-            "TimeToLiveTable_VerifyDocAndFieldMask",
-            "TimeToLiveTable_VerifyDocAndWideFieldMask",
-            "TimeToLiveTable_VerifyInit",
-            // Used by bench.
-            "TimeToLiveTable_Destroy",
-            "TimeToLiveTable_IsEmpty",
-        ],
+        path: "src/trie/trie_node.h",
+        fns: &[],
         types: &[],
-        vars: &[],
+        vars: &["TRIE_INITIAL_STRING_LEN", "TRIE_MAX_PREFIX"],
     },
     HeaderAllowlist {
         path: "src/util/arr/arr.h",
@@ -392,7 +507,7 @@ const PERMITTED_GENERATED_HEADERS: &[&str] = &[
     // (src/redisearch.h) — the full enum definition is required.
     "document_rs.h",
     // `FieldExpirationPredicate` is taken by value in TTL table function
-    // signatures (src/ttl_table/ttl_table.h).
+    // signatures (src/ttl_table.h).
     "field.h",
     // `RSOffsetVector` is embedded by value in `RSByteOffsets`
     // (src/byte_offsets.h) — the struct body is required.
@@ -441,10 +556,18 @@ const PERMITTED_GENERATED_HEADERS: &[&str] = &[
     // `aggregate.h` includes `value_ffi.h`; reachable via
     // `optimizer_reader.h` -> `query_optimizer.h` -> `aggregate.h`.
     "value_ffi.h",
+    // `src/search_result.h` includes this for the `IndexResult_DeepCopy`
+    // declaration used by the inline `SearchResult_TakeOwnedIndexResult`.
+    "types_ffi.h",
     // `src/byte_offsets.h` defines `static inline` functions that call
     // `NewVarintVectorWriter` / `VVW_Free` / `VVW_Write`. The whole file is
     // small (one opaque type + a handful of functions).
     "varint_ffi.h",
+    // `src/ext/default.h` includes `query_eval.h` for the scorer- and
+    // expander-name macros (`BM25_STD_SCORER_NAME`, `DEFAULT_EXPANDER_NAME`,
+    // ...), whose single source of truth is the Rust `query_eval` crate. These
+    // are string `#define`s, so a forward declaration isn't applicable.
+    "query_eval.h",
 ];
 
 /// Types defined in Rust (re-exported from their owning crate in

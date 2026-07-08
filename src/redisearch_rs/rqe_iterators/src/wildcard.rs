@@ -11,10 +11,11 @@
 
 use std::ptr::NonNull;
 
-use index_result::RSIndexResult;
+use index_result::{RSIndexResult, RawIndexResult};
 use index_spec::IndexSpecReadGuard;
 use inverted_index::codec::{doc_ids_only::DocIdsOnly, raw_doc_ids_only::RawDocIdsOnly};
 use inverted_index::{DocIdsDecoder, opaque};
+use ref_mode::{Active, Ref};
 
 use rqe_core::{DocId, RS_FIELDMASK_ALL};
 
@@ -25,15 +26,25 @@ use crate::{
 };
 use crate::{IteratorType, QueryError, RQEIteratorPrintable};
 
-/// An iterator that yields all ids within a given range, from 1 to max id (inclusive) in an index.
-#[derive(Default)]
-pub struct Wildcard<'index> {
+/// An iterator that yields all ids within a given range, from 1 to max id
+/// (inclusive) in an index.
+///
+/// Parameterised over a [`Ref`] mode — see [`Wildcard`] for the [`Active`]
+/// instantiation that implements [`RQEIterator`]. The struct owns no
+/// references into the index (it's a pure counter); the only `Rf`-dependent
+/// field is `result`.
+#[repr(C)]
+pub struct RawWildcard<Rf: Ref> {
     // Supposed to be the max id in the index
     top_id: DocId,
 
     /// A reusable result object to avoid allocations on each `read` call.
-    result: RSIndexResult<'index>,
+    result: RawIndexResult<Rf>,
 }
+
+/// Alias for an [`Active`] [`RawWildcard`] — the only instantiation with an
+/// [`RQEIterator`] impl today.
+pub type Wildcard<'index> = RawWildcard<Active<'index>>;
 
 impl Wildcard<'_> {
     pub fn new(top_id: DocId, weight: f64) -> Self {
@@ -126,7 +137,8 @@ impl<'index> WildcardIterator<'index> for Wildcard<'index> {}
 impl<'index, E> WildcardIterator<'index> for crate::inverted_index::Wildcard<'index, E>
 where
     E: inverted_index::DecodedBy
-        + inverted_index::opaque::OpaqueEncoding<Storage = inverted_index::InvertedIndex<E>>,
+        + inverted_index::opaque::OpaqueEncoding<Storage = inverted_index::InvertedIndex<E>>
+        + 'index,
     <E as inverted_index::DecodedBy>::Decoder: DocIdsDecoder,
 {
 }
@@ -381,10 +393,13 @@ pub unsafe fn new_wildcard_iterator_optimized<'index>(
 /// 1. `disk_spec` must reference a valid [`RedisSearchDiskIndexSpec`](ffi::RedisSearchDiskIndexSpec)
 ///    that remains valid for `'index`.
 /// 2. [`SEARCH_ENTERPRISE_ITERATORS`] must be initialized before calling this function.
-/// 3. `status`, when non-null, must point to a valid [`QueryError`](ffi::QueryError).
+/// 3. `snapshot` must be a [`RedisSearchDiskSnapshot`](ffi::RedisSearchDiskSnapshot) handle
+///    for `disk_spec` and must remain valid for `'index`.
+/// 4. `status`, when non-null, must point to a valid [`QueryError`](ffi::QueryError).
 pub unsafe fn new_wildcard_iterator_on_disk<'index>(
     disk_spec: &'index mut ffi::RedisSearchDiskIndexSpec,
     weight: f64,
+    snapshot: std::ptr::NonNull<ffi::RedisSearchDiskSnapshot>,
     status: *mut ffi::QueryError,
 ) -> NewWildcardIterator<'index> {
     // SAFETY: Caller guarantees `SEARCH_ENTERPRISE_ITERATORS` is
@@ -392,12 +407,12 @@ pub unsafe fn new_wildcard_iterator_on_disk<'index>(
     let enterprise_iters_api = SEARCH_ENTERPRISE_ITERATORS
         .get()
         .expect("SEARCH_ENTERPRISE_ITERATORS not initialized");
-    // SAFETY: caller guarantees `status`, when non-null, points to a valid `QueryError` (3).
+    // SAFETY: caller guarantees `status`, when non-null, points to a valid `QueryError` (4).
     let status = unsafe { QueryError::from_opaque_mut_ptr(status.cast()) };
     // On failure the enterprise implementation populates `status` with the
     // cause; we just fall back to an empty iterator so the query aborts via the
     // existing `QueryError_HasError` check rather than returning empty results.
-    match enterprise_iters_api.new_wildcard_on_disk(disk_spec, weight, status) {
+    match enterprise_iters_api.new_wildcard_on_disk(disk_spec, weight, snapshot, status) {
         Ok(it) => NewWildcardIterator::Disk(it),
         Err(err) => {
             tracing::warn!(
@@ -439,6 +454,9 @@ pub unsafe fn new_wildcard_iterator_on_disk<'index>(
 ///    [`RedisSearchDiskIndexSpec`](ffi::RedisSearchDiskIndexSpec) that remains valid for `'index`.
 /// 8. When `query.sctx.spec.diskSpec` is non-null, [`SEARCH_ENTERPRISE_ITERATORS`] must be
 ///    initialized.
+/// 9. When `query.sctx.spec.diskSpec` is non-null, `query.sctx.diskSnapshot` must be a
+///    non-null [`RedisSearchDiskSnapshot`](ffi::RedisSearchDiskSnapshot) handle for
+///    `query.sctx.spec.diskSpec` and must remain valid for `'index`.
 pub unsafe fn new_wildcard_iterator<'index>(
     query: NonNull<ffi::QueryEvalCtx>,
     weight: f64,
@@ -456,10 +474,12 @@ pub unsafe fn new_wildcard_iterator<'index>(
         // pointer to a `RedisSearchDiskIndexSpec` that remains valid for
         // `'index` (7).
         let disk_spec = unsafe { &mut *spec.diskSpec };
+        let snapshot = NonNull::new(sctx_ref.diskSnapshot)
+            .expect("query.sctx.diskSnapshot is null for a disk-backed wildcard query");
         // SAFETY: Caller guarantees all preconditions of
-        // `new_wildcard_iterator_on_disk` hold (7, 8); `query.status` is the
+        // `new_wildcard_iterator_on_disk` hold (7, 8, 9); `query.status` is the
         // valid `QueryError` of the evaluating query.
-        return unsafe { new_wildcard_iterator_on_disk(disk_spec, weight, query.status) };
+        return unsafe { new_wildcard_iterator_on_disk(disk_spec, weight, snapshot, query.status) };
     }
 
     let index_all = NonNull::new(spec.rule)

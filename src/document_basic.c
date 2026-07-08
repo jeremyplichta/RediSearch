@@ -26,6 +26,7 @@ void Document_Init(Document *doc, RedisModuleString *docKey, double score, RSLan
   doc->payload = NULL;
   doc->payloadSize = 0;
   doc->type = type;
+  doc->fieldExpirations = FieldExpirations_Empty();
 }
 
 // Nor related to AS attribute. Used by LLAPI.
@@ -129,7 +130,7 @@ t_expirationTimePoint GetKeyExpirationTime(RedisModuleKey *openedKey) {
 }
 
 void Document_LoadHashFieldExpiration(RedisModuleKey *k, const FieldSpec *field,
-                                      size_t ii, arrayof(FieldExpiration) *out) {
+                                      size_t ii, FieldExpirations *out) {
   mstime_t expireAt = REDISMODULE_NO_EXPIRE;
   RedisModule_HashGet(k, REDISMODULE_HASH_CFIELDS | REDISMODULE_HASH_EXPIRE_TIME,
                       HiddenString_GetUnsafe(field->fieldPath, NULL), &expireAt, NULL);
@@ -137,13 +138,21 @@ void Document_LoadHashFieldExpiration(RedisModuleKey *k, const FieldSpec *field,
     return;
   }
   FieldExpiration fx = {.index = (t_fieldIndex)ii, .point = timespecFromMilliseconds(expireAt)};
-  array_ensure_append_1(*out, fx);
+
+  FieldExpirations_Push(out, fx);
 }
 
-int Document_LoadSchemaFieldHash(Document *doc, RedisSearchCtx *sctx, QueryError *status) {
+int Document_LoadSchemaFieldHash(Document *doc, RedisSearchCtx *sctx, RedisModuleKey *openKey,
+                                 QueryError *status) {
   // must happen before opening the key, in case the call will cause a lazy expiration
   IndexSpec *spec = sctx->spec;
-  RedisModuleKey *k = RedisModule_OpenKey(sctx->redisCtx, doc->docKey, DOCUMENT_OPEN_KEY_INDEXING_FLAGS);
+  // Reuse the caller's already-open, pinned handle when provided (e.g. the async scan
+  // key callback). Opening the same key a second time while the caller's handle is
+  // still live is unsafe, so borrow it here. The caller retains ownership, so a
+  // borrowed handle must not be closed below.
+  RedisModuleKey *k = openKey ? openKey
+                              : RedisModule_OpenKey(sctx->redisCtx, doc->docKey,
+                                                    DOCUMENT_OPEN_KEY_INDEXING_FLAGS);
   int rv = REDISMODULE_ERR;
   size_t nitems = 0;
   SchemaRule *rule = NULL;
@@ -201,13 +210,15 @@ int Document_LoadSchemaFieldHash(Document *doc, RedisSearchCtx *sctx, QueryError
   }
   rv = REDISMODULE_OK;
 done:
-  if (k) {
+  // Only close a handle we opened ourselves; a borrowed `openKey` is the caller's.
+  if (k && k != openKey) {
     RedisModule_CloseKey(k);
   }
   return rv;
 }
 
-int Document_LoadSchemaFieldJson(Document *doc, RedisSearchCtx *sctx, QueryError* status) {
+int Document_LoadSchemaFieldJson(Document *doc, RedisSearchCtx *sctx, RedisModuleKey *openKey,
+                                 QueryError* status) {
   int rv = REDISMODULE_ERR;
   IndexSpec *spec = NULL;
   SchemaRule *rule = NULL;
@@ -229,7 +240,10 @@ int Document_LoadSchemaFieldJson(Document *doc, RedisSearchCtx *sctx, QueryError
   ctx = sctx->redisCtx;
   nitems = sctx->spec->numFields;
 
-  k = RedisModule_OpenKey(sctx->redisCtx, doc->docKey, DOCUMENT_OPEN_KEY_INDEXING_FLAGS);
+  // Reuse the caller's already-open, pinned handle when provided instead of opening
+  // the same key a second time; a borrowed handle must not be closed below.
+  k = openKey ? openKey
+              : RedisModule_OpenKey(sctx->redisCtx, doc->docKey, DOCUMENT_OPEN_KEY_INDEXING_FLAGS);
   if (!k) {
     QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_INVAL, "Key does not exist", ": %s", RedisModule_StringPtrLen(doc->docKey, NULL));
     goto done;
@@ -239,9 +253,16 @@ int Document_LoadSchemaFieldJson(Document *doc, RedisSearchCtx *sctx, QueryError
     doc->docExpirationTime = GetKeyExpirationTime(k);
   }
 
-  RedisModule_CloseKey(k);
+  if (!openKey) {
+    RedisModule_CloseKey(k);
+  }
 
-  jsonRoot = japi->openKeyWithFlags(ctx, doc->docKey, DOCUMENT_OPEN_KEY_QUERY_FLAGS);
+  if (openKey) {
+    //TODO: Analyze if we do not need to close key and we can always use this path
+    jsonRoot = japi->isJSON(openKey) ? (RedisJSON)RedisModule_ModuleTypeGetValue(openKey) : NULL;
+  } else {
+    jsonRoot = japi->openKeyWithFlags(ctx, doc->docKey, DOCUMENT_OPEN_KEY_QUERY_FLAGS);
+  }
   if (!jsonRoot) {
     QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_INVAL, "Key does not exist or is not a json", ": %s", RedisModule_StringPtrLen(doc->docKey, NULL));
     goto done;
@@ -466,8 +487,7 @@ void Document_Clear(Document *d) {
 
 void Document_Free(Document *doc) {
   Document_Clear(doc);
-  array_free(doc->fieldExpirations);
-  doc->fieldExpirations = NULL;
+  FieldExpirations_Free(&doc->fieldExpirations);
   if (doc->flags & (DOCUMENT_F_OWNREFS | DOCUMENT_F_OWNSTRINGS)) {
     RedisModule_FreeString(RSDummyContext, doc->docKey);
   }

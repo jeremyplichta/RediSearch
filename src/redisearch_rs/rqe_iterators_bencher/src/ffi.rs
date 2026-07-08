@@ -10,8 +10,8 @@
 pub use ffi::{
     IndexFlags, IndexFlags_Index_DocIdsOnly, IndexFlags_Index_StoreByteOffsets,
     IndexFlags_Index_StoreFieldFlags, IndexFlags_Index_StoreFreqs, IndexFlags_Index_StoreNumeric,
-    IndexFlags_Index_StoreTermOffsets, IteratorStatus, IteratorStatus_ITERATOR_OK,
-    RedisModule_Alloc, RedisModule_Free, ValidateStatus,
+    IndexFlags_Index_StoreTermOffsets, IteratorStatus, IteratorStatus_ITERATOR_EOF,
+    IteratorStatus_ITERATOR_OK, RedisModule_Alloc, RedisModule_Free, ValidateStatus,
 };
 use index_result::{RSIndexResult, RSQueryTerm};
 use iterators_ffi::intersection::NewIntersectionIterator;
@@ -182,7 +182,7 @@ impl QueryIterator {
     #[inline(always)]
     pub fn current(&self) -> Option<&RSIndexResult<'static>> {
         let current = unsafe { (*self.0).current };
-        unsafe { current.cast::<RSIndexResult>().as_ref() }
+        unsafe { current.cast::<RSIndexResult<'static>>().as_ref() }
     }
 }
 

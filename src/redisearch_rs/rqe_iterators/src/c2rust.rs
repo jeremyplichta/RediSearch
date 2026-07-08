@@ -8,6 +8,7 @@
 */
 // TODO: remove once we have compound iterators written in Rust that leverage
 //   this shim.
+
 use ffi::{
     IteratorStatus_ITERATOR_EOF, IteratorStatus_ITERATOR_NOTFOUND, IteratorStatus_ITERATOR_OK,
     IteratorStatus_ITERATOR_TIMEOUT, IteratorType, QueryIterator, ValidateStatus_VALIDATE_ABORTED,
@@ -172,6 +173,17 @@ impl CRQEIterator {
     pub fn into_raw(self) -> NonNull<QueryIterator> {
         let self_ = ManuallyDrop::new(self);
         self_.header
+    }
+
+    /// Return the raw pointer to the underlying [`QueryIterator`] without
+    /// consuming `self`.
+    ///
+    /// Unlike [`Self::into_raw`], `self` retains ownership: the returned pointer
+    /// aliases the one owned by `self`, so it must not be freed while `self` is
+    /// still live, nor used to construct a second owning [`CRQEIterator`] unless
+    /// ownership is first relinquished (e.g. by overwriting `self` in place).
+    pub const fn as_raw(&self) -> NonNull<QueryIterator> {
+        self.header
     }
 }
 
@@ -381,6 +393,8 @@ impl<'index> RQEIterator<'index> for CRQEIterator {
             IteratorType::IdListUnsorted => 1.0,
             IteratorType::MetricSortedById => 1.0,
             IteratorType::MetricSortedByScore => 1.0,
+            IteratorType::MetricLazySortedById => 1.0,
+            IteratorType::MetricLazySortedByScore => 1.0,
             IteratorType::Profile => 1.0,
             IteratorType::Optimus => 1.0,
             IteratorType::GeoShape => 1.0,

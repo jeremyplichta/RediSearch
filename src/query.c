@@ -19,6 +19,7 @@
 #include "query_error_ffi.h"
 #include "redis_index.h"
 #include "iterators_ffi.h"
+#include "query_eval_ffi.h"
 #include "tokenize.h"
 #include "trie/trie.h"
 #include "triemap_ffi.h"
@@ -573,7 +574,7 @@ QueryIterator *Query_EvalTokenNode(QueryEvalCtx *q, QueryNode *qn) {
     double idf = CalculateIDF(q->sctx->spec->stats.scoring.numDocuments, numDocsInTerm);
     double bm25_idf = CalculateIDF_BM25(q->sctx->spec->stats.scoring.numDocuments, numDocsInTerm);
     bool needsOffsets = queryNeedsOffsets(q->opts->scorerName, &qn->opts);
-    return SearchDisk_NewTermIterator(q->sctx->spec->diskSpec, &qn->tn, q->tokenId++, EFFECTIVE_FIELDMASK(q, qn), qn->opts.weight, idf, bm25_idf, needsOffsets, q->status);
+    return SearchDisk_NewTermIterator(q->sctx->spec->diskSpec, q->sctx, &qn->tn, q->tokenId++, EFFECTIVE_FIELDMASK(q, qn), qn->opts.weight, idf, bm25_idf, needsOffsets, q->status);
   } else {
     return Redis_OpenReader(q->sctx, &qn->tn, q->tokenId++, q->docTable, EFFECTIVE_FIELDMASK(q, qn), qn->opts.weight);
   }
@@ -595,7 +596,7 @@ static inline void addTerm(char *str, size_t tok_len, size_t numDocsInTerm, Quer
     double idf = CalculateIDF(q->sctx->spec->stats.scoring.numDocuments, numDocsInTerm);
     double bm25_idf = CalculateIDF_BM25(q->sctx->spec->stats.scoring.numDocuments, numDocsInTerm);
     bool needsOffsets = queryNeedsOffsets(q->opts->scorerName, opts);
-    ir = SearchDisk_NewTermIterator(q->sctx->spec->diskSpec, &tok, q->tokenId++, q->opts->fieldmask & opts->fieldMask, 1, idf, bm25_idf, needsOffsets, q->status);
+    ir = SearchDisk_NewTermIterator(q->sctx->spec->diskSpec, q->sctx, &tok, q->tokenId++, q->opts->fieldmask & opts->fieldMask, 1, idf, bm25_idf, needsOffsets, q->status);
   } else {
     // Open an index reader
     ir = Redis_OpenReader(q->sctx, &tok, q->tokenId++, &q->sctx->spec->docs,
@@ -614,9 +615,9 @@ static inline void addTerm(char *str, size_t tok_len, size_t numDocsInTerm, Quer
 }
 
 static QueryIterator *iterateExpandedTerms(QueryEvalCtx *q, Trie *terms, const char *str,
-                                           size_t len, int maxDist, int prefixMode,
+                                           size_t len, int maxDist, TrieMatchMode mode,
                                            QueryNodeOptions *opts) {
-  TrieIterator *it = Trie_Iterate(terms, str, len, maxDist, prefixMode);
+  TrieIterator *it = Trie_IterateFuzzy(terms, str, len, maxDist, mode);
   if (!it) return NULL;
 
   size_t itsSz = 0, itsCap = 8;
@@ -645,7 +646,7 @@ static QueryIterator *iterateExpandedTerms(QueryEvalCtx *q, Trie *terms, const c
   }
 
   // Add an iterator over the inverted index of the empty string for fuzzy search
-  if (!prefixMode && q->sctx->apiVersion >= 2 && len <= maxDist) {
+  if (mode == TRIE_MATCH_EDIT_DISTANCE && q->sctx->apiVersion >= 2 && len <= maxDist) {
     size_t rlen = 0;
     runeBuf buf;
     rune *runes = runeBufFill("", 1, &buf, &rlen);
@@ -655,7 +656,7 @@ static QueryIterator *iterateExpandedTerms(QueryEvalCtx *q, Trie *terms, const c
     addTerm("", 0, numDocsInEmpty, q, opts, &its, &itsSz, &itsCap);
   }
 
-  QueryNodeType type = prefixMode ? QN_PREFIX : QN_FUZZY;
+  QueryNodeType type = mode == TRIE_MATCH_PREFIX ? QN_PREFIX : QN_FUZZY;
   return NewUnionIterator(its, itsSz, true, opts->weight, type, str, q->config);
 }
 
@@ -777,12 +778,16 @@ static QueryIterator *Query_EvalWildcardQueryNode(QueryEvalCtx *q, QueryNode *qn
     // all modifier fields are supported
     if (qn->opts.fieldMask == RS_FIELDMASK_ALL ||
        (spec->suffixMask & qn->opts.fieldMask) == qn->opts.fieldMask) {
+      // TEXT terms are stored lowercased, so recheck against the lowercased
+      // pattern (Suffix_CB_Wildcard matches cstr) to stay case-insensitive.
+      size_t lcstrlen;
+      char *lcstr = runesToStr(str, nstr, &lcstrlen);
       SuffixCtx sufCtx = {
         .trie = spec->suffix,
         .rune = str,
         .runelen = nstr,
-        .cstr = token->str,
-        .cstrlen = token->len,
+        .cstr = lcstr,
+        .cstrlen = lcstrlen,
         .type = SUFFIX_TYPE_WILDCARD,
         .callback = charIterCb, // the difference is weather the function receives char or rune
         .cbCtx = &ctx,
@@ -793,6 +798,7 @@ static QueryIterator *Query_EvalWildcardQueryNode(QueryEvalCtx *q, QueryNode *qn
         // if suffix trie cannot be used, use brute force
         fallbackBruteForce = true;
       }
+      rm_free(lcstr);
     } else {
       QueryError_SetError(q->status, QUERY_ERROR_CODE_GENERIC, "Contains query on fields without WITHSUFFIXTRIE support");
     }
@@ -843,7 +849,7 @@ static int runeIterCb(const rune *r, size_t n, void *p, void *payload, size_t nu
     double idf = CalculateIDF(q->sctx->spec->stats.scoring.numDocuments, numDocsInTerm);
     double bm25_idf = CalculateIDF_BM25(q->sctx->spec->stats.scoring.numDocuments, numDocsInTerm);
     bool needsOffsets = queryNeedsOffsets(q->opts->scorerName, ctx->opts);
-    ir = SearchDisk_NewTermIterator(q->sctx->spec->diskSpec, &tok, ctx->q->tokenId++, q->opts->fieldmask & ctx->opts->fieldMask, 1, idf, bm25_idf, needsOffsets, q->status);
+    ir = SearchDisk_NewTermIterator(q->sctx->spec->diskSpec, q->sctx, &tok, ctx->q->tokenId++, q->opts->fieldmask & ctx->opts->fieldMask, 1, idf, bm25_idf, needsOffsets, q->status);
   } else {
     ir = Redis_OpenReader(q->sctx, &tok, ctx->q->tokenId++, &q->sctx->spec->docs,
                                         q->opts->fieldmask & ctx->opts->fieldMask, 1);
@@ -877,7 +883,7 @@ static int charIterCb(const char *s, size_t n, void *p, void *payload) {
     double idf = CalculateIDF(q->sctx->spec->stats.scoring.numDocuments, numDocsInTerm);
     double bm25_idf = CalculateIDF_BM25(q->sctx->spec->stats.scoring.numDocuments, numDocsInTerm);
     bool needsOffsets = queryNeedsOffsets(q->opts->scorerName, ctx->opts);
-    ir = SearchDisk_NewTermIterator(q->sctx->spec->diskSpec, &tok, q->tokenId++, q->opts->fieldmask & ctx->opts->fieldMask, 1, idf, bm25_idf, needsOffsets, q->status);
+    ir = SearchDisk_NewTermIterator(q->sctx->spec->diskSpec, q->sctx, &tok, q->tokenId++, q->opts->fieldmask & ctx->opts->fieldMask, 1, idf, bm25_idf, needsOffsets, q->status);
   } else {
     ir = Redis_OpenReader(q->sctx, &tok, q->tokenId++, &q->sctx->spec->docs,
                                         q->opts->fieldmask & ctx->opts->fieldMask, 1);
@@ -927,46 +933,8 @@ static QueryIterator *Query_EvalFuzzyNode(QueryEvalCtx *q, QueryNode *qn) {
 
   if (!terms) return NULL;
 
-  return iterateExpandedTerms(q, terms, qn->pfx.tok.str, strlen(qn->pfx.tok.str), qn->fz.maxDist, 0, &qn->opts);
-}
-
-static QueryIterator *Query_EvalPhraseNode(QueryEvalCtx *q, QueryNode *qn) {
-  QueryPhraseNode *node = &qn->pn;
-  // an intersect stage with one child is the same as the child, so we just
-  // return it
-  if (QueryNode_NumChildren(qn) == 1) {
-    qn->children[0]->opts.fieldMask &= qn->opts.fieldMask;
-    return Query_EvalNode(q, qn->children[0]);
-  }
-
-  // recursively eval the children
-  QueryIterator **iters = rm_calloc(QueryNode_NumChildren(qn), sizeof(QueryIterator *));
-  for (size_t ii = 0; ii < QueryNode_NumChildren(qn); ++ii) {
-    qn->children[ii]->opts.fieldMask &= qn->opts.fieldMask;
-    iters[ii] = Query_EvalNode(q, qn->children[ii]);
-  }
-  QueryIterator *ret;
-
-  if (node->exact) {
-    ret = NewIntersectionIterator(iters, QueryNode_NumChildren(qn), 0, true, qn->opts.weight);
-  } else {
-    // Let the query node override the slop/order parameters
-    int slop = qn->opts.maxSlop;
-    if (slop == -1) slop = q->opts->slop;
-
-    // Let the query node override the inorder of the whole query
-    bool inOrder = (q->opts->flags & Search_InOrder) || qn->opts.inOrder;
-
-    ret = NewIntersectionIterator(iters, QueryNode_NumChildren(qn), slop, inOrder, qn->opts.weight);
-  }
-  return ret;
-}
-
-static QueryIterator *Query_EvalWildcardNode(QueryEvalCtx *q, QueryNode *qn) {
-  RS_LOG_ASSERT(qn->type == QN_WILDCARD, "query node type should be wildcard");
-  RS_LOG_ASSERT(q->docTable, "DocTable is NULL");
-
-  return NewWildcardIterator(q, qn->opts.weight);
+  return iterateExpandedTerms(q, terms, qn->pfx.tok.str, strlen(qn->pfx.tok.str), qn->fz.maxDist,
+                              TRIE_MATCH_EDIT_DISTANCE, &qn->opts);
 }
 
 // Probe the Blocked Client Timeout flag for a query iterator. Called from
@@ -979,37 +947,6 @@ bool AREQ_CheckTimedOut(AREQ *areq) {
   SyncPoint_WaitUntil(SYNC_POINT_BEFORE_QI_TIMEOUT_CHECK, areq_timed_out, areq);
 #endif
   return AREQ_TimedOut(areq);
-}
-
-static QueryIterator *Query_EvalNotNode(QueryEvalCtx *q, QueryNode *qn) {
-  RS_LOG_ASSERT(qn->type == QN_NOT, "query node type should be not")
-  QueryIterator *child = NULL;
-  bool currently_notSubtree = q->notSubtree;
-  q->notSubtree = true;
-  child = Query_EvalNode(q, qn->children[0]);
-  q->notSubtree = currently_notSubtree;
-
-  t_docId maxDocId = q->sctx->spec->diskSpec ? SearchDisk_GetMaxDocId(q->sctx->spec->diskSpec) : q->docTable->maxDocId;
-  return NewNotIterator(child, maxDocId, qn->opts.weight, q->sctx->time.timeout,
-                        q->bcTimeoutAreq, q);
-}
-
-static QueryIterator *Query_EvalOptionalNode(QueryEvalCtx *q, QueryNode *qn) {
-  RS_LOG_ASSERT(qn->type == QN_OPTIONAL, "query node type should be optional");
-  RS_LOG_ASSERT(QueryNode_NumChildren(qn) == 1, "Optional node must have a single child");
-  t_docId maxDocId = q->sctx->spec->diskSpec ? SearchDisk_GetMaxDocId(q->sctx->spec->diskSpec) : q->docTable->maxDocId;
-  return NewOptionalIterator(Query_EvalNode(q, qn->children[0]), q, maxDocId, qn->opts.weight);
-}
-
-static QueryIterator *Query_EvalNumericNode(QueryEvalCtx *q, QueryNode *node) {
-  RS_LOG_ASSERT(node->type == QN_NUMERIC, "query node type should be numeric")
-
-  const FieldSpec *fs = node->nn.nf->fieldSpec;
-  if (q->sctx->spec->diskSpec) {
-    return SearchDisk_NewNumericIterator(q->sctx->spec->diskSpec, node->nn.nf, fs->index, q->status);
-  }
-  FieldFilterContext filterCtx = {.field = {.index_tag = FieldMaskOrIndex_Index, .index = fs->index}, .predicate = FIELD_EXPIRATION_PREDICATE_DEFAULT};
-  return NewNumericFilterIterator(q->sctx, node->nn.nf, INDEXFLD_T_NUMERIC, q->config, &filterCtx);
 }
 
 static QueryIterator *Query_EvalGeofilterNode(QueryEvalCtx *q, QueryNode *node,
@@ -1080,7 +1017,7 @@ static QueryIterator *Query_EvalVectorNode(QueryEvalCtx *q, QueryNode *qn) {
   QueryIterator *child_it = NULL;
   if (QueryNode_NumChildren(qn) > 0) {
     RS_ASSERT(QueryNode_NumChildren(qn) == 1);
-    child_it = Query_EvalNode(q, qn->children[0]);
+    child_it = Query_EvalNode_Rs(q, qn->children[0]);
     // If child iterator is in valid or empty, the hybrid iterator is empty as well.
     if (child_it == NULL) {
       return NULL;
@@ -1090,7 +1027,9 @@ static QueryIterator *Query_EvalVectorNode(QueryEvalCtx *q, QueryNode *qn) {
   // If iterator was created successfully, and we have a metric to yield, update the
   // Only create MetricRequest entries for iterators that actually yield metrics
   if (it && qn->vn.vq->scoreField &&
-      (it->type == HYBRID_ITERATOR || it->type == METRIC_SORTED_BY_ID_ITERATOR || it->type == METRIC_SORTED_BY_SCORE_ITERATOR)) {
+      (it->type == HYBRID_ITERATOR || it->type == METRIC_SORTED_BY_ID_ITERATOR ||
+       it->type == METRIC_SORTED_BY_SCORE_ITERATOR || it->type == METRIC_LAZY_SORTED_BY_ID_ITERATOR ||
+       it->type == METRIC_LAZY_SORTED_BY_SCORE_ITERATOR)) {
     MetricRequest *request = array_ensure_at(q->metricRequestsP, idx, MetricRequest);
 
     // Create a handle that points to the iterator's ownKey field
@@ -1112,73 +1051,6 @@ static QueryIterator *Query_EvalVectorNode(QueryEvalCtx *q, QueryNode *qn) {
     child_it->Free(child_it);
   }
   return it;
-}
-
-static int cmp_docids(const void *p1, const void *p2) {
-  const t_docId *d1 = p1, *d2 = p2;
-  return (int)(*d1 - *d2);
-}
-
-static inline size_t deduplicateDocIdsFrom(t_docId *ids, size_t num, size_t start) {
-  size_t j = start - 1;
-  for (size_t i = start + 1; i < num; ++i) {
-    if (ids[i] != ids[j]) {
-      ids[++j] = ids[i];
-    }
-  }
-  return j + 1;
-}
-
-static inline size_t deduplicateDocIds(t_docId *ids, size_t num) {
-  for (size_t i = 1; i < num; ++i) {
-    if (ids[i] == ids[i - 1]) {
-      return deduplicateDocIdsFrom(ids, num, i);
-    }
-  }
-  return num;
-}
-
-static QueryIterator *Query_EvalIdFilterNode(QueryEvalCtx *q, QueryIdFilterNode *node) {
-  size_t num = 0;
-  t_docId* it_ids = rm_malloc(sizeof(*it_ids) * node->len);
-  for (size_t ii = 0; ii < node->len; ++ii) {
-    t_docId did = 0;
-    if (node->docIds) {
-      RS_ASSERT(SearchDisk_IsEnabled());
-      did = node->docIds[ii];
-    } else {
-      did = DocTable_GetId(&q->sctx->spec->docs, node->keys[ii], sdslen(node->keys[ii]));
-    }
-    if (did) {
-      it_ids[num++] = did;
-    }
-  }
-  if (num) {
-    qsort(it_ids, num, sizeof(t_docId), cmp_docids);
-    num = deduplicateDocIds(it_ids, num);
-  }
-  // Passing the ownership of the ids to the iterator.
-  return NewSortedIdListIterator(it_ids, num, 1);
-}
-
-static QueryIterator *Query_EvalUnionNode(QueryEvalCtx *q, QueryNode *qn) {
-  RS_LOG_ASSERT(qn->type == QN_UNION, "query node type should be union")
-  // Parsers and expanders always create unions with 2+ children.
-  RS_ASSERT(QueryNode_NumChildren(qn) > 1);
-
-  // recursively eval the children
-  QueryIterator **iters = rm_malloc(QueryNode_NumChildren(qn) * sizeof(QueryIterator *));
-  for (size_t i = 0; i < QueryNode_NumChildren(qn); ++i) {
-    qn->children[i]->opts.fieldMask &= qn->opts.fieldMask;
-    iters[i] = Query_EvalNode(q, qn->children[i]);
-  }
-
-  // We want to get results with all the matching children (`quickExit == false`), unless:
-  // 1. We are a `Not` sub-tree, so we only care about the set of IDs
-  // 2. The node's weight is 0, which means the sub-tree is not relevant for scoring.
-  bool quickExit = q->notSubtree || qn->opts.weight == 0;
-  QueryIterator *ret = NewUnionIterator(iters, QueryNode_NumChildren(qn), quickExit, qn->opts.weight, QN_UNION, NULL, q->config);
-  return ret;
 }
 
 /**
@@ -1229,12 +1101,7 @@ void tag_strtolower(char **pstr, size_t *len, int caseSensitive) {
 
 static QueryIterator *Query_EvalTagLexRangeNode(QueryEvalCtx *q, TagIndex *idx, QueryNode *qn,
                                                 double weight, bool caseSensitive) {
-  TrieMap *t = idx->values;
   TrieCallbackCtx ctx = {.q = q, .opts = &qn->opts, .weight = weight, .tagIdx = idx};
-
-  if (!t) {
-    return NULL;
-  }
 
   if(qn->lxrng.begin) {
     size_t beginLen = strlen(qn->lxrng.begin);
@@ -1252,8 +1119,8 @@ static QueryIterator *Query_EvalTagLexRangeNode(QueryEvalCtx *q, TagIndex *idx, 
   const char *begin = qn->lxrng.begin, *end = qn->lxrng.end;
   int nbegin = begin ? strlen(begin) : -1, nend = end ? strlen(end) : -1;
 
-  TrieMap_IterateRange(t, begin, nbegin, qn->lxrng.includeBegin, end, nend, qn->lxrng.includeEnd,
-                       tagRangeIterCb, &ctx);
+  TagIndex_IterateRangeValues(idx, begin, nbegin, qn->lxrng.includeBegin, end, nend,
+                              qn->lxrng.includeEnd, tagRangeIterCb, &ctx);
 
   return NewUnionIterator(ctx.its, ctx.nits, true, qn->opts.weight, QN_LEXRANGE, NULL, q->config);
 }
@@ -1272,21 +1139,21 @@ static QueryIterator *Query_EvalTagPrefixNode(QueryEvalCtx *q, TagIndex *idx, Qu
   if (tok->len < q->config->minTermPrefix) {
     return NULL;
   }
-  if (!idx || !idx->values) return NULL;
+  if (!idx) return NULL;
 
   size_t itsSz = 0, itsCap = 8;
   QueryIterator **its = rm_calloc(itsCap, sizeof(*its));
 
   if (!qn->pfx.suffix || !withSuffixTrie) {    // prefix query or no suffix triemap, use bruteforce
-    tm_iter_mode iter_mode = TM_PREFIX_MODE;
+    tag_iter_mode iter_mode = TAG_PREFIX_MODE;
     if (qn->pfx.suffix) {
       if (qn->pfx.prefix) { // contains mode
-        iter_mode = TM_CONTAINS_MODE;
+        iter_mode = TAG_CONTAINS_MODE;
       } else {
-        iter_mode = TM_SUFFIX_MODE;
+        iter_mode = TAG_SUFFIX_MODE;
       }
     }
-    TrieMapIterator *it = TrieMap_IterateWithFilter(idx->values, tok->str, tok->len, iter_mode);
+    TrieMapIterator *it = TagIndex_IterateValuesWithFilter(idx, tok->str, tok->len, iter_mode);
     // TrieMap_IterateWithFilter only returns NULL on allocation failure
     RS_ASSERT(it);
     if (!q->sctx->time.skipTimeoutChecks) {
@@ -1318,9 +1185,10 @@ static QueryIterator *Query_EvalTagPrefixNode(QueryEvalCtx *q, TagIndex *idx, Qu
     }
 
     TrieMapIterator_Free(it);
-  } else {    // TAG field has suffix triemap
-    arrayof(char**) arr = GetList_SuffixTrieMap(idx->suffix, tok->str, tok->len,
-                                                qn->pfx.prefix, q->sctx->time.timeout, q->sctx->time.skipTimeoutChecks);
+  } else {  // TAG field has suffix triemap
+    arrayof(char **) arr =
+        TagIndex_GetSuffixMatches(idx, tok->str, tok->len, qn->pfx.prefix, q->sctx->time.timeout,
+                               q->sctx->time.skipTimeoutChecks);
     if (!arr) {
       rm_free(its);
       return NULL;
@@ -1355,7 +1223,7 @@ static QueryIterator *Query_EvalTagWildcardNode(QueryEvalCtx *q, TagIndex *idx,
                      QueryNode *qn, double weight,
                      t_fieldIndex fieldIndex, bool caseSensitive) {
   RS_ASSERT(qn->type == QN_WILDCARD_QUERY);
-  if (!idx || !idx->values) return NULL;
+  if (!idx) return NULL;
 
   RSToken *tok = &qn->verb.tok;
 
@@ -1367,10 +1235,11 @@ static QueryIterator *Query_EvalTagWildcardNode(QueryEvalCtx *q, TagIndex *idx,
   QueryIterator **its = rm_malloc(itsCap * sizeof(*its));
 
   bool fallbackBruteForce = false;
-  if (idx->suffix) {
+  if (TagIndex_HasSuffix(idx)) {
     // with suffix
-    arrayof(char*) arr = GetList_SuffixTrieMap_Wildcard(idx->suffix, tok->str, tok->len,
-                                                        q->sctx->time.timeout, q->config->maxPrefixExpansions, q->sctx->time.skipTimeoutChecks);
+    arrayof(char *) arr = TagIndex_GetSuffixWildcardMatches(
+        idx, tok->str, tok->len, q->sctx->time.timeout, q->config->maxPrefixExpansions,
+        q->sctx->time.skipTimeoutChecks);
     if (!arr) {
       // No matching terms
       rm_free(its);
@@ -1398,9 +1267,10 @@ static QueryIterator *Query_EvalTagWildcardNode(QueryEvalCtx *q, TagIndex *idx,
     }
   }
 
-  if (!idx->suffix || fallbackBruteForce) {
+  if (!TagIndex_HasSuffix(idx) || fallbackBruteForce) {
     // brute force wildcard query
-    TrieMapIterator *it = TrieMap_IterateWithFilter(idx->values, tok->str, tok->len, TM_WILDCARD_MODE);
+    TrieMapIterator *it =
+        TagIndex_IterateValuesWithFilter(idx, tok->str, tok->len, TAG_WILDCARD_MODE);
     if (!q->sctx->time.skipTimeoutChecks) {
       TrieMapIterator_SetTimeout(it, q->sctx->time.timeout);
     }
@@ -1511,64 +1381,41 @@ static QueryIterator *Query_EvalTagNode(QueryEvalCtx *q, QueryNode *qn) {
   // We want to get results with all the matching children (`quickExit == false`), unless:
   // 1. We are a `Not` sub-tree, so we only care about the set of IDs
   // 2. The node's weight is 0, which means the sub-tree is not relevant for scoring.
-  bool quickExit = q->notSubtree || qn->opts.weight == 0;
+  bool quickExit = q->inNotSubTree || qn->opts.weight == 0;
   return NewUnionIterator(iters, QueryNode_NumChildren(qn), quickExit, qn->opts.weight, QN_TAG, NULL, q->config);
-}
-
-static QueryIterator *Query_EvalMissingNode(QueryEvalCtx *q, QueryNode *qn) {
-  RS_LOG_ASSERT(qn->type == QN_MISSING, "query qn type should be missing")
-  const FieldSpec *fs = qn->miss.field;
-
-  // Get the InvertedIndex corresponding to the queried field.
-  InvertedIndex *missingII = dictFetchValue(q->sctx->spec->missingFieldDict, fs->fieldName);
-
-  if (!missingII) {
-    // There are no missing values for this field.
-    return NULL;
-  }
-
-  // Create an iterator for the missing values InvertedIndex.
-  return NewInvIndIterator_MissingQuery(missingII, q->sctx, fs->index);
 }
 
 QueryIterator *Query_EvalNode(QueryEvalCtx *q, QueryNode *n) {
   switch (n->type) {
+    case QN_IDS:
+    case QN_WILDCARD:
+    case QN_NULL:
+    case QN_MISSING:
+    case QN_OPTIONAL:
+    case QN_NOT:
+    case QN_PHRASE:
+    case QN_UNION:
+    case QN_NUMERIC:
+      // These node types have been ported to Rust.
+      return Query_EvalNode_Rs(q, n);
     case QN_TOKEN:
       return Query_EvalTokenNode(q, n);
-    case QN_PHRASE:
-      return Query_EvalPhraseNode(q, n);
-    case QN_UNION:
-      return Query_EvalUnionNode(q, n);
     case QN_TAG:
       return Query_EvalTagNode(q, n);
-    case QN_NOT:
-      return Query_EvalNotNode(q, n);
     case QN_PREFIX:
       return Query_EvalPrefixNode(q, n);
     case QN_LEXRANGE:
       return Query_EvalLexRangeNode(q, n);
     case QN_FUZZY:
       return Query_EvalFuzzyNode(q, n);
-    case QN_NUMERIC:
-      return Query_EvalNumericNode(q, n);
-    case QN_OPTIONAL:
-      return Query_EvalOptionalNode(q, n);
     case QN_GEO:
       return Query_EvalGeofilterNode(q, n, n->opts.weight);
     case QN_VECTOR:
       return Query_EvalVectorNode(q, n);
-    case QN_IDS:
-      return Query_EvalIdFilterNode(q, &n->fn);
-    case QN_WILDCARD:
-      return Query_EvalWildcardNode(q, n);
     case QN_WILDCARD_QUERY:
       return Query_EvalWildcardQueryNode(q,n);
     case QN_GEOMETRY:
       return Query_EvalGeometryNode(q, n);
-    case QN_NULL:
-      return NewEmptyIterator();
-    case QN_MISSING:
-      return Query_EvalMissingNode(q, n);
     case QN_MAX: // LCOV_EXCL_LINE — exhaustive switch: all valid QN types handled above
       RS_ABORT("Invalid query node type"); // LCOV_EXCL_LINE
   }
@@ -1615,27 +1462,6 @@ int QAST_Parse(QueryAST *dst, const RedisSearchCtx *sctx, const RSSearchOptions 
   dst->numTokens = qpCtx.numTokens;
   dst->numParams = qpCtx.numParams;
   return REDISMODULE_OK;
-}
-
-QueryIterator *QAST_Iterate(QueryAST *qast, const RSSearchOptions *opts, RedisSearchCtx *sctx,
-                            uint32_t reqflags, struct AREQ *areq, QueryError *status) {
-  QueryEvalCtx qectx = {
-      .opts = opts,
-      .docTable = &sctx->spec->docs,
-      .sctx = sctx,
-      .status = status,
-      .metricRequestsP = &qast->metricRequests,
-      .reqFlags = reqflags,
-      .config = &qast->config,
-      .notSubtree = false,
-      .bcTimeoutAreq = AREQ_TimeoutAreqOrNull(areq),
-  };
-  QueryIterator *root = Query_EvalNode(&qectx, qast->root);
-  if (!root) {
-    // Return the dummy iterator
-    root = NewEmptyIterator();
-  }
-  return root;
 }
 
 void QAST_Destroy(QueryAST *q) {
