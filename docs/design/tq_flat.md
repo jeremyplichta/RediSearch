@@ -7,17 +7,30 @@
 > maintainer review. Users cannot create a TQ flat index; the only user-facing TQ
 > surface is `HNSW ... COMPRESSION TQ8|TQ4|TQ2` (see [tq_hnsw.md](tq_hnsw.md)).
 
-The TQ flat backend (`VecSimAlgo_TQ`) is an exact flat vector index inside the vendored
-VecSim TurboQuant-style compressed scan implementation. It remains in the codebase as a
-building block: it serves as the compressed brute-force component of the tiered
+The TQ flat backend (`VecSimAlgo_TQ`) is an exhaustive-scan vector index inside the
+vendored VecSim TurboQuant-style compressed implementation. It remains in the codebase
+as a building block: it serves as the compressed brute-force component of the tiered
 TQ-HNSW composition (tiered frontend role) and is exercised directly by VecSim-level
-tests and benchmarks.
+tests and benchmarks. The scan is exhaustive, but its scores are approximate because
+stored vectors are compressed.
 
 Engine behavior is unchanged by the API rework:
 
 - each inserted vector is rotated and quantized once at insertion time
 - queries scan every entry using the TQ distance kernels (asymmetric by default)
 - VecSim owns the internal preprocessing and compressed storage
+
+For an even dimension `d`, the current storage representation contains:
+
+- `d / 2` FP32 radii, one for each pair of rotated coordinates
+- two FP32 norm values
+- a quantized polar-angle code for each coordinate pair
+- one packed sign bit for each of `d / 2` residual projections
+
+The compression name controls the polar resolution: TQ2, TQ4, and TQ8 use 1, 3,
+and 7 polar bits respectively. TQ2 and TQ4 both use the current nibble-packed angle
+layout, so they have the same byte footprint; TQ2 trades angle resolution for no
+additional storage saving in this implementation.
 
 ## Internal Parameters
 
@@ -35,6 +48,7 @@ and are now fixed internal defaults:
 ## Current Constraints
 
 - `FLOAT32` only
+- even vector dimensions only
 - single-value vectors only
 - not available on disk-backed indexes (the owning `COMPRESSION` argument is rejected
   there at parse time)
@@ -50,6 +64,10 @@ frontend buffer are merged with the TQ-HNSW backend results, exactly as for plai
 `HNSW`. Query vectors stay raw FP32; the index handles its own preprocessing
 internally.
 
+For cosine fields, storage and query vectors are normalized before estimation and the
+reported distance is `1 - estimated_inner_product`. This keeps yielded distances and
+`VECTOR_RANGE` radii on the standard approximate cosine-distance scale.
+
 ## Introspection
 
 There is no user-visible TQ-flat introspection:
@@ -62,8 +80,10 @@ There is no user-visible TQ-flat introspection:
 ## Persistence
 
 There is no standalone TQ RDB branch anymore; the backend's state is persisted as
-part of the tiered-`TQ_HNSW` v4 branch (see [tq_hnsw.md](tq_hnsw.md)). Older encoding
-versions do not understand the new algorithm enum and fail closed.
+part of the tiered-`TQ_HNSW` branch in `VecSim_RdbLoad_v4` (see
+[tq_hnsw.md](tq_hnsw.md)). RediSearch encoding version 28 marks introduction of this
+layout. Older builds reject version-28 files; the new loader continues to accept
+older non-TQ files.
 
 ## Testing Focus
 

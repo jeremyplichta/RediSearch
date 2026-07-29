@@ -116,54 +116,126 @@ def test_tq_knn_and_range_query():
     env.assertEqual(knn[3], "doc:2")
     env.assertEqual(knn[5], "doc:3")
 
-    # The TQ cosine kernels score on an angle-based scale rather than 1-cos, so absolute
-    # VECTOR_RANGE radii are not directly comparable to exact cosine distances. Use a radius
-    # that covers all docs and assert mechanics + ordering only.
+    # TQ cosine results use the standard approximate 1-cosine distance scale. A 0.5 radius
+    # includes the aligned vector and excludes the orthogonal and opposite vectors.
     range_res = env.cmd(
-        "FT.SEARCH", "idx_tq_knn", "@v:[VECTOR_RANGE 10 $blob]=>{$yield_distance_as: dist}",
+        "FT.SEARCH", "idx_tq_knn", "@v:[VECTOR_RANGE 0.5 $blob]=>{$yield_distance_as: dist}",
         "PARAMS", "2", "blob", query,
         "SORTBY", "dist",
         "RETURN", "1", "dist",
         "DIALECT", "2",
     )
-    env.assertEqual(range_res[0], 3)
+    env.assertEqual(range_res[0], 1)
     env.assertEqual(range_res[1], "doc:1")
-    env.assertEqual(range_res[3], "doc:2")
-    env.assertEqual(range_res[5], "doc:3")
     conn.execute_command("FT.DROPINDEX", "idx_tq_knn", "DD")
 
 
-def test_tq4_compression():
+def test_tq_compression_variants():
     env = Env(moduleArgs="DEFAULT_DIALECT 2")
     conn = getConnectionByEnv(env)
-
-    params = _tq_schema_params(dim=8, compression="TQ4")
-    conn.flushall()
-    env.expect("FT.CREATE", "idx_tq4", "SCHEMA", "v", "VECTOR", "HNSW", len(params), *params).ok()
-    waitForIndex(env, "idx_tq4")
-
-    info = to_dict(env.executeCommand("FT.INFO", "idx_tq4"))
-    attr = to_dict(info["attributes"][0])
-    env.assertEqual(attr["compression"], "TQ4")
 
     base = np.zeros(8, dtype=np.float32)
     base[0] = 1.0
     other = np.zeros(8, dtype=np.float32)
     other[1] = 1.0
-    conn.execute_command("HSET", "doc:1", "v", base.tobytes())
-    conn.execute_command("HSET", "doc:2", "v", other.tobytes())
-    waitForIndex(env, "idx_tq4")
+
+    for compression in ("TQ2", "TQ4", "TQ8"):
+        index_name = f"idx_{compression.lower()}"
+        params = _tq_schema_params(dim=8, compression=compression)
+        conn.flushall()
+        env.expect("FT.CREATE", index_name, "SCHEMA", "v", "VECTOR", "HNSW",
+                   len(params), *params).ok()
+        waitForIndex(env, index_name)
+
+        info = to_dict(env.executeCommand("FT.INFO", index_name))
+        attr = to_dict(info["attributes"][0])
+        env.assertEqual(attr["compression"], compression)
+
+        conn.execute_command("HSET", "doc:1", "v", base.tobytes())
+        conn.execute_command("HSET", "doc:2", "v", other.tobytes())
+        waitForIndex(env, index_name)
+
+        res = env.cmd(
+            "FT.SEARCH", index_name, "*=>[KNN 2 @v $blob AS dist]",
+            "PARAMS", "2", "blob", base.tobytes(),
+            "SORTBY", "dist",
+            "RETURN", "1", "dist",
+            "DIALECT", "2",
+        )
+        env.assertEqual(res[0], 2)
+        env.assertEqual(res[1], "doc:1")
+        conn.execute_command("FT.DROPINDEX", index_name, "DD")
+
+
+def test_tq_inner_product_query():
+    env = Env(moduleArgs="DEFAULT_DIALECT 2")
+    conn = getConnectionByEnv(env)
+
+    params = _tq_schema_params(dim=8, metric="IP")
+    conn.flushall()
+    env.expect("FT.CREATE", "idx_tq_ip", "SCHEMA", "v", "VECTOR", "HNSW",
+               len(params), *params).ok()
+    waitForIndex(env, "idx_tq_ip")
+
+    query = np.zeros(8, dtype=np.float32)
+    query[0] = 1.0
+    aligned = query.copy()
+    aligned[0] = 2.0
+    orthogonal = np.zeros(8, dtype=np.float32)
+    orthogonal[1] = 1.0
+    opposite = -query
+
+    conn.execute_command("HSET", "doc:aligned", "v", aligned.tobytes())
+    conn.execute_command("HSET", "doc:orthogonal", "v", orthogonal.tobytes())
+    conn.execute_command("HSET", "doc:opposite", "v", opposite.tobytes())
+    waitForIndex(env, "idx_tq_ip")
 
     res = env.cmd(
-        "FT.SEARCH", "idx_tq4", "*=>[KNN 2 @v $blob AS dist]",
-        "PARAMS", "2", "blob", base.tobytes(),
+        "FT.SEARCH", "idx_tq_ip", "*=>[KNN 3 @v $blob AS dist]",
+        "PARAMS", "2", "blob", query.tobytes(),
         "SORTBY", "dist",
         "RETURN", "1", "dist",
         "DIALECT", "2",
     )
-    env.assertEqual(res[0], 2)
-    env.assertEqual(res[1], "doc:1")
-    conn.execute_command("FT.DROPINDEX", "idx_tq4", "DD")
+    env.assertEqual(res[0], 3)
+    env.assertEqual(res[1], "doc:aligned")
+    env.assertEqual(res[3], "doc:orthogonal")
+    env.assertEqual(res[5], "doc:opposite")
+    conn.execute_command("FT.DROPINDEX", "idx_tq_ip", "DD")
+
+
+@skip(cluster=True)
+def test_tq_rdb_round_trip():
+    env = Env(moduleArgs="DEFAULT_DIALECT 2")
+    conn = getConnectionByEnv(env)
+
+    params = _tq_hnsw_schema_params(dim=8, compression="TQ8")
+    conn.flushall()
+    env.expect("FT.CREATE", "idx_tq_rdb", "SCHEMA", "v", "VECTOR", "HNSW",
+               len(params), *params).ok()
+
+    query = np.zeros(8, dtype=np.float32)
+    query[0] = 1.0
+    orthogonal = np.zeros(8, dtype=np.float32)
+    orthogonal[1] = 1.0
+    conn.execute_command("HSET", "doc:1", "v", query.tobytes())
+    conn.execute_command("HSET", "doc:2", "v", orthogonal.tobytes())
+    waitForIndex(env, "idx_tq_rdb")
+
+    for _ in env.reloadingIterator():
+        info = to_dict(env.executeCommand("FT.INFO", "idx_tq_rdb"))
+        attr = to_dict(info["attributes"][0])
+        env.assertEqual(attr["compression"], "TQ8")
+
+        res = env.cmd(
+            "FT.SEARCH", "idx_tq_rdb", "*=>[KNN 2 @v $blob AS dist]",
+            "PARAMS", "2", "blob", query.tobytes(),
+            "SORTBY", "dist",
+            "RETURN", "1", "dist",
+            "DIALECT", "2",
+        )
+        env.assertEqual(res[0], 2)
+        env.assertEqual(res[1], "doc:1")
 
 
 def test_tq_rejects_non_float32():
@@ -189,6 +261,17 @@ def test_tq_rejects_l2_metric():
     conn.flushall()
     env.expect("FT.CREATE", "idx_tq_l2", "SCHEMA", "v", "VECTOR", "HNSW", len(params), *params) \
         .error().contains("TQ compression with DISTANCE_METRIC L2 is not yet supported; use COSINE or IP")
+
+
+def test_tq_rejects_odd_dimensions():
+    env = Env(moduleArgs="DEFAULT_DIALECT 2")
+    conn = getConnectionByEnv(env)
+
+    params = _tq_schema_params(dim=3)
+    conn.flushall()
+    env.expect("FT.CREATE", "idx_tq_odd_dim", "SCHEMA", "v", "VECTOR", "HNSW",
+               len(params), *params) \
+        .error().contains("TQ compression requires an even vector dimension")
 
 
 def test_tq_rejects_unknown_compression():

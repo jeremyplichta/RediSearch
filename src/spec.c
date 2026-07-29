@@ -653,6 +653,11 @@ static int parseVectorField_validate_tq_hnsw(VecSimParams *params, QueryError *s
                         "TQ compression does not support multi-value vectors");
     return 0;
   }
+  if (params->algoParams.tqHnswParams.dim % 2 != 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression requires an even vector dimension");
+    return 0;
+  }
 
   size_t elementSize = VecSimIndex_EstimateElementSize(params);
   size_t maxBlockSize = BLOCK_MEMORY_LIMIT / elementSize;

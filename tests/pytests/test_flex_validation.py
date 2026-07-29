@@ -24,6 +24,24 @@ def with_simulate_in_flex(enabled, module_args='', no_default_module_args=False)
 
 @skip(cluster=True)
 @with_simulate_in_flex(True)
+def test_tq_compression_rejected_for_disk_indexes(env):
+    params = [
+        'TYPE', 'FLOAT32',
+        'DIM', 8,
+        'DISTANCE_METRIC', 'COSINE',
+        'COMPRESSION', 'TQ8',
+        'M', 16,
+        'EF_CONSTRUCTION', 200,
+        'EF_RUNTIME', 50,
+        'RERANK', 'FALSE',
+    ]
+    env.expect('FT.CREATE', 'idx_tq_disk', 'SCHEMA', 'v', 'VECTOR', 'HNSW',
+               len(params), *params) \
+        .error().contains('Disk index does not support COMPRESSION')
+
+
+@skip(cluster=True)
+@with_simulate_in_flex(True)
 def test_flex_max_index_limit(env):
     """Test that creating more than 10 indices fails when search-_simulate-in-flex is true"""
     # Create 10 indices successfully (the maximum allowed)

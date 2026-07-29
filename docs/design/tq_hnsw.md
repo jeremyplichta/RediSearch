@@ -60,6 +60,16 @@ they were deliberately removed from the API per review. Internally they are fixe
 - seed: `7`
 - rotation: always on
 
+The stored representation applies a full-dimensional orthogonal rotation, groups the
+rotated coordinates into pairs, and stores an FP32 radius plus a quantized polar angle
+per pair. It also stores two FP32 norms and packed signs from `DIM / 2` QJL projections
+of the reconstruction residual. The projection count controls the residual sketch; it
+does not reduce the rotation dimension.
+
+TQ2, TQ4, and TQ8 use 1, 3, and 7 polar bits respectively. TQ2 and TQ4 both use the
+current nibble-packed angle layout, so they have the same byte footprint in this
+implementation; TQ2 has lower angular resolution without an additional memory saving.
+
 `BLOCK_SIZE` / `INITIAL_CAP` are deprecated args and not part of the TQ surface
 (block size is fixed at 1024 vectors per block internally).
 
@@ -76,6 +86,7 @@ The initial RediSearch integration intentionally keeps the surface narrow. All a
 parse-time validation errors:
 
 - `TYPE FLOAT32` only — `"TQ compression only supports FLOAT32 vectors"`
+- even vector dimensions only — `"TQ compression requires an even vector dimension"`
 - `COSINE` / `IP` only — `"TQ compression with DISTANCE_METRIC L2 is not yet
   supported; use COSINE or IP"`
 - single-value vectors only — `"TQ compression does not support multi-value vectors"`
@@ -102,7 +113,10 @@ Range query example:
 FT.SEARCH idx "@vec:[VECTOR_RANGE 0.2 $blob]=>{$yield_distance_as: dist}" PARAMS 2 blob <raw-f32-bytes> SORTBY dist DIALECT 2
 ```
 
-The query vector stays raw. The index handles its own preprocessing internally.
+The query vector stays raw. The index handles its own preprocessing internally. For
+cosine fields, both stored and query vectors are normalized and yielded distances are
+`1 - estimated_inner_product`, so `VECTOR_RANGE` uses the standard approximate
+cosine-distance scale.
 
 ## Introspection
 
@@ -126,12 +140,13 @@ is no dedicated TQ counter (a compressed-HNSW counter is a possible follow-up).
 ## Persistence
 
 TQ-compressed HNSW is supported by the current RDB save/load path via a single
-tiered-`TQ_HNSW` v4 branch, which saves `swapJobThreshold` then type, dim, metric,
+tiered-`TQ_HNSW` branch in `VecSim_RdbLoad_v4`, which saves `swapJobThreshold` then type, dim, metric,
 multi, bits, projections, seed, useRotation, `M`, `efConstruction`, `efRuntime`,
 `epsilon`.
 
-Older encoding versions do not understand the new algorithm enum and are expected to
-reject it rather than load partially valid state.
+RediSearch encoding version 28 marks introduction of this layout. Older builds reject
+version-28 files rather than partially loading an unknown algorithm; the new loader
+continues to load older non-TQ files.
 
 ## Testing Focus
 

@@ -3,7 +3,7 @@
 | **PRD**             | TBD                                                            |
 | ------------------- | -------------------------------------------------------------- |
 | **Document owner**  | Jeremy Plichta                                                 |
-| **Document status** | DRAFT v0.5 (review feedback incorporated, re-review requested) |
+| **Document status** | DRAFT v0.6 (correctness cleanup; compressed-SVS benchmark outstanding) |
 | **RediSearch branch** | [jeremyplichta/RediSearch @ feat/tq-vector-quantization](https://github.com/jeremyplichta/RediSearch/tree/feat/tq-vector-quantization) |
 | **VecSim branch**   | [jeremyplichta/VectorSimilarity @ feat/tq-vector-quantization](https://github.com/jeremyplichta/VectorSimilarity/tree/feat/tq-vector-quantization) |
 
@@ -14,6 +14,7 @@
 | 3   | 0.3     | 2026-05-13    | Link file references to the GitHub fork branch; surface branch links in the header |
 | 4   | 0.4     | 2026-06-11    | API reworked per review: TQ exposed via HNSW `COMPRESSION` argument (`TQ2`/`TQ4`/`TQ8`); standalone `TQ-FLAT`/`TQ-HNSW` algorithm names and `BITS`/`PROJECTIONS`/`SEED`/`ROTATION` knobs removed |
 | 5   | 0.5     | 2026-07-08    | Synced with branch state after merging latest master (twice); suites green (C 742+130, Python 2139/2140 — remaining failure is a local-env TLS port conflict, unrelated to TQ; VecSim TQ 14, bench harness 16); added Risk 9 (cosine distance scale) |
+| 6   | 0.6     | 2026-07-28    | Corrected the algorithm and storage description, advanced the RDB encoding version to 28, added even-dimension validation and TQ2/IP/disk/cosine-scale coverage, removed the incorrect cosine-scale risk, and made the compressed-SVS comparison an explicit sign-off gate |
 
 ## Table of Contents
 
@@ -34,7 +35,7 @@
 
 #### 1.1 Purpose
 
-Add TurboQuant (TQ) vector compression to RediSearch's `HNSW` vector index, exposed through the existing `COMPRESSION` argument on `FT.CREATE` (`COMPRESSION TQ8|TQ4|TQ2`) — mirroring how `SVS-VAMANA` exposes its LVQ / LeanVec compression. TurboQuant is a quantization technique published by Google Research that combines a random orthogonal rotation with per-component scalar quantization. Together they produce a compact, SIMD-friendly representation of high-dimensional vectors with near-lossless recall at typical embedding dimensions (≥ 512), and bring meaningful memory and bandwidth savings compared to FP32 storage.
+Add TurboQuant (TQ) vector compression to RediSearch's `HNSW` vector index, exposed through the existing `COMPRESSION` argument on `FT.CREATE` (`COMPRESSION TQ8|TQ4|TQ2`) — mirroring how `SVS-VAMANA` exposes its LVQ / LeanVec compression. The implementation combines a random orthogonal rotation, pairwise polar quantization, and a sign-only QJL sketch of the reconstruction residual. Together they produce a compact, SIMD-friendly representation of high-dimensional vectors and bring meaningful memory and bandwidth savings compared to FP32 storage.
 
 > **API note (v0.4).** Per maintainer review on Confluence, TQ is **no longer exposed as standalone algorithms** `TQ-FLAT` / `TQ-HNSW` on `FT.CREATE`. The user-facing surface is `HNSW ... COMPRESSION TQ<bits>`. The TQ flat backend still exists inside VecSim as the tiered frontend / building block, but it is not user-creatable. The internal enums (`VecSimAlgo_TQ`, `VecSimAlgo_TQ_HNSW`) and the tiered wrapping are unchanged.
 
@@ -58,7 +59,7 @@ This adds a new family of compression options to RediSearch's existing vector in
 
 #### 1.4 Target version
 
-8.x (target TBD after review).
+Redis 8.12.
 
 ---
 
@@ -84,12 +85,15 @@ This adds a new family of compression options to RediSearch's existing vector in
 
 #### 3.1 TurboQuant Approach (recap)
 
-TurboQuant compresses a `d`-dimensional FP32 vector to a much smaller byte representation in two stages:
+TurboQuant compresses an even-dimensional FP32 vector in three steps:
 
-1. **Random orthogonal rotation** onto a subspace of `projections` components (fixed internally at `max(1, DIM / 2)`). The rotation is a fixed random orthogonal matrix derived from an internal seed (7). The rotation step spreads the energy of any input vector approximately uniformly across the projected components, which makes scalar quantization much more accurate (Lloyd-Max-style assumptions hold better on a rotated vector than on the raw one). Disabling rotation remains possible VecSim-side for diagnostics and parity testing, but it is not exposed to users (rotation is always ON in production).
-2. **Per-component scalar quantization** of the rotated vector to a per-component bit budget taken from the compression name — 8 for `TQ8` (recommended default), 4 for `TQ4`, 2 for `TQ2`. The decode parameters (min, delta, plus a small amount of per-vector summary metadata) are stored alongside the codes.
+1. **Full-dimensional random orthogonal rotation.** A deterministic `d × d` matrix derived from the internal seed (7) spreads vector energy across all `d` coordinates. The `projections` parameter does not reduce the rotation dimension.
+2. **Pairwise polar quantization.** Rotated coordinates are grouped into `d / 2` pairs. Each pair stores an FP32 radius and a quantized polar angle. The compression names provide 1, 3, and 7 polar bits for TQ2, TQ4, and TQ8 respectively.
+3. **Residual sketch.** The polar code is reconstructed, the reconstruction residual is projected through `max(1, d / 2)` QJL rows, and only the projection signs are packed into the stored vector.
 
-Distance computation is **asymmetric** by default: at query time the query vector is rotated and stored in a query blob along with FP32 summary metadata, while index candidates remain in their compact code form. This avoids the recall penalty of round-tripping the query through quantization. For graph construction inside `TQ-HNSW`, where every neighbor candidate is already quantized, a **symmetric** code-vs-code distance path is used; for `L2` it is corrected to be unbiased using a stored full-vector norm. A separate **compact-angle / polar** SIMD path is used for cosine/IP scoring on NEON.
+Each stored vector therefore contains the FP32 radii, two FP32 norms, packed angle codes, and packed residual signs. TQ2 and TQ4 both use the current nibble-packed angle layout, so they have the same byte footprint; TQ2 lowers angular resolution without an additional memory saving in this implementation.
+
+Distance computation is **asymmetric** by default: at query time the raw query is normalized for cosine, rotated, and transformed into a transient lookup blob, while index candidates remain in their compressed form. The estimated inner product combines the polar and residual-sketch terms. Cosine distance is reported as `1 - estimated_inner_product`, preserving the standard approximate cosine-distance scale for yielded scores and `VECTOR_RANGE`. For graph construction inside `TQ-HNSW`, where every neighbor candidate is already quantized, a **symmetric** code-vs-code path is used.
 
 For full mathematical details of TurboQuant see the Google Research blog post and the VectorSimilarity-side design doc [TQ VecSim design](https://github.com/RedisAI/VectorSimilarity) (commit range listed in §10).
 
@@ -99,7 +103,7 @@ Two new VecSim algorithm enums are introduced. Neither is a user-facing algorith
 
 | Algorithm enum         | User-facing surface | Index family | Tiered? |
 | ---------------------- | ------------------- | ------------ | ------- |
-| `VecSimAlgo_TQ`        | none — internal flat backend, used as the tiered frontend / building block | exact / BF   | No      |
+| `VecSimAlgo_TQ`        | none — internal flat backend, used as the tiered frontend / building block | exhaustive approximate scan | No      |
 | `VecSimAlgo_TQ_HNSW`   | `HNSW` + `COMPRESSION TQ8\|TQ4\|TQ2` | HNSW graph   | Yes (wrapped in `VecSimAlgo_TIERED` from the RediSearch side, identically to how `HNSW` is wrapped) |
 
 ##### 3.2.1 TQ flat backend — internal compressed brute-force building block
@@ -118,7 +122,7 @@ The TQ-HNSW backend (`VecSimAlgo_TQ_HNSW`) reuses the HNSW graph layout (`M`, `E
 
 * Wrapped in a `VecSimAlgo_TIERED` index from the RediSearch side, with `TQ_HNSW` as the primary index — exactly the same wrapping used today for plain `HNSW`. This enables background indexing via the existing job queue, frontend flat buffer, and the standard tiered query merge logic.
 * `swapJobThreshold` is set to 0 (default tiered behavior).
-* Distance metric is currently restricted to `COSINE` and `IP`. `L2` is rejected at the parser; the VecSim side does not yet expose an unbiased TQ-HNSW L2 kernel that we are confident enough to ship.
+* Distance metric is currently restricted to `COSINE` and `IP`. VecSim contains an L2 estimate, but RediSearch rejects `L2` until its recall and range semantics have been validated for release.
 
 ##### 3.2.3 Component Design
 
@@ -141,7 +145,7 @@ The TQ-HNSW backend (`VecSimAlgo_TQ_HNSW`) reuses the HNSW graph layout (`M`, `E
 * [`src/vector_index.c`](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/src/vector_index.c) / [`src/vector_index.h`](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/src/vector_index.h):
     * New compression-name constants `VECSIM_TQ_2` / `VECSIM_TQ_4` / `VECSIM_TQ_8` (`"TQ2"` / `"TQ4"` / `"TQ8"`); the former `BITS` / `PROJECTIONS` / `SEED` / `ROTATION` keyword defines were removed.
     * New helper `VecSimTqCompression_ToString(bits)` in `vector_index.c` mapping the stored bit budget back to the compression name for reporting.
-    * `VecSim_RdbSave` and `VecSim_RdbLoad_v4` cases for tiered-`TQ_HNSW` only; the standalone `TQ` / `TQ-HNSW` RDB branches were removed. The tiered branch saves `swapJobThreshold` then type, dim, metric, multi, bits, projections, seed, useRotation, `M`, `efConstruction`, `efRuntime`, `epsilon`.
+    * `VecSim_RdbSave` and `VecSim_RdbLoad_v4` cases for tiered-`TQ_HNSW` only; the standalone `TQ` / `TQ-HNSW` RDB branches were removed. The tiered branch saves `swapJobThreshold` then type, dim, metric, multi, bits, projections, seed, useRotation, `M`, `efConstruction`, `efRuntime`, `epsilon`. RediSearch encoding version 28 marks introduction of this layout.
     * Older RDB versions (v2, v3) explicitly fail when they encounter the new algorithm enum (we don't pretend they were loadable).
     * `getVecSimMetricFromVectorField` extended.
 * [`src/info/info_command.c`](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/src/info/info_command.c): a TQ-compressed field renders the plain-HNSW `FT.INFO` block (`algorithm=HNSW`, `data_type`, `dim`, `distance_metric`, `M`, `ef_construction`) plus a `compression` line (`TQ8`/`TQ4`/`TQ2`), mirroring how SVS reports its compression. TQ internals (`bits`, `projections`, `seed`, `rotation`) are not reported.
@@ -156,7 +160,7 @@ The TQ-HNSW backend (`VecSimAlgo_TQ_HNSW`) reuses the HNSW graph layout (`M`, `E
 * **New compression-name strings:** `VECSIM_TQ_2` (`TQ2`), `VECSIM_TQ_4` (`TQ4`), `VECSIM_TQ_8` (`TQ8`) — values of the existing `COMPRESSION` keyword. No new algorithm-name strings; the former `BITS` / `PROJECTIONS` / `SEED` / `ROTATION` keyword defines were removed.
 * **New parameter structs:** `TQFlatParams`, `TQHNSWParams` (defined VecSim-side, consumed via `VecSimParams::algoParams.tqFlatParams` / `tqHnswParams`).
 * **Global stats:** unchanged — TQ-compressed HNSW fields count in the existing `HNSW` bucket (the interim `numVectorFieldsTqFlat` counter was removed).
-* **RDB:** No version bump. The existing v4 envelope is extended with one new tiered-`TQ_HNSW` branch. Older versions (v2, v3) fail to load any RDB containing TQ-compressed fields, by design.
+* **RDB:** RediSearch encoding version 28 marks the new tiered-`TQ_HNSW` branch in the existing `VecSim_RdbLoad_v4` loader. Older builds reject version-28 files; new builds continue to load older non-TQ files.
 
 #### 3.4 Default Parameter Values
 
@@ -208,7 +212,7 @@ All standard HNSW arguments (`M`, `EF_CONSTRUCTION`, `EF_RUNTIME`, `EPSILON`) re
 | Attribute         | Description                                                                 | Default                       |
 | ----------------- | --------------------------------------------------------------------------- | ----------------------------- |
 | `TYPE`            | Vector component type. **FLOAT32 only** with TQ compression in this phase.  | (mandatory)                   |
-| `DIM`             | Vector dimensionality.                                                      | (mandatory)                   |
+| `DIM`             | Even vector dimensionality (TQ stores rotated coordinates in pairs).        | (mandatory)                   |
 | `DISTANCE_METRIC` | `COSINE` or `IP` with TQ compression (`L2` rejected).                       | (mandatory)                   |
 | `COMPRESSION`     | `TQ8` (recommended default, 8-bit), `TQ4`, or `TQ2`. The bit budget is encoded in the name, like `LVQ4`/`LVQ8` for SVS. Case-insensitive. | (optional — omit for plain HNSW) |
 | `M` / `EF_CONSTRUCTION` / `EF_RUNTIME` / `EPSILON` | As `HNSW`.                                 | HNSW defaults                 |
@@ -218,6 +222,7 @@ The former TQ knobs `BITS`, `PROJECTIONS`, `SEED`, `ROTATION` are **not user-exp
 **Validation errors (parse-time):**
 
 * `TYPE` other than `FLOAT32` → `"TQ compression only supports FLOAT32 vectors"`.
+* Odd `DIM` → `"TQ compression requires an even vector dimension"`.
 * `DISTANCE_METRIC L2` → `"TQ compression with DISTANCE_METRIC L2 is not yet supported; use COSINE or IP"`.
 * Multi-value vector (JSON `$.vecs[*]`) → `"TQ compression does not support multi-value vectors"`.
 * `COMPRESSION` on a disk-backed index → `"Disk index does not support COMPRESSION"`.
@@ -235,7 +240,7 @@ FT.SEARCH idx "*=>[KNN 10 @vec $blob AS dist]" PARAMS 2 blob <raw-f32-bytes> SOR
 FT.SEARCH idx "@vec:[VECTOR_RANGE 0.2 $blob]=>{$yield_distance_as: dist}" PARAMS 2 blob <raw-f32-bytes> SORTBY dist DIALECT 2
 ```
 
-The query vector is raw FP32 of length `DIM * sizeof(float)`. The index applies its own rotation/quantization internally.
+The query vector is raw FP32 of length `DIM * sizeof(float)`. The index applies its own preprocessing internally. Cosine fields normalize both sides and report `1 - estimated_inner_product`, so yielded distances and `VECTOR_RANGE` radii remain on the standard approximate cosine-distance scale.
 
 #### 4.4 FT.INFO
 
@@ -263,7 +268,9 @@ No changes. TQ-compressed HNSW fields are counted in the existing `HNSW` bucket 
 
 #### 5.1 Memory
 
-* TQ-compressed indexes store each vector as `bits * projections / 8` bytes of compact codes plus a small constant per-vector metadata block (FP32 min/delta + summary terms). With `TQ8` (bits = 8) and the internal `projections = DIM/2`, raw storage drops from `4 * DIM` bytes to roughly `DIM / 2 + O(1)` bytes per vector — an ~8× reduction at typical embedding sizes (e.g. dim 768 → 32B vs 3072B before metadata).
+* For even dimension `d`, stored-vector bytes are `4 * (d / 2)` for FP32 radii, 8 for two FP32 norms, the packed angle codes, and `ceil((d / 2) / 8)` for residual signs. Angle codes use `ceil((d / 2) / 2)` bytes for TQ2/TQ4 and `d / 2` bytes for TQ8.
+* At dimension 768 this is 1,784 bytes for TQ2/TQ4 and 1,976 bytes for TQ8, versus 3,072 bytes for FP32 before allocator and graph metadata: approximately 42% and 36% raw-vector savings respectively. The observed whole-index reduction is smaller because HNSW graph metadata is unchanged.
+* TQ2 and TQ4 have the same storage footprint in the current nibble-packed representation. TQ2 is a quality trade-off, not an additional memory tier, until a denser packing format is implemented.
 * Graph overhead (links, levels) is unchanged from `HNSW`.
 
 #### 5.2 Throughput
@@ -275,8 +282,8 @@ No changes. TQ-compressed HNSW fields are counted in the existing `HNSW` bucket 
 #### 5.3 Recall
 
 * Random rotation is the main lever — with rotation on (always, internally), recall is near-lossless for typical embedding distributions at `TQ8`.
-* Choosing a lower bit budget (`TQ4`, `TQ2`) increases compression but degrades recall; this trade-off should be benchmarked per dataset before recommending non-default compression values.
-* The internal `projections < DIM` setting introduces additional approximation but reduces both storage and distance-compute cost.
+* Choosing a lower angle resolution (`TQ4`, `TQ2`) can degrade recall; this trade-off should be benchmarked per dataset before recommending non-default compression values.
+* The internal `projections = DIM / 2` setting controls the residual sketch size and its approximation/compute trade-off; it does not reduce the full-dimensional rotation.
 
 #### 5.4 Concurrency / Threading
 
@@ -285,13 +292,22 @@ No changes. TQ-compressed HNSW fields are counted in the existing `HNSW` bucket 
 
 #### 5.5 Availability
 
-No new availability concerns. Replication is delegated to the standard RDB/AOF path. RDB v4 round-trip is supported; older RDB versions fail closed when a TQ field is encountered, which is the correct behavior.
+No new availability concerns. Replication is delegated to the standard RDB/AOF path.
+TQ round-trip is supported through the internal VecSim v4 loader and RediSearch encoding
+version 28. Older builds reject version-28 files; new builds continue to load older
+non-TQ files.
 
 #### 5.6 Measured Benchmarks
 
 > **Note:** these runs predate the v0.4 API rename — the old `TQ-FLAT` / `TQ-HNSW` lane names refer to the same engine now reachable via `HNSW` + `COMPRESSION TQ<bits>`; standalone `TQ-FLAT` lanes are no longer reachable through the public API.
 
 The numbers below are from the local benchmarking harness at `~/git/redis-turboquant-bench`, run against the patched RediSearch + VecSim from this branch. Two sets of results are included: (a) **single-shard local** runs that establish the quality / latency / memory shape, and (b) **multi-node Redis Enterprise** runs (`4 × e2-standard-16`, `all-master-shards`, sparse placement) that establish the throughput shape.
+
+> **Benchmark sign-off gap.** These historical results include raw SVS-VAMANA only.
+> They do not compare TQ against compressed SVS-VAMANA (`LVQ8`, `LVQ4`, or LeanVec)
+> on the same corpus and hardware, as requested in review. That apples-to-apples matrix
+> must be run on the final branch before approval; no conclusion about TQ versus
+> compressed SVS should be drawn from the tables below.
 
 **Dataset.** [`CohereLabs/msmarco-v2.1-embed-english-v3`](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) on Hugging Face — MS MARCO v2.1 passages with **pre-computed Cohere `embed-english-v3.0` embeddings** (FLOAT32, 1024-dim). Using the pre-embedded variant means the benchmark measures pure indexing / retrieval cost rather than embedding-generation cost, and every algorithm sees the exact same vector for the same passage. Prepared corpus: ~253K passages assembled from locality-aware contiguous blocks to keep labeled coverage intact while sitting close to the ~1 GiB raw-FLAT memory target. 214 evaluated annotated queries.
 
@@ -367,6 +383,7 @@ This confirms that the tier wrapping for `TQ-HNSW` correctly engages the backgro
 * The single-shard local runs were on Apple Silicon (NEON) with the `WORKERS`-aware writer paths; the Enterprise runs were on `e2-standard-16` GCP nodes (AVX2 + FMA, AVX-512 not used).
 * The Enterprise `raw-hnsw` lane there was *also* using tiered HNSW with workers — it is not a "single-threaded raw HNSW" baseline. Treat that table as "raw vs TQ at the same cluster shape," not "raw single-threaded vs TQ tiered."
 * These numbers are from `~/git/redis-turboquant-bench` notes `benchmark-findings.md` (single-shard, 2026-04-15) and `jp-tq-bench-enterprise-report-2026-04-22.md` (cluster, 2026-04-22), and from `results/latest/comparison.md` + `workers-comparison.md`. They should be re-run on the final branch and re-pinned in this doc before sign-off.
+* Several lanes use the pre-v0.4 standalone prototype names and bit settings that are no longer user-creatable. Treat them as historical implementation evidence, not a benchmark of the final public API.
 
 ---
 
@@ -379,11 +396,12 @@ No new security considerations. TQ-compressed indexes use the same ACL surface a
 ## 7. Compatibility & Constraints
 
 * **No standalone TQ-FLAT:** `TQ-FLAT` is no longer a creatable index type. The only way to get TQ on a vector field is `HNSW ... COMPRESSION TQ<bits>`. The TQ flat backend remains internal to VecSim.
-* **Backward compatibility:** Existing indexes (no TQ) are unaffected. RDB v4 files written by an old build still load on a new build; new RDB files containing TQ-compressed fields cannot be loaded by a build that doesn't know the enum (the v2/v3/v4 loaders fail closed on unknown algorithm enums).
+* **Backward compatibility:** Existing indexes (no TQ) are unaffected. RediSearch encoding version 28 identifies files written with the TQ-capable layout. New builds load older non-TQ files; older builds reject version-28 files.
 * **Data types:** `FLOAT32` only with TQ compression in this phase. Adding `FLOAT16` (and integer types) requires new VecSim SIMD kernel variants — explicitly out of scope.
 * **Distance metrics:** `COSINE`, `IP` only with TQ compression. `L2` returns a parse error.
 * **Disk (Flex / ROF):** unsupported. `COMPRESSION` is rejected when `isSpecOnDiskForValidation(sp) == true`.
 * **Multi-value:** unsupported with TQ compression. JSON `$.vecs[*]` is rejected at parse time.
+* **Dimensions:** TQ requires an even vector dimension because the polar representation groups rotated coordinates into pairs. Odd dimensions are rejected at schema validation.
 * **VecSim version:** requires `deps/VectorSimilarity` to include the TQ commit range below. The submodule pin is bumped on this branch.
 * **Cluster mode:** TQ-compressed HNSW is a local-shard index type and uses the existing coordinator and resharding paths. No coordinator changes are required.
 
@@ -393,8 +411,8 @@ No new security considerations. TQ-compressed indexes use the same ACL surface a
 
 | Level                | Type      | Description                                                                                                                |
 | -------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------- |
-| Unit (VecSim)        | Automated | TurboQuant parity harness against a Rust oracle (`test: add turboquant parity harness against rust oracle`).               |
-| Unit (RediSearch)    | Automated | Parser branch coverage for the `COMPRESSION` `TQ2`/`TQ4`/`TQ8` branch, including unknown-compression-value, FLOAT32-only, L2, multi-value, and disk-index validation errors. |
+| Unit (VecSim)        | Automated | TurboQuant parity harness against a Rust oracle, TQ2/TQ4/TQ8 scalar/SIMD parity, and explicit cosine-distance scale/range checks. |
+| Unit (RediSearch)    | Automated | Parser branch coverage for the `COMPRESSION` `TQ2`/`TQ4`/`TQ8` branch, including unknown-compression-value, FLOAT32-only, odd dimension, L2, multi-value, and disk-index validation errors. |
 | Component tests      | Automated | `FT.CREATE` schema acceptance, `FT.INFO` rendering (HNSW block + `compression`), RDB save/load round-trip (see [`tests/pytests/test_tq.py`](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/tests/pytests/test_tq.py)). |
 | E2E functional       | Automated | KNN and `VECTOR_RANGE` correctness on real embeddings (HASH + JSON, single-value), mixed insert/query/delete workloads, tiered transitions under load. |
 | Recall / quality     | Automated | Recall@K vs FP32 `FLAT` ground truth across at least one open embedding dataset, for TQ-compressed HNSW with default params. |
@@ -405,11 +423,12 @@ No new security considerations. TQ-compressed indexes use the same ACL surface a
 
 Existing test artifacts on the branch:
 
-* [`tests/pytests/test_tq.py`](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/tests/pytests/test_tq.py) — covers `FT.CREATE` with `COMPRESSION TQ2`/`TQ4`/`TQ8` (HASH + JSON), `FT.INFO` rendering (HNSW block + `compression`), KNN and `VECTOR_RANGE` queries, RDB persistence round-trip, and negative cases (non-`FLOAT32` types, `L2`, multi-value JSON paths, unknown `COMPRESSION` values, disk-backed rejection).
+* [`tests/pytests/test_tq.py`](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/tests/pytests/test_tq.py) — covers `FT.CREATE` with `COMPRESSION TQ2`/`TQ4`/`TQ8` (HASH + JSON), `FT.INFO` rendering (HNSW block + `compression`), cosine KNN/`VECTOR_RANGE`, IP ordering, RDB persistence round-trip, and negative cases (non-`FLOAT32` types, odd dimensions, `L2`, multi-value JSON paths, and unknown `COMPRESSION` values). Flex-mode disk rejection is covered in `tests/pytests/test_flex_validation.py`.
 
 Test gaps to close before merge (see §9):
 
 * End-to-end recall test for TQ-compressed HNSW on a real dataset.
+* Final-branch comparison against compressed SVS-VAMANA (`LVQ8`, `LVQ4`, and applicable LeanVec variants) on the same corpus and hardware.
 
 ---
 
@@ -417,15 +436,14 @@ Test gaps to close before merge (see §9):
 
 | ID     | Description                                                                                                                                                                          | Impact                                                                                  | Mitigation                                                                                                                                                                                |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Risk 1 | **No `L2` support for TQ compression yet.** Symmetric L2 path was added VecSim-side via the stored full-vector norm, but the asymmetric query path and recall validation aren't ready.    | Users with L2 embeddings cannot use `COMPRESSION TQ<bits>`.                                          | Reject at parser with a user-readable error pointing at COSINE/IP. Follow-up: enable L2 in a later release once the asymmetric kernel + recall numbers are in.                            |
+| Risk 1 | **No `L2` support for TQ compression yet.** VecSim contains symmetric and asymmetric L2 estimates, but their recall and range behavior have not been validated for the public surface. | Users with L2 embeddings cannot use `COMPRESSION TQ<bits>`. | Reject at parser with a user-readable error pointing at COSINE/IP. Follow-up: enable L2 only after end-to-end validation. |
 | Risk 2 | **The fixed internal defaults are heuristic.** `projections = DIM/2` and the per-name bit budgets work well on the datasets we've tried, but defaults can be wrong on long-tail distributions — and users can no longer tune them. | Recall may be worse than expected on some user data, with no user-side knob beyond picking `TQ8`/`TQ4`/`TQ2`. | Publish a tuning guide alongside benchmarks (which compression name to pick per workload). Consider warning in logs when `DIM` is very low (< 64) — small dims don't amortize TQ overhead. |
 | Risk 3 | **No data type other than `FLOAT32`.** Many of our users send `FLOAT16` / `BFLOAT16` embeddings.                                                                                       | Coverage gap relative to `FLAT` / `HNSW`.                                               | Explicitly call out in docs; track follow-up to add FP16 SIMD kernel variants (mirrors the SQ HLD §7 SIMD matrix).                                                                        |
 | Risk 4 | **No disk-backed variant.** Disk-backed RediSearch (Flex / ROF) cannot use `COMPRESSION` / TQ.                                                                                          | Tiered-memory deployments cannot benefit from TQ in this phase.                         | Reject at parser; design integration with `vecsim_disk` as a follow-up HLD.                                                                                                               |
 | Risk 5 | **No dedicated compressed-HNSW observability.** TQ-compressed HNSW fields are counted in the existing `HNSW` bucket of `INFO MODULES` (the interim `TQ_FLAT` counter was removed with the standalone index), so operators can't tell from `INFO MODULES` alone how many compressed fields they have. | Observability gap.                                                                      | A dedicated compressed-HNSW counter is a possible follow-up; `FT.INFO` per-field `compression` reporting covers the per-index need today.                                                  |
-| Risk 6 | **VecSim API surface widened.** New factory paths, virtual dispatch in tiered algos, `static_assert`s on TQ param prefixes. Risk of misuse from other consumers of VecSim.            | Build break or runtime UB in `vecsim_disk` / micro-benchmarks if they construct params zero-initialized. | All new enums are zero (`VecSimAlgo_TQ`, `VecSimAlgo_TQ_HNSW` follow the existing enum tail). Coordinate the VecSim bump with consumers; the API-hardening commit covers most of the obvious traps. |
-| Risk 7 | **Benchmarks are not in the merge gate.** Numbers below are anecdotal until we run `vector-db-benchmark`.                                                                              | We could ship a regression vs the existing path on some datasets.                       | Block merge on at least one end-to-end recall + throughput benchmark; capture results in this HLD before flipping the doc to APPROVED.                                                    |
+| Risk 6 | **VecSim API surface widened.** New factory paths, virtual dispatch in tiered algos, `static_assert`s on TQ param prefixes. Risk of misuse from other consumers of VecSim.            | Build break or runtime UB in `vecsim_disk` / micro-benchmarks if they construct params zero-initialized. | The new enum values are appended so existing numeric values remain stable. Coordinate the VecSim bump with consumers; the API-hardening commit covers most of the obvious traps. |
+| Risk 7 | **Final benchmark comparison is incomplete.** Existing results compare TQ with FP32 FLAT/HNSW and raw SVS-VAMANA, but not compressed SVS-VAMANA. | We could recommend a new codec without showing whether it improves on existing LVQ/LeanVec choices. | Block approval on a same-corpus, same-hardware recall/latency/memory/build-time matrix against `LVQ8`, `LVQ4`, and applicable LeanVec variants; pin results in this HLD. |
 | Risk 8 | **Branch hygiene.** The `feat/tq-vector-quantization` branch was cut from an older master and accumulated unrelated drift (CI, coord, aggregate, etc.).                                | Hard to review TQ in isolation.                                                         | Largely addressed: current master has since been merged into the branch. Before opening a PR, do a final pass to confirm the diff against master is TQ-only (the RediSearch TQ commits + the VecSim submodule bump). |
-| Risk 9 | **Cosine distances are reported on an angle-based scale.** The TQ cosine kernels (compact-angle / polar path) score on a monotonic angle-based scale rather than exact `1 - cos`. KNN ordering is correct, but absolute `VECTOR_RANGE` radii and yielded distances are a surrogate, and the scale can differ between SIMD paths. | `VECTOR_RANGE` radius semantics and user-visible distances differ from exact cosine distance. | Documented; flow tests assert ordering, not absolute radii. Follow-up before GA: normalize the reported score back to `1 - cos` (or document the scale as part of the API contract). |
 
 ---
 
@@ -436,7 +454,6 @@ Test gaps to close before merge (see §9):
 | Reference HLD (SQ)         | [HLD: Scalar Quantization (SQ) Compression for Tiered HNSW](https://redislabs.atlassian.net/wiki/spaces/DX/pages/6153601069/HLD+Scalar+Quantization+SQ+Compression+for+Tiered+HNSW) | Dor Forer      |
 | External background        | [Google Research blog — TurboQuant: redefining AI efficiency with extreme compression](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) | n/a            |
 | Local design notes         | [docs/design/tq_flat.md](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/docs/design/tq_flat.md), [docs/design/tq_hnsw.md](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/docs/design/tq_hnsw.md) | Jeremy Plichta |
-| Reviewer's guide           | [notes/tq-review-guide.md](https://github.com/jeremyplichta/RediSearch/blob/feat/tq-vector-quantization/notes/tq-review-guide.md) — recommended reading order for the diff           | Jeremy Plichta |
 | Benchmark dataset          | [CohereLabs/msmarco-v2.1-embed-english-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3) — MS MARCO v2.1 passages with pre-computed Cohere `embed-english-v3.0` 1024-dim embeddings | n/a |
 | RediSearch fork branch     | [jeremyplichta/RediSearch @ feat/tq-vector-quantization](https://github.com/jeremyplichta/RediSearch/tree/feat/tq-vector-quantization)                                              | Jeremy Plichta |
 | VecSim fork branch         | [jeremyplichta/VectorSimilarity @ feat/tq-vector-quantization](https://github.com/jeremyplichta/VectorSimilarity/tree/feat/tq-vector-quantization)                                  | Jeremy Plichta |
