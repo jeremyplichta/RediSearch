@@ -1,161 +1,99 @@
-# Design: TQ-Compressed HNSW Vector Index
+# Design: Paper-Faithful TQ-Compressed HNSW
 
 ## Overview
 
-> **Status (2026-06-11):** per maintainer review, TQ is exposed through the existing
-> `COMPRESSION` argument on the `HNSW` algorithm (`COMPRESSION TQ8|TQ4|TQ2`), mirroring
-> how `SVS-VAMANA` exposes LVQ/LeanVec compression. The standalone `TQ-HNSW` algorithm
-> name on `FT.CREATE` was dropped. Internally the index is still backed by the
-> `VecSimAlgo_TQ_HNSW` enum and the same tiered wrapping.
-
-TQ-compressed HNSW is an approximate vector index mode backed by the vendored VecSim
-TurboQuant-style compressed representation plus HNSW graph traversal.
-
-At the RediSearch layer, the goal is the same as the existing vector algorithms:
-
-- users create the index with `FT.CREATE` (as `HNSW` with `COMPRESSION TQ<bits>`)
-- users write raw vectors into documents
-- users query with raw vectors through `FT.SEARCH`
-- VecSim owns the internal preprocessing, compressed storage, and HNSW traversal
-
-## User-Facing Schema
-
-TQ compression is accepted anywhere `VECTOR HNSW` fields are accepted in `FT.CREATE`.
-
-Example:
+TQ is exposed through the existing `COMPRESSION` argument on `HNSW`:
 
 ```redis
 FT.CREATE idx SCHEMA vec VECTOR HNSW 10 \
-  TYPE FLOAT32 \
-  DIM 768 \
-  DISTANCE_METRIC COSINE \
-  COMPRESSION TQ8 \
+  TYPE FLOAT32 DIM 768 DISTANCE_METRIC COSINE COMPRESSION TQ8 \
   M 16 EF_CONSTRUCTION 200 EF_RUNTIME 50 EPSILON 0.01
 ```
 
-Supported parameters in v1:
+The public algorithm remains `HNSW`; internally RediSearch builds a tiered index whose
+primary backend is `VecSimAlgo_TQ_HNSW` and whose frontend is the internal TQ flat
+index. Raw FP32 document and query blobs use the normal RediSearch ingest/query paths.
+VecSim owns compression and scoring.
 
-- `TYPE`
-- `DIM`
-- `DISTANCE_METRIC`
-- `COMPRESSION` — `TQ8` (recommended default, 8-bit), `TQ4`, or `TQ2`; the bit budget
-  is encoded in the name (like `LVQ4`/`LVQ8` for SVS); case-insensitive
-- `M`
-- `EF_CONSTRUCTION`
-- `EF_RUNTIME`
-- `EPSILON`
+## Algorithm and Storage
 
-The standard HNSW arguments (`M`, `EF_CONSTRUCTION`, `EF_RUNTIME`, `EPSILON`) are all
-optional and keep their HNSW defaults:
+The implementation follows `TurboQuant_prod` (Algorithm 2): a deterministic random
+orthogonal rotation, an exact sphere-distribution Lloyd-Max quantizer using `b - 1`
+bits per coordinate, and one QJL residual-sign bit per coordinate. It stores the
+residual norm and applies the unbiased correction `gamma * sqrt(pi / 2) / d`.
+See [tq_flat.md](tq_flat.md) for the equations and packing details.
 
-- `M=16`
-- `EF_CONSTRUCTION=200`
-- `EF_RUNTIME=10`
-- `EPSILON=0.01`
+Per-vector payload is:
 
-The former TQ knobs `BITS`, `PROJECTIONS`, `SEED`, `ROTATION` are **not user-exposed**;
-they were deliberately removed from the API per review. Internally they are fixed:
-
-- projections: `max(1, DIM / 2)`
-- seed: `7`
-- rotation: always on
-
-The stored representation applies a full-dimensional orthogonal rotation, groups the
-rotated coordinates into pairs, and stores an FP32 radius plus a quantized polar angle
-per pair. It also stores two FP32 norms and packed signs from `DIM / 2` QJL projections
-of the reconstruction residual. The projection count controls the residual sketch; it
-does not reduce the rotation dimension.
-
-TQ2, TQ4, and TQ8 use 1, 3, and 7 polar bits respectively. TQ2 and TQ4 both use the
-current nibble-packed angle layout, so they have the same byte footprint in this
-implementation; TQ2 has lower angular resolution without an additional memory saving.
-
-`BLOCK_SIZE` / `INITIAL_CAP` are deprecated args and not part of the TQ surface
-(block size is fixed at 1024 vectors per block internally).
-
-Internally, when `COMPRESSION TQ<bits>` is present, the parser builds the same tiered
-index as plain `HNSW` but with `VecSimAlgo_TQ_HNSW` as the primary algorithm and
-`TQHNSWParams` (type, dim, metric, multi, `M`, `efConstruction`, `efRuntime`,
-`epsilon` carried over from the parsed HNSW args; bits from the compression name;
-projections/seed/rotation fixed defaults). Background indexing via tiered worker jobs
-is identical to `HNSW`.
-
-## Current Constraints
-
-The initial RediSearch integration intentionally keeps the surface narrow. All are
-parse-time validation errors:
-
-- `TYPE FLOAT32` only — `"TQ compression only supports FLOAT32 vectors"`
-- even vector dimensions only — `"TQ compression requires an even vector dimension"`
-- `COSINE` / `IP` only — `"TQ compression with DISTANCE_METRIC L2 is not yet
-  supported; use COSINE or IP"`
-- single-value vectors only — `"TQ compression does not support multi-value vectors"`
-- not supported for disk-backed indexes — `"Disk index does not support COMPRESSION"`
-- an unknown `COMPRESSION` value on `HNSW` fails with the standard bad-argument error
-  mentioning `COMPRESSION`
-
-Unsupported forms fail during schema validation rather than being accepted and
-degraded later.
-
-## Query Semantics
-
-TQ-compressed HNSW is exposed through the standard vector query syntax.
-
-KNN example:
-
-```redis
-FT.SEARCH idx "*=>[KNN 10 @vec $blob AS dist]" PARAMS 2 blob <raw-f32-bytes> SORTBY dist DIALECT 2
+```text
+ceil((b - 1) * DIM / 8) + ceil(DIM / 8) + 8 bytes
 ```
 
-Range query example:
+The final eight bytes are the FP32 source scale needed by non-unit IP vectors and the
+FP32 residual norm. At dimension 1024 the exact payload is 264/520/1032 bytes for
+TQ2/TQ4/TQ8. Model-wide rotation, codebook, and QJL matrices are not per-vector bytes.
 
-```redis
-FT.SEARCH idx "@vec:[VECTOR_RANGE 0.2 $blob]=>{$yield_distance_as: dist}" PARAMS 2 blob <raw-f32-bytes> SORTBY dist DIALECT 2
-```
+## Parameters and Validation
 
-The query vector stays raw. The index handles its own preprocessing internally. For
-cosine fields, both stored and query vectors are normalized and yielded distances are
-`1 - estimated_inner_product`, so `VECTOR_RANGE` uses the standard approximate
-cosine-distance scale.
+Supported schema parameters are the standard HNSW parameters plus `COMPRESSION`:
+
+- `COMPRESSION TQ2|TQ4|TQ8` (case-insensitive);
+- `M`, default 16;
+- `EF_CONSTRUCTION`, default 200;
+- `EF_RUNTIME`, default 10;
+- `EPSILON`, default 0.01.
+
+The former `BITS`, `PROJECTIONS`, `SEED`, and `ROTATION` knobs are not public.
+RediSearch derives total bits from the compression name, fixes projections to `DIM`,
+uses seed 7, and always enables rotation.
+
+Validation currently requires:
+
+- `TYPE FLOAT32`;
+- `DIM >= 2` (odd dimensions are valid);
+- `DISTANCE_METRIC COSINE` or `IP`;
+- a single-value vector path;
+- an in-memory index (disk-backed compression is rejected).
+
+## Search and Graph Construction
+
+Query traversal is asymmetric. VecSim preprocesses each query once into `Pi y` and
+`S y`, then evaluates candidates directly from their packed indices, packed signs,
+source scale, and residual norm. Cosine normalizes both sides. IP leaves the query
+unnormalized and restores every source vector's original magnitude.
+
+The TurboQuant paper does not specify a compressed-code-to-compressed-code estimator.
+HNSW construction and maintenance need stored-to-stored comparisons, so the current
+correctness-first path decodes both Algorithm 2 approximations and computes their
+ordinary metric distance. This is explicit and tested; it does not retain raw vectors
+and does not pretend that a new symmetric estimator came from the paper. Query
+traversal continues to use the asymmetric estimator.
+
+Tiered background indexing and frontend/backend result merging are otherwise the same
+as ordinary HNSW.
 
 ## Introspection
 
-`FT.INFO` reports the plain-HNSW block plus the compression — the algorithm is
-reported as `HNSW`, not `TQ-HNSW` (mirroring how SVS reports its compressed variants):
-
-- `algorithm` (`HNSW`)
-- `data_type`
-- `dim`
-- `distance_metric`
-- `M`
-- `ef_construction`
-- `compression` (`TQ8` / `TQ4` / `TQ2`)
-
-It does **not** report `bits` / `projections` / `seed` / `rotation` /
-`ef_runtime` / `epsilon`.
-
-`INFO MODULES` counts TQ-compressed HNSW fields in the existing `HNSW` bucket; there
-is no dedicated TQ counter (a compressed-HNSW counter is a possible follow-up).
+`FT.INFO` reports the ordinary HNSW block plus `compression: TQ2|TQ4|TQ8`. It does not
+expose the fixed internal projection count, seed, or rotation flag. `INFO MODULES`
+counts these fields in the existing HNSW bucket.
 
 ## Persistence
 
-TQ-compressed HNSW is supported by the current RDB save/load path via a single
-tiered-`TQ_HNSW` branch in `VecSim_RdbLoad_v4`, which saves `swapJobThreshold` then type, dim, metric,
-multi, bits, projections, seed, useRotation, `M`, `efConstruction`, `efRuntime`,
-`epsilon`.
+Encoding version 29 stores paper codec marker `2` before the tiered TQ parameters,
+followed by the tiered swap threshold, vector type/dimension/metric/multi flag,
+bit width, projection count, seed, rotation flag, and HNSW parameters.
 
-RediSearch encoding version 28 marks introduction of this layout. Older builds reject
-version-28 files rather than partially loading an unknown algorithm; the new loader
-continues to load older non-TQ files.
+Encoding version 28 identified the historical pairwise-polar prototype. Its parameter
+shape looks similar but its vector bytes and equations are incompatible, so the v29
+loader rejects it. Older non-TQ indexes remain loadable through their existing paths.
+
+RDB tests compare complete search results and scores before and after reload, rather
+than checking only that documents survive.
 
 ## Testing Focus
 
-The expected coverage areas for the RediSearch layer (see
-`tests/pytests/test_tq.py`) are:
-
-- schema parsing and validation, including the negative cases above
-- `FT.INFO` rendering (HNSW block + `compression`)
-- KNN and `VECTOR_RANGE`
-- JSON single-value vs multi-value behavior (multi-value rejected)
-- RDB and AOF round-trips
-- INFO MODULES accounting (counted under `HNSW`)
+Coverage includes all three bit widths, HASH and JSON ingest, COSINE and non-unit IP,
+odd dimensions, tiered insertion/query behavior, KNN/range paths, FT.INFO, exact RDB
+score preservation, invalid types/metrics/multi-value/dimensions, and VecSim-level
+HNSW construction tests against the explicit Algorithm 2 decoder.
