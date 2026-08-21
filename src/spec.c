@@ -653,9 +653,9 @@ static int parseVectorField_validate_tq_hnsw(VecSimParams *params, QueryError *s
                         "TQ compression does not support multi-value vectors");
     return 0;
   }
-  if (params->algoParams.tqHnswParams.dim % 2 != 0) {
+  if (params->algoParams.tqHnswParams.dim < 2) {
     QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
-                        "TQ compression requires an even vector dimension");
+                        "TQ compression requires vector dimension >= 2");
     return 0;
   }
 
@@ -904,7 +904,7 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
     tqParams->efRuntime = hnswParams.efRuntime;
     tqParams->epsilon = hnswParams.epsilon ? hnswParams.epsilon : HNSW_DEFAULT_EPSILON;
     tqParams->bits = tqBits;
-    tqParams->projections = MAX(1, hnswParams.dim / 2);
+    tqParams->projections = hnswParams.dim;
     tqParams->seed = 7;
     tqParams->useRotation = true;
     params->algo = VecSimAlgo_TQ_HNSW;
@@ -2582,7 +2582,8 @@ static int FieldSpec_RdbLoad(RedisModuleIO *rdb, FieldSpec *f, StrongRef sp_ref,
       f->vectorOpts.expBlobSize = LoadUnsigned_IOError(rdb, goto fail);
     }
     if (encver >= INDEX_VECSIM_SVS_VAMANA_VERSION) {
-      if (VecSim_RdbLoad_v4(rdb, &f->vectorOpts.vecSimParams, sp_ref, HiddenString_GetUnsafe(f->fieldName, NULL)) != REDISMODULE_OK) {
+      if (VecSim_RdbLoad_v4(rdb, &f->vectorOpts.vecSimParams, sp_ref,
+                            HiddenString_GetUnsafe(f->fieldName, NULL), encver) != REDISMODULE_OK) {
         goto fail;
       }
     } else if (encver >= INDEX_VECSIM_TIERED_VERSION) {

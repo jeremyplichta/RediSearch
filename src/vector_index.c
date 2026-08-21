@@ -451,6 +451,8 @@ const char *VecSimTqCompression_ToString(size_t bits) {
   }
 }
 
+#define VECSIM_TQ_PAPER_CODEC_VERSION 2
+
 const char *VecSimSearchHistory_ToString(VecSimOptionMode option) {
     if (option == VecSimOption_ENABLE)
         return VECSIM_USE_SEARCH_HISTORY_ON;
@@ -486,6 +488,7 @@ void VecSim_RdbSave(RedisModuleIO *rdb, VecSimParams *vecsimParams) {
       RedisModule_SaveUnsigned(rdb, primaryParams->efRuntime);
       RedisModule_SaveDouble(rdb, primaryParams->epsilon);
     } else if (vecsimParams->algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_TQ_HNSW) {
+      RedisModule_SaveUnsigned(rdb, VECSIM_TQ_PAPER_CODEC_VERSION);
       RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold);
       TQHNSWParams *primaryParams = &vecsimParams->algoParams.tieredParams.primaryIndexParams->algoParams.tqHnswParams;
 
@@ -540,7 +543,7 @@ static int VecSimIndex_validate_Rdb_parameters(RedisModuleIO *rdb, VecSimParams 
 }
 
 int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef sp_ref,
-                      const char *field_name) {
+                      const char *field_name, int encver) {
   VecSimLogCtx *logCtx = NULL;
   VecSimParams *primaryParams = NULL;
 
@@ -574,6 +577,12 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
       primaryParams->algoParams.hnswParams.efRuntime = LoadUnsigned_IOError(rdb, goto fail);
       primaryParams->algoParams.hnswParams.epsilon = LoadDouble_IOError(rdb, goto fail);
     } else if (primaryParams->algo == VecSimAlgo_TQ_HNSW) {
+      // Encoding version 28 carried the historical pairwise-polar blob contract. Its parameters
+      // look compatible but select a different codec, so it must never be loaded as paper TQ.
+      if (encver < INDEX_TQ_PAPER_VERSION ||
+          LoadUnsigned_IOError(rdb, goto fail) != VECSIM_TQ_PAPER_CODEC_VERSION) {
+        goto fail;
+      }
       vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold = LoadUnsigned_IOError(rdb, goto fail);
 
       primaryParams->algoParams.tqHnswParams.type = LoadUnsigned_IOError(rdb, goto fail);

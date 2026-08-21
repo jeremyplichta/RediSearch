@@ -186,7 +186,8 @@ int VecSim_RdbLoad_v2(RedisModuleIO *rdb, VecSimParams *vecsimParams); // includ
 int VecSim_RdbLoad_v3(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef spec,
                       const char *field_name); // includes tiered index
 int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef spec,
-                      const char *field_name); // includes SVS algorithm support
+                      const char *field_name,
+                      int encver); // includes SVS and versioned TQ algorithm support
 
 void VecSim_TieredParams_Init(TieredIndexParams *params, StrongRef sp_ref);
 void VecSimLogCallback(void *ctx, const char *level, const char *message);

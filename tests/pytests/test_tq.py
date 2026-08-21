@@ -222,6 +222,14 @@ def test_tq_rdb_round_trip():
     conn.execute_command("HSET", "doc:2", "v", orthogonal.tobytes())
     waitForIndex(env, "idx_tq_rdb")
 
+    before = env.cmd(
+        "FT.SEARCH", "idx_tq_rdb", "*=>[KNN 2 @v $blob AS dist]",
+        "PARAMS", "2", "blob", query.tobytes(),
+        "SORTBY", "dist",
+        "RETURN", "1", "dist",
+        "DIALECT", "2",
+    )
+
     for _ in env.reloadingIterator():
         info = to_dict(env.executeCommand("FT.INFO", "idx_tq_rdb"))
         attr = to_dict(info["attributes"][0])
@@ -234,8 +242,7 @@ def test_tq_rdb_round_trip():
             "RETURN", "1", "dist",
             "DIALECT", "2",
         )
-        env.assertEqual(res[0], 2)
-        env.assertEqual(res[1], "doc:1")
+        env.assertEqual(res, before)
 
 
 def test_tq_rejects_non_float32():
@@ -263,15 +270,20 @@ def test_tq_rejects_l2_metric():
         .error().contains("TQ compression with DISTANCE_METRIC L2 is not yet supported; use COSINE or IP")
 
 
-def test_tq_rejects_odd_dimensions():
+def test_tq_accepts_odd_dimensions_and_rejects_dimension_one():
     env = Env(moduleArgs="DEFAULT_DIALECT 2")
     conn = getConnectionByEnv(env)
 
     params = _tq_schema_params(dim=3)
     conn.flushall()
     env.expect("FT.CREATE", "idx_tq_odd_dim", "SCHEMA", "v", "VECTOR", "HNSW",
+               len(params), *params).ok()
+    conn.execute_command("FT.DROPINDEX", "idx_tq_odd_dim", "DD")
+
+    params = _tq_schema_params(dim=1)
+    env.expect("FT.CREATE", "idx_tq_dim_one", "SCHEMA", "v", "VECTOR", "HNSW",
                len(params), *params) \
-        .error().contains("TQ compression requires an even vector dimension")
+        .error().contains("TQ compression requires vector dimension >= 2")
 
 
 def test_tq_rejects_unknown_compression():
