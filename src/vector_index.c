@@ -17,6 +17,7 @@
 #include "redis_index.h"
 #include "search_disk.h"
 
+#include <math.h>
 #include <string.h>
 
 #if defined(__x86_64__) && defined(__GLIBC__)
@@ -451,7 +452,132 @@ const char *VecSimTqCompression_ToString(size_t bits) {
   }
 }
 
-#define VECSIM_TQ_PAPER_CODEC_VERSION 2
+static const VecSimTqModelIdentity tqDenseReferenceIdentity = {
+    .rdbMarker = VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER,
+    .codecVersion = 1,
+    .payloadLayoutVersion = 1,
+    .modelVersion = 1,
+    .rotationVersion = 1,
+    .qjlVersion = 1,
+    .constructionScoreVersion = 1,
+    .constructionScoreMode = 1,
+    .metricContractVersion = 1,
+    .profileName = "DenseReferenceV1",
+    .payloadLayoutName = "PaperV1",
+    .rotationName = "DenseHaarV1",
+    .qjlName = "DenseGaussianV1",
+    .constructionScoreName = "FullDecodeReferenceV1",
+    .metricContractName = "CosineOrInnerProductV1",
+};
+
+const VecSimTqModelIdentity *VecSimTqModelIdentity_FromRdbMarker(uint64_t marker) {
+  switch (marker) {
+    case VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER:
+      return &tqDenseReferenceIdentity;
+    default:
+      return NULL;
+  }
+}
+
+bool VecSimTq_CalculatePayloadSize(size_t dim, size_t bits, size_t *payloadSize) {
+  if (!payloadSize || (bits != 2 && bits != 4 && bits != 8)) {
+    return false;
+  }
+
+  const size_t coarseBitsPerCoordinate = bits - 1;
+  if (dim != 0 && coarseBitsPerCoordinate > SIZE_MAX / dim) {
+    return false;
+  }
+  const size_t coarseBits = coarseBitsPerCoordinate * dim;
+  const size_t coarseBytes = coarseBits / 8 + (coarseBits % 8 != 0);
+  const size_t qjlBytes = dim / 8 + (dim % 8 != 0);
+  if (qjlBytes > SIZE_MAX - coarseBytes ||
+      VECSIM_TQ_METADATA_BYTES > SIZE_MAX - coarseBytes - qjlBytes) {
+    return false;
+  }
+  *payloadSize = coarseBytes + qjlBytes + VECSIM_TQ_METADATA_BYTES;
+  return true;
+}
+
+int VecSimTq_ValidateParams(const TQHNSWParams *params, QueryError *status) {
+  if (params->type != VecSimType_FLOAT32) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression only supports FLOAT32 vectors");
+    return REDISMODULE_ERR;
+  }
+  if (params->metric == VecSimMetric_L2) {
+    QueryError_SetError(
+        status, QUERY_ERROR_CODE_PARSE_ARGS,
+        "TQ compression with DISTANCE_METRIC L2 is not yet supported; use COSINE or IP");
+    return REDISMODULE_ERR;
+  }
+  if (params->metric != VecSimMetric_Cosine && params->metric != VecSimMetric_IP) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression only supports DISTANCE_METRIC COSINE or IP");
+    return REDISMODULE_ERR;
+  }
+  if (params->multi) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression does not support multi-value vectors");
+    return REDISMODULE_ERR;
+  }
+  if (params->dim < 2) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression requires vector dimension >= 2");
+    return REDISMODULE_ERR;
+  }
+  if (params->bits != 2 && params->bits != 4 && params->bits != 8) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression bit width must be 2, 4, or 8");
+    return REDISMODULE_ERR;
+  }
+  if (params->projections != params->dim) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression requires projections equal to vector dimension");
+    return REDISMODULE_ERR;
+  }
+  if (!params->useRotation) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS, "TQ compression requires rotation");
+    return REDISMODULE_ERR;
+  }
+  if (params->seed != VECSIM_TQ_DENSE_REFERENCE_SEED) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ dense reference profile requires seed 7");
+    return REDISMODULE_ERR;
+  }
+  if (params->M == 0 || params->M > SIZE_MAX / (4 * sizeof(idType))) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "TQ compression M is outside the supported size range");
+    return REDISMODULE_ERR;
+  }
+  if (params->efConstruction == 0 || params->efRuntime == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression requires EF_CONSTRUCTION and EF_RUNTIME >= 1");
+    return REDISMODULE_ERR;
+  }
+  if (!isfinite(params->epsilon) || params->epsilon < 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression requires a finite nonnegative EPSILON");
+    return REDISMODULE_ERR;
+  }
+
+  size_t payloadSize;
+  if (!VecSimTq_CalculatePayloadSize(params->dim, params->bits, &payloadSize)) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "TQ compression payload size exceeds the supported size");
+    return REDISMODULE_ERR;
+  }
+
+  // Marker 2 rebuilds the dense reference model. Guard its quadratic model-size arithmetic here,
+  // before the C API enters VecSim's checked C++ estimator (which must not throw across C frames).
+  if (params->dim > SIZE_MAX / params->dim ||
+      params->dim * params->dim > SIZE_MAX / (4 * sizeof(float))) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "TQ compression model size exceeds the supported size");
+    return REDISMODULE_ERR;
+  }
+  return REDISMODULE_OK;
+}
 
 const char *VecSimSearchHistory_ToString(VecSimOptionMode option) {
     if (option == VecSimOption_ENABLE)
@@ -488,7 +614,7 @@ void VecSim_RdbSave(RedisModuleIO *rdb, VecSimParams *vecsimParams) {
       RedisModule_SaveUnsigned(rdb, primaryParams->efRuntime);
       RedisModule_SaveDouble(rdb, primaryParams->epsilon);
     } else if (vecsimParams->algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_TQ_HNSW) {
-      RedisModule_SaveUnsigned(rdb, VECSIM_TQ_PAPER_CODEC_VERSION);
+      RedisModule_SaveUnsigned(rdb, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER);
       RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold);
       TQHNSWParams *primaryParams = &vecsimParams->algoParams.tieredParams.primaryIndexParams->algoParams.tqHnswParams;
 
@@ -542,12 +668,119 @@ static int VecSimIndex_validate_Rdb_parameters(RedisModuleIO *rdb, VecSimParams 
   return rv;
 }
 
+static int VecSimTq_validate_Rdb_parameters(RedisModuleIO *rdb, const TQHNSWParams *tqParams) {
+  QueryError status = QueryError_Default();
+  int rv = VecSimTq_ValidateParams(tqParams, &status);
+  if (rv != REDISMODULE_OK) {
+    RedisModule_LogIOError(
+        rdb, REDISMODULE_LOGLEVEL_WARNING, "ERROR: loading TurboQuant vector index failed: %s",
+        QueryError_GetDisplayableError(&status, RSGlobalConfig.hideUserDataFromLog));
+  }
+  QueryError_ClearError(&status);
+  return rv;
+}
+
+static int VecSimTq_load_Rdb_parameters(RedisModuleIO *rdb, TQHNSWParams *tqParams) {
+  uint64_t rawType = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawDim = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawMetric = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawMulti = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawBits = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawProjections = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawSeed = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawUseRotation = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawM = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawEfConstruction = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawEfRuntime = LoadUnsigned_IOError(rdb, goto fail);
+  double rawEpsilon = LoadDouble_IOError(rdb, goto fail);
+
+  // Validate the serialized domains before narrowing enums, booleans, or size_t. Otherwise values
+  // with the same low bits as a supported value could silently select a different configuration.
+  if (rawType != VecSimType_FLOAT32) {
+    RedisModule_LogIOError(rdb, REDISMODULE_LOGLEVEL_WARNING,
+                           "ERROR: loading TurboQuant vector index failed: invalid FLOAT32 type "
+                           "identity %llu",
+                           (unsigned long long)rawType);
+    goto fail;
+  }
+  if (rawMetric != VecSimMetric_L2 && rawMetric != VecSimMetric_IP &&
+      rawMetric != VecSimMetric_Cosine) {
+    RedisModule_LogIOError(rdb, REDISMODULE_LOGLEVEL_WARNING,
+                           "ERROR: loading TurboQuant vector index failed: invalid metric "
+                           "identity %llu",
+                           (unsigned long long)rawMetric);
+    goto fail;
+  }
+  if (rawMulti > 1) {
+    RedisModule_LogIOError(rdb, REDISMODULE_LOGLEVEL_WARNING,
+                           "ERROR: loading TurboQuant vector index failed: invalid multi-value "
+                           "flag %llu",
+                           (unsigned long long)rawMulti);
+    goto fail;
+  }
+  if (rawUseRotation > 1) {
+    RedisModule_LogIOError(rdb, REDISMODULE_LOGLEVEL_WARNING,
+                           "ERROR: loading TurboQuant vector index failed: invalid rotation flag "
+                           "%llu",
+                           (unsigned long long)rawUseRotation);
+    goto fail;
+  }
+#if SIZE_MAX < UINT64_MAX
+  if (rawDim > SIZE_MAX || rawBits > SIZE_MAX || rawProjections > SIZE_MAX || rawSeed > SIZE_MAX ||
+      rawM > SIZE_MAX || rawEfConstruction > SIZE_MAX || rawEfRuntime > SIZE_MAX) {
+    RedisModule_LogIOError(
+        rdb, REDISMODULE_LOGLEVEL_WARNING,
+        "ERROR: loading TurboQuant vector index failed: numeric parameter exceeds size_t");
+    goto fail;
+  }
+#endif
+
+  tqParams->type = (VecSimType)rawType;
+  tqParams->dim = (size_t)rawDim;
+  tqParams->metric = (VecSimMetric)rawMetric;
+  tqParams->multi = (bool)rawMulti;
+  tqParams->initialCapacity = 0;
+  tqParams->bits = (size_t)rawBits;
+  tqParams->projections = (size_t)rawProjections;
+  tqParams->seed = (size_t)rawSeed;
+  tqParams->useRotation = (bool)rawUseRotation;
+  tqParams->M = (size_t)rawM;
+  tqParams->efConstruction = (size_t)rawEfConstruction;
+  tqParams->efRuntime = (size_t)rawEfRuntime;
+  tqParams->epsilon = rawEpsilon;
+  return VecSimTq_validate_Rdb_parameters(rdb, tqParams);
+
+fail:
+  return REDISMODULE_ERR;
+}
+
+static bool vecSimAlgoFromRdbValue(uint64_t rawAlgo, VecSimAlgo *algo) {
+  switch (rawAlgo) {
+    case VecSimAlgo_BF:
+    case VecSimAlgo_HNSWLIB:
+    case VecSimAlgo_TIERED:
+    case VecSimAlgo_SVS:
+    case VecSimAlgo_TQ:
+    case VecSimAlgo_TQ_HNSW:
+      *algo = (VecSimAlgo)rawAlgo;
+      return true;
+    default:
+      return false;
+  }
+}
+
 int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef sp_ref,
                       const char *field_name, int encver) {
   VecSimLogCtx *logCtx = NULL;
   VecSimParams *primaryParams = NULL;
 
-  vecsimParams->algo = LoadUnsigned_IOError(rdb, goto fail);
+  uint64_t rawAlgo = LoadUnsigned_IOError(rdb, goto fail);
+  if (!vecSimAlgoFromRdbValue(rawAlgo, &vecsimParams->algo)) {
+    RedisModule_LogIOError(rdb, REDISMODULE_LOGLEVEL_WARNING,
+                           "ERROR: loading vector index failed: invalid algorithm identity %llu",
+                           (unsigned long long)rawAlgo);
+    goto fail;
+  }
   logCtx = rm_new(VecSimLogCtx);
   logCtx->index_field_name = field_name;
   vecsimParams->logCtx = logCtx;
@@ -563,7 +796,14 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
     VecSim_TieredParams_Init(&vecsimParams->algoParams.tieredParams, sp_ref);
     primaryParams = vecsimParams->algoParams.tieredParams.primaryIndexParams;
     primaryParams->logCtx = vecsimParams->logCtx;
-    primaryParams->algo = LoadUnsigned_IOError(rdb, goto fail);
+    uint64_t rawPrimaryAlgo = LoadUnsigned_IOError(rdb, goto fail);
+    if (!vecSimAlgoFromRdbValue(rawPrimaryAlgo, &primaryParams->algo)) {
+      RedisModule_LogIOError(
+          rdb, REDISMODULE_LOGLEVEL_WARNING,
+          "ERROR: loading vector index failed: invalid primary algorithm identity %llu",
+          (unsigned long long)rawPrimaryAlgo);
+      goto fail;
+    }
 
     if (primaryParams->algo == VecSimAlgo_HNSWLIB) {
       vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold = LoadUnsigned_IOError(rdb, goto fail);
@@ -579,24 +819,29 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
     } else if (primaryParams->algo == VecSimAlgo_TQ_HNSW) {
       // Encoding version 28 carried the historical pairwise-polar blob contract. Its parameters
       // look compatible but select a different codec, so it must never be loaded as paper TQ.
-      if (encver < INDEX_TQ_PAPER_VERSION ||
-          LoadUnsigned_IOError(rdb, goto fail) != VECSIM_TQ_PAPER_CODEC_VERSION) {
+      if (encver < INDEX_TQ_PAPER_VERSION) {
+        RedisModule_LogIOError(
+            rdb, REDISMODULE_LOGLEVEL_WARNING,
+            "ERROR: loading TurboQuant vector index failed: RediSearch encoding version %d does "
+            "not identify the paper-faithful payload",
+            encver);
         goto fail;
       }
-      vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold = LoadUnsigned_IOError(rdb, goto fail);
+      uint64_t tqRdbMarker = LoadUnsigned_IOError(rdb, goto fail);
+      if (!VecSimTqModelIdentity_FromRdbMarker(tqRdbMarker)) {
+        RedisModule_LogIOError(rdb, REDISMODULE_LOGLEVEL_WARNING,
+                               "ERROR: loading TurboQuant vector index failed: unknown or "
+                               "unsupported model marker %llu",
+                               (unsigned long long)tqRdbMarker);
+        goto fail;
+      }
+      vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold =
+          LoadUnsigned_IOError(rdb, goto fail);
 
-      primaryParams->algoParams.tqHnswParams.type = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.dim = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.metric = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.multi = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.bits = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.projections = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.seed = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.useRotation = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.M = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.efConstruction = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.efRuntime = LoadUnsigned_IOError(rdb, goto fail);
-      primaryParams->algoParams.tqHnswParams.epsilon = LoadDouble_IOError(rdb, goto fail);
+      if (VecSimTq_load_Rdb_parameters(rdb, &primaryParams->algoParams.tqHnswParams) !=
+          REDISMODULE_OK) {
+        goto fail;
+      }
     } else if (primaryParams->algo == VecSimAlgo_SVS) {
       vecsimParams->algoParams.tieredParams.specificParams.tieredSVSParams.trainingTriggerThreshold = LoadUnsigned_IOError(rdb, goto fail);
 

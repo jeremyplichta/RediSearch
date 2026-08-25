@@ -105,6 +105,7 @@ def test_rdb_load_no_deadlock():
 @skip(cluster=True)
 def test_rdb_reload_tq_round_trip():
     env = Env(moduleArgs='DEFAULT_DIALECT 2')
+    env.expect(config_cmd(), 'SET', 'ENABLE_UNSTABLE_FEATURES', 'true').ok()
     conn = env.getConnection()
     index_name = 'idx_tq_rdb'
     doc_ids = ['tq:rdb:doc:1', 'tq:rdb:doc:2', 'tq:rdb:doc:3']

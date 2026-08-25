@@ -219,7 +219,7 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
           }
         } else if (primary_params->algo == VecSimAlgo_TQ_HNSW) {
           // TQ-compressed HNSW is exposed to users as an HNSW index with COMPRESSION TQ<bits>;
-          // the remaining TurboQuant internals (projections, rotation, seed) are not reported.
+          // the immutable model identity is diagnostic-only and is not a backend selector.
           REPLY_KVSTR("algorithm", VECSIM_ALGORITHM_HNSW);
           TQHNSWParams tq_hnsw_params = primary_params->algoParams.tqHnswParams;
           REPLY_KVSTR("data_type", VecSimType_ToString(tq_hnsw_params.type));
@@ -227,7 +227,26 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
           REPLY_KVSTR("distance_metric", VecSimMetric_ToString(tq_hnsw_params.metric));
           REPLY_KVINT("M", tq_hnsw_params.M);
           REPLY_KVINT("ef_construction", tq_hnsw_params.efConstruction);
+          REPLY_KVINT("ef_runtime", tq_hnsw_params.efRuntime);
           REPLY_KVSTR("compression", VecSimTqCompression_ToString(tq_hnsw_params.bits));
+          const VecSimTqModelIdentity *identity =
+              VecSimTqModelIdentity_FromRdbMarker(VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER);
+          RS_LOG_ASSERT(identity, "dense TurboQuant model identity must be registered");
+          REPLY_KVINT("tq_rdb_marker", identity->rdbMarker);
+          REPLY_KVINT("tq_codec_version", identity->codecVersion);
+          REPLY_KVSTR("tq_profile", identity->profileName);
+          REPLY_KVSTR("tq_payload_layout", identity->payloadLayoutName);
+          REPLY_KVSTR("tq_rotation", identity->rotationName);
+          REPLY_KVSTR("tq_qjl", identity->qjlName);
+          REPLY_KVSTR("tq_construction_score", identity->constructionScoreName);
+          REPLY_KVSTR("tq_metric_contract", identity->metricContractName);
+          REPLY_KVINT("tq_projections", tq_hnsw_params.projections);
+          REPLY_KVINT("tq_seed", tq_hnsw_params.seed);
+          size_t payloadSize;
+          RS_LOG_ASSERT(
+              VecSimTq_CalculatePayloadSize(tq_hnsw_params.dim, tq_hnsw_params.bits, &payloadSize),
+              "validated TurboQuant payload size must be representable");
+          REPLY_KVINT("tq_payload_bytes", payloadSize);
         }
       } else if (field_algo == VecSimAlgo_BF) {
         REPLY_KVSTR("algorithm", VecSimAlgorithm_ToString(field_algo));

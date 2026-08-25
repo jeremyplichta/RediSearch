@@ -38,7 +38,8 @@ def testRawAof():
 
 
 def testAofTqRoundTrip():
-    env = Env(useAof=True, moduleArgs='DEFAULT_DIALECT 2')
+    env = Env(useAof=True,
+              moduleArgs='DEFAULT_DIALECT 2 ENABLE_UNSTABLE_FEATURES true')
     conn = getConnectionByEnv(env)
     index_name = 'idx_tq_aof'
     doc_ids = ['tq:aof:doc:1', 'tq:aof:doc:2']
@@ -66,6 +67,27 @@ def testAofTqRoundTrip():
     )
     env.assertEqual(before[1], doc_ids[0])
     env.assertEqual(before[3], doc_ids[1])
+    before_info = to_dict(env.cmd('FT.INFO', index_name))
+    before_attr = to_dict(before_info['attributes'][0])
+    identity_keys = (
+        'tq_rdb_marker', 'tq_codec_version', 'tq_profile', 'tq_payload_layout',
+        'tq_rotation', 'tq_qjl', 'tq_construction_score', 'tq_metric_contract',
+        'tq_projections', 'tq_seed', 'tq_payload_bytes',
+    )
+    before_identity = {key: before_attr[key] for key in identity_keys}
+    env.assertEqual(before_identity, {
+        'tq_rdb_marker': 2,
+        'tq_codec_version': 1,
+        'tq_profile': 'DenseReferenceV1',
+        'tq_payload_layout': 'PaperV1',
+        'tq_rotation': 'DenseHaarV1',
+        'tq_qjl': 'DenseGaussianV1',
+        'tq_construction_score': 'FullDecodeReferenceV1',
+        'tq_metric_contract': 'CosineOrInnerProductV1',
+        'tq_projections': 2,
+        'tq_seed': 7,
+        'tq_payload_bytes': 11,
+    })
 
     env.restartAndReload()
     waitForIndex(env, index_name)
@@ -74,6 +96,7 @@ def testAofTqRoundTrip():
     attr = to_dict(info['attributes'][0])
     env.assertEqual(attr['algorithm'], 'HNSW')
     env.assertEqual(attr['compression'], 'TQ8')
+    env.assertEqual({key: attr[key] for key in identity_keys}, before_identity)
 
     after = env.cmd(
         'FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
@@ -82,8 +105,7 @@ def testAofTqRoundTrip():
         'RETURN', '1', 'dist',
         'DIALECT', '2',
     )
-    env.assertEqual(after[1], doc_ids[0])
-    env.assertEqual(after[3], doc_ids[1])
+    env.assertEqual(after, before)
 
 
 def testRewriteAofSortables():

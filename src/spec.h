@@ -625,6 +625,10 @@ bool IndexSpec_IsCoherent(IndexSpec *sp, sds* prefixes, size_t n_prefixes);
  */
 int VecSimIndex_validate_params(RedisModuleCtx *ctx, VecSimParams *params, QueryError *status);
 
+/** Checked arithmetic for the initial index allocation plus one vector block. */
+bool VecSimIndex_CalculateBlockMemory(size_t initialSize, size_t elementSize, size_t blockSize,
+                                      size_t *totalSize);
+
 //---------------------------------------------------------------------------------------------
 
 typedef enum {

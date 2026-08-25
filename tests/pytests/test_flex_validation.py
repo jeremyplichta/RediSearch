@@ -23,7 +23,7 @@ def with_simulate_in_flex(enabled, module_args='', no_default_module_args=False)
 
 
 @skip(cluster=True)
-@with_simulate_in_flex(True)
+@with_simulate_in_flex(True, module_args='ENABLE_UNSTABLE_FEATURES true')
 def test_tq_compression_rejected_for_disk_indexes(env):
     params = [
         'TYPE', 'FLOAT32',

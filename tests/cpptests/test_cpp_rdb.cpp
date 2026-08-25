@@ -14,14 +14,17 @@
 #include "synonym_map.h"
 #include "trie/trie.h"
 #include <cstdint>  // For SIZE_MAX, UINT32_MAX
+#include <limits>
 
 extern "C" {
 #include "spec.h"
+#include "config.h"
 #include "indexes.h"
 #include "query_error_ffi.h"
 #include "rules.h"
 #include "stopwords.h"
 #include "doc_table.h"
+#include "vector_index.h"
 
 // Forward declarations for RDB functions
 extern int Indexes_RdbLoad(RedisModuleIO *rdb, int encver, int when);
@@ -46,6 +49,333 @@ protected:
 
     RedisModuleCtx *ctx = nullptr;
 };
+
+static void freeTqRdbTestSpec(void *ptr) {
+  rm_free(ptr);
+}
+
+struct TqRdbRawParams {
+  uint64_t type;
+  uint64_t dim;
+  uint64_t metric;
+  uint64_t multi;
+  uint64_t bits;
+  uint64_t projections;
+  uint64_t seed;
+  uint64_t useRotation;
+  uint64_t M;
+  uint64_t efConstruction;
+  uint64_t efRuntime;
+  double epsilon;
+};
+
+static TqRdbRawParams rawTqRdbParams(const TQHNSWParams &params) {
+  TqRdbRawParams raw = {};
+  raw.type = static_cast<uint64_t>(params.type);
+  raw.dim = params.dim;
+  raw.metric = static_cast<uint64_t>(params.metric);
+  raw.multi = params.multi;
+  raw.bits = params.bits;
+  raw.projections = params.projections;
+  raw.seed = params.seed;
+  raw.useRotation = params.useRotation;
+  raw.M = params.M;
+  raw.efConstruction = params.efConstruction;
+  raw.efRuntime = params.efRuntime;
+  raw.epsilon = params.epsilon;
+  return raw;
+}
+
+static int loadTqRdbRawParams(const TqRdbRawParams &rawParams, uint64_t marker,
+                              int encver = INDEX_CURRENT_VERSION, bool truncate = false,
+                              uint64_t rawOuterAlgo = VecSimAlgo_TIERED,
+                              uint64_t rawPrimaryAlgo = VecSimAlgo_TQ_HNSW) {
+  RedisModuleIO *io = RMCK_CreateRdbIO();
+  RMCK_SaveUnsigned(io, rawOuterAlgo);
+  RMCK_SaveUnsigned(io, rawPrimaryAlgo);
+  RMCK_SaveUnsigned(io, marker);
+  RMCK_SaveUnsigned(io, 0);  // tiered swap-job threshold
+  RMCK_SaveUnsigned(io, rawParams.type);
+  RMCK_SaveUnsigned(io, rawParams.dim);
+  RMCK_SaveUnsigned(io, rawParams.metric);
+  RMCK_SaveUnsigned(io, rawParams.multi);
+  RMCK_SaveUnsigned(io, rawParams.bits);
+  RMCK_SaveUnsigned(io, rawParams.projections);
+  RMCK_SaveUnsigned(io, rawParams.seed);
+  RMCK_SaveUnsigned(io, rawParams.useRotation);
+  RMCK_SaveUnsigned(io, rawParams.M);
+  RMCK_SaveUnsigned(io, rawParams.efConstruction);
+  RMCK_SaveUnsigned(io, rawParams.efRuntime);
+  RMCK_SaveDouble(io, rawParams.epsilon);
+  if (truncate) {
+    io->buffer.pop_back();
+  }
+  io->read_pos = 0;
+
+  StrongRef spec = StrongRef_New(rm_malloc(1), freeTqRdbTestSpec);
+  VecSimParams loaded = {};
+  int rv = VecSim_RdbLoad_v4(io, &loaded, spec, "v", encver);
+  VecSimParams_Cleanup(&loaded);
+  StrongRef_Release(spec);
+  RMCK_FreeRdbIO(io);
+  return rv;
+}
+
+static int loadTqRdbParams(const TQHNSWParams &params, uint64_t marker,
+                           int encver = INDEX_CURRENT_VERSION, bool truncate = false) {
+  return loadTqRdbRawParams(rawTqRdbParams(params), marker, encver, truncate);
+}
+
+static TQHNSWParams validTqRdbParams() {
+  TQHNSWParams params = {};
+  params.type = VecSimType_FLOAT32;
+  params.dim = 8;
+  params.metric = VecSimMetric_Cosine;
+  params.multi = false;
+  params.bits = 8;
+  params.projections = params.dim;
+  params.seed = VECSIM_TQ_DENSE_REFERENCE_SEED;
+  params.useRotation = true;
+  params.M = 16;
+  params.efConstruction = 200;
+  params.efRuntime = 10;
+  params.epsilon = 0.01;
+  return params;
+}
+
+TEST(TqPersistenceMetadataTest, DenseReferenceMarkerHasImmutableComponentIdentity) {
+  const VecSimTqModelIdentity *identity =
+      VecSimTqModelIdentity_FromRdbMarker(VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER);
+  ASSERT_NE(identity, nullptr);
+  EXPECT_EQ(identity->rdbMarker, 2);
+  EXPECT_EQ(identity->codecVersion, 1);
+  EXPECT_EQ(identity->payloadLayoutVersion, 1);
+  EXPECT_EQ(identity->modelVersion, 1);
+  EXPECT_EQ(identity->rotationVersion, 1);
+  EXPECT_EQ(identity->qjlVersion, 1);
+  EXPECT_EQ(identity->constructionScoreVersion, 1);
+  EXPECT_EQ(identity->constructionScoreMode, 1);
+  EXPECT_EQ(identity->metricContractVersion, 1);
+  EXPECT_STREQ(identity->profileName, "DenseReferenceV1");
+  EXPECT_STREQ(identity->payloadLayoutName, "PaperV1");
+  EXPECT_STREQ(identity->rotationName, "DenseHaarV1");
+  EXPECT_STREQ(identity->qjlName, "DenseGaussianV1");
+  EXPECT_STREQ(identity->constructionScoreName, "FullDecodeReferenceV1");
+  EXPECT_STREQ(identity->metricContractName, "CosineOrInnerProductV1");
+
+  EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(0), nullptr);
+  EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(1), nullptr);
+  EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(3), nullptr);
+  EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(UINT64_MAX), nullptr);
+}
+
+TEST(TqPersistenceMetadataTest, PayloadSizeUsesTwoFp32MetadataValues) {
+  size_t payloadSize = 0;
+  EXPECT_TRUE(VecSimTq_CalculatePayloadSize(1024, 2, &payloadSize));
+  EXPECT_EQ(payloadSize, 264);
+  EXPECT_TRUE(VecSimTq_CalculatePayloadSize(1024, 4, &payloadSize));
+  EXPECT_EQ(payloadSize, 520);
+  EXPECT_TRUE(VecSimTq_CalculatePayloadSize(1024, 8, &payloadSize));
+  EXPECT_EQ(payloadSize, 1032);
+
+  EXPECT_TRUE(VecSimTq_CalculatePayloadSize(3, 2, &payloadSize));
+  EXPECT_EQ(payloadSize, 10);
+  EXPECT_TRUE(VecSimTq_CalculatePayloadSize(3, 4, &payloadSize));
+  EXPECT_EQ(payloadSize, 11);
+  EXPECT_TRUE(VecSimTq_CalculatePayloadSize(3, 8, &payloadSize));
+  EXPECT_EQ(payloadSize, 12);
+
+  EXPECT_FALSE(VecSimTq_CalculatePayloadSize(1024, 3, &payloadSize));
+  EXPECT_FALSE(VecSimTq_CalculatePayloadSize(SIZE_MAX, 8, &payloadSize));
+  EXPECT_FALSE(VecSimTq_CalculatePayloadSize(1024, 8, nullptr));
+}
+
+TEST(TqPersistenceMetadataTest, DenseReferenceParametersRejectInconsistentMetadata) {
+  TQHNSWParams valid = validTqRdbParams();
+
+  auto expect_validation = [](const TQHNSWParams &params, int expected) {
+    QueryError status = QueryError_Default();
+    EXPECT_EQ(VecSimTq_ValidateParams(&params, &status), expected);
+    EXPECT_EQ(QueryError_HasError(&status), expected == REDISMODULE_ERR);
+    QueryError_ClearError(&status);
+  };
+
+  expect_validation(valid, REDISMODULE_OK);
+
+  TQHNSWParams invalid = valid;
+  invalid.bits = 3;
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.projections = valid.dim - 1;
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.useRotation = false;
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.seed = VECSIM_TQ_DENSE_REFERENCE_SEED + 1;
+  QueryError seedStatus = QueryError_Default();
+  EXPECT_EQ(VecSimTq_ValidateParams(&invalid, &seedStatus), REDISMODULE_ERR);
+  EXPECT_NE(std::string(QueryError_GetUserError(&seedStatus))
+                .find("TQ dense reference profile requires seed 7"),
+            std::string::npos);
+  QueryError_ClearError(&seedStatus);
+  invalid = valid;
+  invalid.metric = static_cast<VecSimMetric>(UINT8_MAX);
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.dim = SIZE_MAX;
+  invalid.projections = SIZE_MAX;
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.M = SIZE_MAX;
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.efConstruction = 0;
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.efRuntime = 0;
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.epsilon = std::numeric_limits<double>::quiet_NaN();
+  expect_validation(invalid, REDISMODULE_ERR);
+  invalid = valid;
+  invalid.epsilon = -0.01;
+  expect_validation(invalid, REDISMODULE_ERR);
+}
+
+TEST(TqPersistenceMetadataTest, RdbLoadRejectsUnknownMarkerAndMutatedDenseFields) {
+  TQHNSWParams valid = validTqRdbParams();
+  // Loading an already-persisted marker-2 index is independent of the unstable creation gate.
+  bool unstableFeatures = RSGlobalConfig.enableUnstableFeatures;
+  RSGlobalConfig.enableUnstableFeatures = false;
+  EXPECT_EQ(loadTqRdbParams(valid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_OK);
+  RSGlobalConfig.enableUnstableFeatures = unstableFeatures;
+  EXPECT_EQ(loadTqRdbParams(valid, 3), REDISMODULE_ERR);
+  EXPECT_EQ(
+      loadTqRdbParams(valid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER, INDEX_TQ_PAPER_VERSION - 1),
+      REDISMODULE_ERR);
+  EXPECT_EQ(
+      loadTqRdbParams(valid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER, INDEX_CURRENT_VERSION, true),
+      REDISMODULE_ERR);
+
+  TQHNSWParams invalid = valid;
+  invalid.bits = 3;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.projections = valid.dim - 1;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.useRotation = false;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.seed = VECSIM_TQ_DENSE_REFERENCE_SEED + 1;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.metric = static_cast<VecSimMetric>(UINT8_MAX);
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.dim = SIZE_MAX;
+  invalid.projections = SIZE_MAX;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.M = SIZE_MAX;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.efConstruction = 0;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.efRuntime = 0;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.epsilon = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+  invalid = valid;
+  invalid.epsilon = -0.01;
+  EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+}
+
+TEST(TqPersistenceMetadataTest, RdbLoadRejectsRawAliasesBeforeNarrowing) {
+  TqRdbRawParams raw = rawTqRdbParams(validTqRdbParams());
+  EXPECT_EQ(loadTqRdbRawParams(raw, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER, INDEX_CURRENT_VERSION,
+                               false, (UINT64_C(1) << 32) | VecSimAlgo_TIERED),
+            REDISMODULE_ERR);
+
+  EXPECT_EQ(loadTqRdbRawParams(raw, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER, INDEX_CURRENT_VERSION,
+                               false, VecSimAlgo_TIERED, (UINT64_C(1) << 32) | VecSimAlgo_TQ_HNSW),
+            REDISMODULE_ERR);
+
+  raw.type |= UINT64_C(1) << 32;
+  EXPECT_EQ(loadTqRdbRawParams(raw, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+
+  raw = rawTqRdbParams(validTqRdbParams());
+  raw.metric |= UINT64_C(1) << 32;
+  EXPECT_EQ(loadTqRdbRawParams(raw, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+
+  raw = rawTqRdbParams(validTqRdbParams());
+  raw.multi = 2;
+  EXPECT_EQ(loadTqRdbRawParams(raw, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+
+  raw = rawTqRdbParams(validTqRdbParams());
+  raw.useRotation = 2;
+  EXPECT_EQ(loadTqRdbRawParams(raw, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+
+  raw = rawTqRdbParams(validTqRdbParams());
+  raw.seed = VECSIM_TQ_DENSE_REFERENCE_SEED + 1;
+  EXPECT_EQ(loadTqRdbRawParams(raw, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+}
+
+TEST_F(RdbMockTest, VecSimValidationRejectsUnsafeEstimatorResults) {
+  auto expectValidationError = [this](VecSimParams *params, const char *message) {
+    QueryError status = QueryError_Default();
+    EXPECT_EQ(VecSimIndex_validate_params(ctx, params, &status), REDISMODULE_ERR);
+    EXPECT_TRUE(QueryError_HasError(&status));
+    EXPECT_NE(std::string(QueryError_GetUserError(&status)).find(message), std::string::npos);
+    QueryError_ClearError(&status);
+  };
+
+  // The public estimator boundary translates the invalid type exception to zero. Its callers must
+  // reject that sentinel rather than accepting a bogus initial-size estimate.
+  VecSimParams flat = {};
+  flat.algo = VecSimAlgo_BF;
+  flat.algoParams.bfParams.type = static_cast<VecSimType>(UINT32_MAX);
+  flat.algoParams.bfParams.dim = 8;
+  flat.algoParams.bfParams.metric = VecSimMetric_L2;
+  EXPECT_EQ(VecSimIndex_EstimateInitialSize(&flat), 0);
+  expectValidationError(&flat, "initial size exceeds");
+
+  VecSimParams hnsw = {};
+  hnsw.algo = VecSimAlgo_HNSWLIB;
+  hnsw.algoParams.hnswParams.type = static_cast<VecSimType>(UINT32_MAX);
+  hnsw.algoParams.hnswParams.dim = 8;
+  hnsw.algoParams.hnswParams.metric = VecSimMetric_L2;
+  hnsw.algoParams.hnswParams.M = 16;
+  EXPECT_EQ(VecSimIndex_EstimateInitialSize(&hnsw), 0);
+  expectValidationError(&hnsw, "initial size exceeds");
+
+#ifdef HAVE_SVS
+  // For uncompressed FLOAT32 SVS storage, vector and graph bytes are multiples of uint32_t.
+  // This hostile degree makes their unchecked VecSim-side sum wrap exactly to the zero sentinel.
+  VecSimParams svs = {};
+  svs.algo = VecSimAlgo_SVS;
+  svs.algoParams.svsParams.type = VecSimType_FLOAT32;
+  svs.algoParams.svsParams.dim = 16;
+  svs.algoParams.svsParams.metric = VecSimMetric_L2;
+  svs.algoParams.svsParams.quantBits = VecSimSvsQuant_NONE;
+  svs.algoParams.svsParams.graph_max_degree =
+      SIZE_MAX / sizeof(uint32_t) - svs.algoParams.svsParams.dim;
+  EXPECT_EQ(VecSimIndex_EstimateElementSize(&svs), 0);
+  expectValidationError(&svs, "element size exceeds");
+#endif
+}
+
+TEST(VecSimValidationTest, BlockEstimateArithmeticIsChecked) {
+  size_t totalSize = 0;
+  EXPECT_TRUE(VecSimIndex_CalculateBlockMemory(100, 20, 3, &totalSize));
+  EXPECT_EQ(totalSize, 160);
+  EXPECT_FALSE(VecSimIndex_CalculateBlockMemory(0, SIZE_MAX, 2, &totalSize));
+  EXPECT_FALSE(VecSimIndex_CalculateBlockMemory(1, SIZE_MAX, 1, &totalSize));
+  EXPECT_FALSE(VecSimIndex_CalculateBlockMemory(0, 1, 1, nullptr));
+}
 
 TEST_F(RdbMockTest, testBasicRdbOperations) {
     // Test basic RDB save/load operations
@@ -928,6 +1258,54 @@ static int findVectorField(const IndexSpec *spec) {
         }
     }
     return -1;
+}
+
+TEST_F(RdbMockTest, testTqFieldRdbRejectsCorruptRawBlobSizeForJsonReindex) {
+  const char *args[] = {
+      "SCHEMA", "v",           "VECTOR", "HNSW",        "10",
+      "TYPE",   "FLOAT32",     "DIM",    "8",           "DISTANCE_METRIC",
+      "COSINE", "COMPRESSION", "TQ8",    "INITIAL_CAP", "12345",
+  };
+  bool unstableFeatures = RSGlobalConfig.enableUnstableFeatures;
+  RSGlobalConfig.enableUnstableFeatures = true;
+  QueryError parseStatus = QueryError_Default();
+  StrongRef originalRef =
+      IndexSpec_ParseC(NULL, "tq_blob_size_idx", args, sizeof(args) / sizeof(*args), &parseStatus);
+  RSGlobalConfig.enableUnstableFeatures = unstableFeatures;
+  ASSERT_FALSE(QueryError_HasError(&parseStatus)) << QueryError_GetUserError(&parseStatus);
+
+  IndexSpec *spec = static_cast<IndexSpec *>(StrongRef_Get(originalRef));
+  ASSERT_NE(spec, nullptr);
+  std::unique_ptr<IndexSpec, std::function<void(IndexSpec *)>> specPtr(
+      spec, [](IndexSpec *s) { StrongRef_Release(s->own_ref); });
+  int vectorField = findVectorField(spec);
+  ASSERT_GE(vectorField, 0);
+  EXPECT_EQ(spec->fields[vectorField].vectorOpts.expBlobSize, 8 * sizeof(float));
+  const VecSimParams *primary =
+      spec->fields[vectorField].vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams;
+  ASSERT_NE(primary, nullptr);
+  EXPECT_EQ(primary->algoParams.tqHnswParams.initialCapacity, 0);
+
+  // Mark the saved rule as JSON. A corrupt persisted bound must fail while loading the field,
+  // before source-document reindex can allocate or write using expBlobSize.
+  spec->rule->type = DocumentType_Json;
+  for (size_t storedBlobSize : {size_t{1}, SIZE_MAX}) {
+    spec->fields[vectorField].vectorOpts.expBlobSize = storedBlobSize;
+    RedisModuleIO *io = RMCK_CreateRdbIO();
+    IndexSpec_RdbSave(io, spec, 0);
+    io->read_pos = 0;
+
+    QueryError loadStatus = QueryError_Default();
+    IndexSpec *loaded = IndexSpec_RdbLoad(io, INDEX_CURRENT_VERSION, false, &loadStatus);
+    EXPECT_EQ(loaded, nullptr);
+    EXPECT_TRUE(QueryError_HasError(&loadStatus));
+    if (loaded) {
+      StrongRef_Release(loaded->own_ref);
+    }
+    QueryError_ClearError(&loadStatus);
+    RMCK_FreeRdbIO(io);
+  }
+  QueryError_ClearError(&parseStatus);
 }
 
 // Round-trip an HNSW field's diskCtx.rerank through IndexSpec_RdbSave +

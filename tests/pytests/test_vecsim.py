@@ -18,6 +18,7 @@ def _tq_hnsw_params(dim=2, metric='COSINE', compression='TQ8'):
     return ['TYPE', 'FLOAT32', 'DIM', dim, 'DISTANCE_METRIC', metric,
             'COMPRESSION', compression]
 
+
 # Helper method for comparing expected vs. results of KNN query, where the only
 # returned field except for the doc id is the vector distance
 def assert_query_results(env: Env, expected_res, actual_res, error_msg=None, data_type='FLOAT32'):
@@ -69,6 +70,7 @@ def execute_hybrid_query(env, query_string, query_data, non_vector_field, sort_b
 
 def test_sanity_cosine():
     env = Env(moduleArgs='DEFAULT_DIALECT 2')
+    enable_unstable_features(env)
     conn = getConnectionByEnv(env)
 
     score_field_syntaxs = ['AS dist]', ']=>{$yield_distance_as:dist}']
@@ -184,6 +186,7 @@ def test_sanity_cosine():
 
 def test_sanity_l2():
     env = Env(moduleArgs='DEFAULT_DIALECT 2')
+    enable_unstable_features(env)
     conn = getConnectionByEnv(env)
 
     for index_type in VECSIM_ALGOS:
@@ -262,6 +265,7 @@ def test_sanity_l2():
 
 def test_sanity_zero_results():
     env = Env(moduleArgs='DEFAULT_DIALECT 2')
+    enable_unstable_features(env)
     conn = getConnectionByEnv(env)
     dim = 4
 
@@ -550,6 +554,7 @@ def test_create_multiple_vector_fields():
 
 def test_create_errors():
     env = Env(moduleArgs='DEFAULT_DIALECT 2')
+    enable_unstable_features(env)
     conn = getConnectionByEnv(env)
     # missing init args
     ## flat algorithm
@@ -1951,6 +1956,7 @@ class TestTimeoutReached(object):
 @skip(no_json=True)
 def test_create_multi_value_json():
     env = Env(moduleArgs='DEFAULT_DIALECT 2')
+    enable_unstable_features(env)
     conn = getConnectionByEnv(env)
     dim = 4
     multi_paths = ['$..vec', '$.vecs[*]', '$.*.vec']

@@ -160,14 +160,19 @@ def testInfoModulesBasic(env):
                                           'geom', 'GEOSHAPE', 'NOINDEX'
                                           ).ok()
 
-  env.expect('FT.CREATE', idx3, 'SCHEMA', 'vec_flat', 'VECTOR', 'FLAT', '6', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'L2',
-                                          'vec_tq_hnsw', 'VECTOR', 'HNSW', '8', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'COSINE',
-                                          'COMPRESSION', 'TQ8',
-                                          'vec_hnsw', 'VECTOR', 'HNSW', '14', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'L2',
-                                          'INITIAL_CAP', '10000', 'M', '40', 'EF_CONSTRUCTION', '250', 'EF_RUNTIME', '20',
-                                          'vec_svs_vamana', 'VECTOR', 'SVS-VAMANA', '6', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'L2',
-                                          'vec_svs_vamana_COMPRESSED', 'VECTOR', 'SVS-VAMANA', '8', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'L2',
-                                          'COMPRESSION', 'LVQ4').ok()
+  enable_unstable_features(env)
+  try:
+    env.expect('FT.CREATE', idx3, 'SCHEMA', 'vec_flat', 'VECTOR', 'FLAT', '6', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'L2',
+                                            'vec_tq_hnsw', 'VECTOR', 'HNSW', '8', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'COSINE',
+                                            'COMPRESSION', 'TQ8',
+                                            'vec_hnsw', 'VECTOR', 'HNSW', '14', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'L2',
+                                            'INITIAL_CAP', '10000', 'M', '40', 'EF_CONSTRUCTION', '250', 'EF_RUNTIME', '20',
+                                            'vec_svs_vamana', 'VECTOR', 'SVS-VAMANA', '6', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'L2',
+                                            'vec_svs_vamana_COMPRESSED', 'VECTOR', 'SVS-VAMANA', '8', 'TYPE', 'FLOAT32', 'DIM', '128', 'DISTANCE_METRIC', 'L2',
+                                            'COMPRESSION', 'LVQ4').ok()
+  finally:
+    verify_command_OK_on_all_shards(
+      env, 'CONFIG', 'SET', 'search-enable-unstable-features', 'no')
 
   info = info_modules_to_dict(conn)
   env.assertEqual(info['search_indexes']['search_number_of_indexes'], '3')

@@ -596,9 +596,27 @@ static int parseVectorField_GetTqCompression(ArgsCursor *ac, size_t *bits) {
 #define ACTUAL_MEMORY_LIMIT ((memoryLimit == 0) ? SIZE_MAX : memoryLimit)
 #define BLOCK_MEMORY_LIMIT ((RSGlobalConfig.vssMaxResize) ? RSGlobalConfig.vssMaxResize : ACTUAL_MEMORY_LIMIT / 10)
 
+bool VecSimIndex_CalculateBlockMemory(size_t initialSize, size_t elementSize, size_t blockSize,
+                                      size_t *totalSize) {
+  if (!totalSize || (blockSize != 0 && elementSize > SIZE_MAX / blockSize)) {
+    return false;
+  }
+  size_t blockMemory = elementSize * blockSize;
+  if (initialSize > SIZE_MAX - blockMemory) {
+    return false;
+  }
+  *totalSize = initialSize + blockMemory;
+  return true;
+}
+
 static int parseVectorField_validate_hnsw(VecSimParams *params, QueryError *status) {
   // BLOCK_SIZE is deprecated and not respected when set by user as of INDEX_VECSIM_SVS_VAMANA_VERSION.
   size_t elementSize = VecSimIndex_EstimateElementSize(params);
+  if (elementSize == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index element size exceeds the supported size");
+    return 0;
+  }
   // Calculating max block size (in # of vectors), according to memory limits
   size_t maxBlockSize = BLOCK_MEMORY_LIMIT / elementSize;
   params->algoParams.hnswParams.blockSize = MIN(DEFAULT_BLOCK_SIZE, maxBlockSize);
@@ -608,7 +626,18 @@ static int parseVectorField_validate_hnsw(VecSimParams *params, QueryError *stat
     return 0;
   }
   size_t index_size_estimation = VecSimIndex_EstimateInitialSize(params);
-  index_size_estimation += elementSize * params->algoParams.hnswParams.blockSize;
+  if (index_size_estimation == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index initial size exceeds the supported size");
+    return 0;
+  }
+  if (!VecSimIndex_CalculateBlockMemory(index_size_estimation, elementSize,
+                                        params->algoParams.hnswParams.blockSize,
+                                        &index_size_estimation)) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index size exceeds the supported size");
+    return 0;
+  }
 
   RedisModule_Log(RSDummyContext, REDISMODULE_LOGLEVEL_NOTICE,
     "Creating vector index of type HNSW. Required memory for a block of %zu vectors: %zuB",
@@ -619,6 +648,11 @@ static int parseVectorField_validate_hnsw(VecSimParams *params, QueryError *stat
 static int parseVectorField_validate_flat(VecSimParams *params, QueryError *status) {
   // BLOCK_SIZE is deprecated and not respected when set by user as of INDEX_VECSIM_SVS_VAMANA_VERSION.
   size_t elementSize = VecSimIndex_EstimateElementSize(params);
+  if (elementSize == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index element size exceeds the supported size");
+    return 0;
+  }
   // Calculating max block size (in # of vectors), according to memory limits
   size_t maxBlockSize = BLOCK_MEMORY_LIMIT / elementSize;
   params->algoParams.bfParams.blockSize = MIN(DEFAULT_BLOCK_SIZE, maxBlockSize);
@@ -629,7 +663,18 @@ static int parseVectorField_validate_flat(VecSimParams *params, QueryError *stat
   }
   // Calculating index size estimation, after first vector block was allocated.
   size_t index_size_estimation = VecSimIndex_EstimateInitialSize(params);
-  index_size_estimation += elementSize * params->algoParams.bfParams.blockSize;
+  if (index_size_estimation == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index initial size exceeds the supported size");
+    return 0;
+  }
+  if (!VecSimIndex_CalculateBlockMemory(index_size_estimation, elementSize,
+                                        params->algoParams.bfParams.blockSize,
+                                        &index_size_estimation)) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index size exceeds the supported size");
+    return 0;
+  }
 
   RedisModule_Log(RSDummyContext, REDISMODULE_LOGLEVEL_NOTICE,
     "Creating vector index of type FLAT. Required memory for a block of %zu vectors: %zuB",
@@ -638,58 +683,79 @@ static int parseVectorField_validate_flat(VecSimParams *params, QueryError *stat
 }
 
 static int parseVectorField_validate_tq_hnsw(VecSimParams *params, QueryError *status) {
-  if (params->algoParams.tqHnswParams.type != VecSimType_FLOAT32) {
-    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
-                        "TQ compression only supports FLOAT32 vectors");
-    return 0;
-  }
-  if (params->algoParams.tqHnswParams.metric == VecSimMetric_L2) {
-    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
-                        "TQ compression with DISTANCE_METRIC L2 is not yet supported; use COSINE or IP");
-    return 0;
-  }
-  if (params->algoParams.tqHnswParams.multi) {
-    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
-                        "TQ compression does not support multi-value vectors");
-    return 0;
-  }
-  if (params->algoParams.tqHnswParams.dim < 2) {
-    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
-                        "TQ compression requires vector dimension >= 2");
+  // INITIAL_CAP is deprecated and is not part of the TQ schema contract. Normalize the parser's
+  // sentinel/user value before validation or estimator calls so it cannot influence allocation.
+  params->algoParams.tqHnswParams.initialCapacity = 0;
+  if (VecSimTq_ValidateParams(&params->algoParams.tqHnswParams, status) != REDISMODULE_OK) {
     return 0;
   }
 
   size_t elementSize = VecSimIndex_EstimateElementSize(params);
+  if (elementSize == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "TQ compression element size exceeds the supported size");
+    return 0;
+  }
   size_t maxBlockSize = BLOCK_MEMORY_LIMIT / elementSize;
   params->algoParams.tqHnswParams.blockSize = MIN(DEFAULT_BLOCK_SIZE, maxBlockSize);
   if (params->algoParams.tqHnswParams.blockSize == 0) {
     QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_LIMIT, "Vector index element size",
-      " %zu exceeded maximum size allowed by server limit which is %zu", elementSize, maxBlockSize);
+                                  " %zu exceeded maximum size allowed by server limit which is %zu",
+                                  elementSize, maxBlockSize);
     return 0;
   }
 
   size_t index_size_estimation = VecSimIndex_EstimateInitialSize(params);
-  index_size_estimation += elementSize * params->algoParams.tqHnswParams.blockSize;
+  if (index_size_estimation == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "TQ compression initial index size exceeds the supported size");
+    return 0;
+  }
+  if (!VecSimIndex_CalculateBlockMemory(index_size_estimation, elementSize,
+                                        params->algoParams.tqHnswParams.blockSize,
+                                        &index_size_estimation)) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "TQ compression index size exceeds the supported size");
+    return 0;
+  }
 
   RedisModule_Log(RSDummyContext, REDISMODULE_LOGLEVEL_NOTICE,
-    "Creating vector index of type HNSW with TQ compression. Required memory for a block of %zu vectors: %zuB",
-    params->algoParams.tqHnswParams.blockSize, index_size_estimation);
+                  "Creating vector index of type HNSW with TQ compression. Required memory for a "
+                  "block of %zu vectors: %zuB",
+                  params->algoParams.tqHnswParams.blockSize, index_size_estimation);
   return 1;
 }
 
 static int parseVectorField_validate_svs(VecSimParams *params, QueryError *status) {
   size_t elementSize = VecSimIndex_EstimateElementSize(params);
+  if (elementSize == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index element size exceeds the supported size");
+    return 0;
+  }
   // Calculating max block size (in # of vectors), according to memory limits
   size_t maxBlockSize = BLOCK_MEMORY_LIMIT / elementSize;
   // Block size should be min(maxBlockSize, DEFAULT_BLOCK_SIZE)
   params->algoParams.svsParams.blockSize = MIN(DEFAULT_BLOCK_SIZE, maxBlockSize);
 
-  // Calculating index size estimation, after first vector block was allocated.
-  size_t index_size_estimation = VecSimIndex_EstimateInitialSize(params);
-  index_size_estimation += elementSize * params->algoParams.svsParams.blockSize;
   if (params->algoParams.svsParams.blockSize == 0) {
     QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_LIMIT, "Vector index element size",
       " %zu exceeded maximum size allowed by server limit which is %zu", elementSize, maxBlockSize);
+    return 0;
+  }
+
+  // Calculating index size estimation, after first vector block was allocated.
+  size_t index_size_estimation = VecSimIndex_EstimateInitialSize(params);
+  if (index_size_estimation == 0) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index initial size exceeds the supported size");
+    return 0;
+  }
+  if (!VecSimIndex_CalculateBlockMemory(index_size_estimation, elementSize,
+                                        params->algoParams.svsParams.blockSize,
+                                        &index_size_estimation)) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector index size exceeds the supported size");
     return 0;
   }
   RedisModule_Log(RSDummyContext, REDISMODULE_LOGLEVEL_NOTICE,
@@ -842,6 +908,13 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
     return 0;
   }
 
+  if (tqBits && !RSGlobalConfig.enableUnstableFeatures) {
+    QueryError_SetError(
+        status, QUERY_ERROR_CODE_INVAL,
+        "TQ compression is unstable; enable ENABLE_UNSTABLE_FEATURES to create TQ indexes");
+    return 0;
+  }
+
   // Disk-mode validation: enforce mandatory parameters
   if (isSpecOnDiskForValidation(sp)) {
     if (tqBits) {
@@ -883,8 +956,15 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
     }
   }
 
-  // Calculating expected blob size of a vector in bytes.
-  fs->vectorOpts.expBlobSize = params->algoParams.hnswParams.dim * VecSimType_sizeof(params->algoParams.hnswParams.type);
+  // Calculating expected blob size of a vector in bytes. Validate this before any TQ model-size
+  // estimation so hostile dimensions cannot wrap to a small accepted raw blob.
+  size_t typeSize = VecSimType_sizeof(params->algoParams.hnswParams.type);
+  if (typeSize == 0 || params->algoParams.hnswParams.dim > SIZE_MAX / typeSize) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
+                        "Vector blob size exceeds the supported size");
+    return 0;
+  }
+  fs->vectorOpts.expBlobSize = params->algoParams.hnswParams.dim * typeSize;
 
   if (tqBits) {
     // COMPRESSION TQ<bits> switches the primary index to the TQ-compressed HNSW variant. The
@@ -905,7 +985,7 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
     tqParams->epsilon = hnswParams.epsilon ? hnswParams.epsilon : HNSW_DEFAULT_EPSILON;
     tqParams->bits = tqBits;
     tqParams->projections = hnswParams.dim;
-    tqParams->seed = 7;
+    tqParams->seed = VECSIM_TQ_DENSE_REFERENCE_SEED;
     tqParams->useRotation = true;
     params->algo = VecSimAlgo_TQ_HNSW;
     return parseVectorField_validate_tq_hnsw(params, status);
@@ -2524,6 +2604,49 @@ static const FieldType fieldTypeMap[] = {[IDXFLD_LEGACY_FULLTEXT] = INDEXFLD_T_F
                                          [IDXFLD_LEGACY_TAG] = INDEXFLD_T_TAG};
                                          // CHECKED: Not related to new data types - legacy code
 
+static int VecSimParams_CalculateRawBlobSize(const VecSimParams *params, size_t *blobSize) {
+  VecSimType type;
+  size_t dim;
+
+  switch (params->algo) {
+    case VecSimAlgo_BF:
+      type = params->algoParams.bfParams.type;
+      dim = params->algoParams.bfParams.dim;
+      break;
+    case VecSimAlgo_HNSWLIB:
+      type = params->algoParams.hnswParams.type;
+      dim = params->algoParams.hnswParams.dim;
+      break;
+    case VecSimAlgo_SVS:
+      type = params->algoParams.svsParams.type;
+      dim = params->algoParams.svsParams.dim;
+      break;
+    case VecSimAlgo_TQ:
+      type = params->algoParams.tqFlatParams.type;
+      dim = params->algoParams.tqFlatParams.dim;
+      break;
+    case VecSimAlgo_TQ_HNSW:
+      type = params->algoParams.tqHnswParams.type;
+      dim = params->algoParams.tqHnswParams.dim;
+      break;
+    case VecSimAlgo_TIERED:
+      if (!params->algoParams.tieredParams.primaryIndexParams) {
+        return REDISMODULE_ERR;
+      }
+      return VecSimParams_CalculateRawBlobSize(params->algoParams.tieredParams.primaryIndexParams,
+                                               blobSize);
+    default:
+      return REDISMODULE_ERR;
+  }
+
+  size_t typeSize = VecSimType_sizeof(type);
+  if (typeSize == 0 || dim > SIZE_MAX / typeSize) {
+    return REDISMODULE_ERR;
+  }
+  *blobSize = dim * typeSize;
+  return REDISMODULE_OK;
+}
+
 static int FieldSpec_RdbLoad(RedisModuleIO *rdb, FieldSpec *f, StrongRef sp_ref, int encver, bool useSst) {
 
   f->ftId = RS_INVALID_FIELD_ID;
@@ -2579,7 +2702,16 @@ static int FieldSpec_RdbLoad(RedisModuleIO *rdb, FieldSpec *f, StrongRef sp_ref,
   // Load vector specific options
   if (encver >= INDEX_VECSIM_VERSION && FIELD_IS(f, INDEXFLD_T_VECTOR)) {
     if (encver >= INDEX_VECSIM_2_VERSION) {
-      f->vectorOpts.expBlobSize = LoadUnsigned_IOError(rdb, goto fail);
+      uint64_t rawBlobSize = LoadUnsigned_IOError(rdb, goto fail);
+#if SIZE_MAX < UINT64_MAX
+      if (rawBlobSize > SIZE_MAX) {
+        RedisModule_LogIOError(
+            rdb, REDISMODULE_LOGLEVEL_WARNING,
+            "ERROR: loading vector field failed: stored blob size exceeds size_t");
+        goto fail;
+      }
+#endif
+      f->vectorOpts.expBlobSize = (size_t)rawBlobSize;
     }
     if (encver >= INDEX_VECSIM_SVS_VAMANA_VERSION) {
       if (VecSim_RdbLoad_v4(rdb, &f->vectorOpts.vecSimParams, sp_ref,
@@ -2614,28 +2746,32 @@ static int FieldSpec_RdbLoad(RedisModuleIO *rdb, FieldSpec *f, StrongRef sp_ref,
         memcpy(f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams, &hnswParams, sizeof(VecSimParams));
       }
     }
-    // Calculate blob size limitation on lower encvers.
+    size_t calculatedBlobSize;
+    if (VecSimParams_CalculateRawBlobSize(&f->vectorOpts.vecSimParams, &calculatedBlobSize) !=
+        REDISMODULE_OK) {
+      RedisModule_LogIOError(
+          rdb, REDISMODULE_LOGLEVEL_WARNING,
+          "ERROR: loading vector field failed: raw vector blob size is not representable");
+      goto fail;
+    }
+    // Calculate blob size on old encvers. Newer streams persist it, so require an exact match
+    // before a JSON reindex can use it as an allocation and write bound.
     if (encver < INDEX_VECSIM_2_VERSION) {
-      switch (f->vectorOpts.vecSimParams.algo) {
-      case VecSimAlgo_HNSWLIB:
-        f->vectorOpts.expBlobSize = f->vectorOpts.vecSimParams.algoParams.hnswParams.dim * VecSimType_sizeof(f->vectorOpts.vecSimParams.algoParams.hnswParams.type);
-        break;
-      case VecSimAlgo_BF:
-        f->vectorOpts.expBlobSize = f->vectorOpts.vecSimParams.algoParams.bfParams.dim * VecSimType_sizeof(f->vectorOpts.vecSimParams.algoParams.bfParams.type);
-        break;
-      case VecSimAlgo_TQ:
-      case VecSimAlgo_TQ_HNSW:
-        goto fail;  // TQ compression is not supported in old encvers
-      case VecSimAlgo_TIERED:
-        if (f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_HNSWLIB) {
-          f->vectorOpts.expBlobSize = f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algoParams.hnswParams.dim * VecSimType_sizeof(f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algoParams.hnswParams.type);
-        } else if (f->vectorOpts.vecSimParams.algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_SVS) {
-          goto fail;  // svs is not supported in old encvers
-        }
-        break;
-      case VecSimAlgo_SVS:
-        goto fail;  // svs is not supported in old encvers
+      const VecSimParams *legacyParams = &f->vectorOpts.vecSimParams;
+      if (legacyParams->algo == VecSimAlgo_TIERED) {
+        legacyParams = legacyParams->algoParams.tieredParams.primaryIndexParams;
       }
+      if (legacyParams->algo != VecSimAlgo_HNSWLIB && legacyParams->algo != VecSimAlgo_BF) {
+        goto fail;
+      }
+      f->vectorOpts.expBlobSize = calculatedBlobSize;
+    } else if (f->vectorOpts.expBlobSize != calculatedBlobSize) {
+      RedisModule_LogIOError(
+          rdb, REDISMODULE_LOGLEVEL_WARNING,
+          "ERROR: loading vector field failed: stored blob size %zu does not match dimension/type "
+          "size %zu",
+          f->vectorOpts.expBlobSize, calculatedBlobSize);
+      goto fail;
     }
     // RERANK byte was added in INDEX_VECTOR_RERANK_VERSION for every
     // TIERED+HNSWLIB field. Older RDBs and non-HNSW fields default to TRUE.

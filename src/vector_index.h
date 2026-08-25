@@ -69,6 +69,13 @@
 #define VECSIM_TQ_2 "TQ2"
 #define VECSIM_TQ_4 "TQ4"
 #define VECSIM_TQ_8 "TQ8"
+
+// Marker 2 is the already-written dense paper-reference profile. It is intentionally not a
+// generic "paper TQ" marker: every component below is part of its persisted identity. A future
+// fast profile must use a different marker rather than changing this mapping.
+#define VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER 2
+#define VECSIM_TQ_DENSE_REFERENCE_SEED 7
+#define VECSIM_TQ_METADATA_BYTES 8
 #define VECSIM_TRAINING_THRESHOLD "TRAINING_THRESHOLD"
 #define VECSIM_REDUCED_DIM "REDUCE"
 #define VECSIM_RERANK "RERANK"
@@ -82,6 +89,24 @@ typedef enum {
   VECSIM_QT_KNN,
   VECSIM_QT_RANGE
 } VectorQueryType;
+
+typedef struct {
+  uint64_t rdbMarker;
+  uint8_t codecVersion;
+  uint8_t payloadLayoutVersion;
+  uint8_t modelVersion;
+  uint8_t rotationVersion;
+  uint8_t qjlVersion;
+  uint8_t constructionScoreVersion;
+  uint8_t constructionScoreMode;
+  uint8_t metricContractVersion;
+  const char *profileName;
+  const char *payloadLayoutName;
+  const char *rotationName;
+  const char *qjlName;
+  const char *constructionScoreName;
+  const char *metricContractName;
+} VecSimTqModelIdentity;
 
 // This struct holds VecSimRawParam array and bool array.
 // the arrays should have the same length, for testing if the param in some index needs to be evaluated.
@@ -172,6 +197,9 @@ const char *VecSimAlgorithm_ToString(VecSimAlgo algo);
 const char *VecSimSearchMode_ToString(VecSearchMode vecsimSearchMode);
 const char *VecSimSvsCompression_ToString(VecSimSvsQuantBits quantBits);
 const char *VecSimTqCompression_ToString(size_t bits);
+const VecSimTqModelIdentity *VecSimTqModelIdentity_FromRdbMarker(uint64_t marker);
+bool VecSimTq_CalculatePayloadSize(size_t dim, size_t bits, size_t *payloadSize);
+int VecSimTq_ValidateParams(const TQHNSWParams *params, QueryError *status);
 const char *VecSimSearchHistory_ToString(VecSimOptionMode option);
 bool VecSim_IsLeanVecCompressionType(VecSimSvsQuantBits quantBits);
 bool isLVQSupported();

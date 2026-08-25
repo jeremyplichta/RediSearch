@@ -119,6 +119,7 @@ def testRDBCompatibility_vecsim():
 @skip(cluster=True)
 def testRDBCompatibility_tq():
     env = Env(moduleArgs='DEFAULT_DIALECT 2 MIN_OPERATION_WORKERS 0')
+    env.expect(config_cmd(), 'SET', 'ENABLE_UNSTABLE_FEATURES', 'true').ok()
     conn = env.getConnection()
     index_name = 'idx_tq_rdb_compat'
     doc_ids = ['tq:rdbcompat:doc:1', 'tq:rdbcompat:doc:2']
