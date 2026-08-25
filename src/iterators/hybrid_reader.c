@@ -280,6 +280,9 @@ static VecSimQueryReply_Code computeDistances_RAM(HybridIterator *hr) {
   }
 
   VecSimTieredIndex_AcquireSharedLocks(hr->index);
+  // TQ-HNSW contexts expand the query once for the entire candidate loop. Indexes that do not
+  // implement a RAM context return NULL and continue through the compatibility path below.
+  VecSimAdhocBfCtx *ctx = VecSimIndex_AdhocBfCtx_New(hr->index, qvector);
   IteratorStatus child_status;
   while ((child_status = hr->child->Read(hr->child)) != ITERATOR_EOF) {
     // Check for timeout.
@@ -288,7 +291,9 @@ static VecSimQueryReply_Code computeDistances_RAM(HybridIterator *hr) {
       break;
     }
     RS_ASSERT(child_status == ITERATOR_OK);
-    double metric = VecSimIndex_GetDistanceFrom_Unsafe(hr->index, hr->child->lastDocId, qvector);
+    double metric =
+        ctx ? VecSimIndex_AdhocBfCtx_GetDistanceFrom(ctx, hr->child->lastDocId)
+            : VecSimIndex_GetDistanceFrom_Unsafe(hr->index, hr->child->lastDocId, qvector);
     // If this id is not in the vector index (since it was deleted), metric will return as NaN.
     if (isnan(metric)) {
       continue;
@@ -299,6 +304,9 @@ static VecSimQueryReply_Code computeDistances_RAM(HybridIterator *hr) {
       IndexResult_SetNumValue(cur_vec_res, metric);
       insertResultToHeap(hr, hr->child->current, &cur_vec_res, &upper_bound);
     }
+  }
+  if (ctx) {
+    VecSimIndex_AdhocBfCtx_Free(ctx);
   }
   VecSimTieredIndex_ReleaseSharedLocks(hr->index);
 

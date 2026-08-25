@@ -1,3 +1,5 @@
+import json
+
 from common import *
 
 
@@ -25,6 +27,42 @@ def _field_stats_by_identifier(info, identifier):
         if field_stats["identifier"] == identifier:
             return field_stats
     raise AssertionError(f"missing field statistics for {identifier}")
+
+
+def _distance_results(response):
+    return {
+        response[i]: float(to_dict(response[i + 1])["dist"])
+        for i in range(1, len(response), 2)
+    }
+
+
+def _assert_tq_hybrid_scores(env, index_name, query):
+    base = [
+        "FT.SEARCH", index_name,
+        "@n:[0 9]=>[KNN 4 @v $blob AS dist HYBRID_POLICY {}]",
+        "PARAMS", "2", "blob", query.tobytes(),
+        "SORTBY", "dist", "RETURN", "1", "dist", "DIALECT", "2",
+    ]
+    adhoc = env.cmd(*(arg.format("ADHOC_BF") if "{}" in str(arg) else arg for arg in base))
+    batches = env.cmd(*(arg.format("BATCHES") if "{}" in str(arg) else arg for arg in base))
+    env.assertEqual(adhoc[0], 4)
+    env.assertEqual(batches[0], 4)
+    adhoc_scores = _distance_results(adhoc)
+    batches_scores = _distance_results(batches)
+    env.assertEqual(set(adhoc_scores), set(batches_scores))
+    for key, score in adhoc_scores.items():
+        env.assertTrue(np.isfinite(score))
+        env.assertAlmostEqual(score, batches_scores[key], delta=1e-5)
+
+
+def _tq_split_tier_vectors(dim):
+    vectors = []
+    for i in range(4):
+        vector = np.zeros(dim, dtype=np.float32)
+        vector[i] = float(i + 1)
+        vector[(i + 5) % dim] = 0.25 * float(i + 1)
+        vectors.append(vector)
+    return vectors
 
 
 @skip(no_json=True)
@@ -202,6 +240,75 @@ def test_tq_inner_product_query():
     env.assertEqual(res[3], "doc:orthogonal")
     env.assertEqual(res[5], "doc:opposite")
     conn.execute_command("FT.DROPINDEX", "idx_tq_ip", "DD")
+
+
+def test_tq_hybrid_adhoc_scores_frontend_and_backend_hash_vectors():
+    env = Env(moduleArgs="DEFAULT_DIALECT 2 WORKERS 1 MIN_OPERATION_WORKERS 0",
+              enableDebugCommand=True)
+    conn = getConnectionByEnv(env)
+    dim = 16
+    vectors = _tq_split_tier_vectors(dim)
+    query = np.zeros(dim, dtype=np.float32)
+    query[0] = 2.75
+    query[1] = -0.5
+
+    for metric in ("COSINE", "IP"):
+        index_name = f"idx_tq_hybrid_hash_{metric.lower()}"
+        params = _tq_hnsw_schema_params(dim=dim, metric=metric, compression="TQ4")
+        conn.flushall()
+        env.expect("FT.CREATE", index_name, "SCHEMA", "v", "VECTOR", "HNSW",
+                   len(params), *params, "n", "NUMERIC").ok()
+
+        for i in range(2):
+            conn.execute_command("HSET", f"doc:{i}", "v", vectors[i].tobytes(), "n", i)
+        env.expect(debug_cmd(), "WORKERS", "DRAIN").ok()
+        env.expect(debug_cmd(), "WORKERS", "PAUSE").ok()
+        try:
+            for i in range(2, 4):
+                conn.execute_command("HSET", f"doc:{i}", "v", vectors[i].tobytes(), "n", i)
+            waitForIndex(env, index_name)
+            info = to_dict(env.cmd(debug_cmd(), "VECSIM_INFO", index_name, "v"))
+            env.assertGreater(to_dict(info["FRONTEND_INDEX"])["INDEX_SIZE"], 0)
+            env.assertGreater(to_dict(info["BACKEND_INDEX"])["INDEX_SIZE"], 0)
+            _assert_tq_hybrid_scores(env, index_name, query)
+        finally:
+            env.expect(debug_cmd(), "WORKERS", "RESUME").ok()
+            env.expect(debug_cmd(), "WORKERS", "DRAIN").ok()
+
+
+@skip(no_json=True)
+def test_tq_hybrid_adhoc_scores_frontend_and_backend_json_vectors():
+    env = Env(moduleArgs="DEFAULT_DIALECT 2 WORKERS 1 MIN_OPERATION_WORKERS 0",
+              enableDebugCommand=True)
+    conn = getConnectionByEnv(env)
+    dim = 16
+    params = _tq_hnsw_schema_params(dim=dim, metric="COSINE", compression="TQ4")
+    conn.flushall()
+    env.expect("FT.CREATE", "idx_tq_hybrid_json", "ON", "JSON", "SCHEMA",
+               "$.v", "AS", "v", "VECTOR", "HNSW", len(params), *params,
+               "$.n", "AS", "n", "NUMERIC").ok()
+    vectors = _tq_split_tier_vectors(dim)
+    query = np.zeros(dim, dtype=np.float32)
+    query[0] = 2.75
+    query[1] = -0.5
+
+    for i in range(2):
+        conn.execute_command("JSON.SET", f"doc:{i}", "$",
+                             json.dumps({"v": vectors[i].tolist(), "n": i}))
+    env.expect(debug_cmd(), "WORKERS", "DRAIN").ok()
+    env.expect(debug_cmd(), "WORKERS", "PAUSE").ok()
+    try:
+        for i in range(2, 4):
+            conn.execute_command("JSON.SET", f"doc:{i}", "$",
+                                 json.dumps({"v": vectors[i].tolist(), "n": i}))
+        waitForIndex(env, "idx_tq_hybrid_json")
+        info = to_dict(env.cmd(debug_cmd(), "VECSIM_INFO", "idx_tq_hybrid_json", "v"))
+        env.assertGreater(to_dict(info["FRONTEND_INDEX"])["INDEX_SIZE"], 0)
+        env.assertGreater(to_dict(info["BACKEND_INDEX"])["INDEX_SIZE"], 0)
+        _assert_tq_hybrid_scores(env, "idx_tq_hybrid_json", query)
+    finally:
+        env.expect(debug_cmd(), "WORKERS", "RESUME").ok()
+        env.expect(debug_cmd(), "WORKERS", "DRAIN").ok()
 
 
 @skip(cluster=True)
