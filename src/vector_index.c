@@ -681,18 +681,31 @@ static int VecSimTq_validate_Rdb_parameters(RedisModuleIO *rdb, const TQHNSWPara
 }
 
 static int VecSimTq_load_Rdb_parameters(RedisModuleIO *rdb, TQHNSWParams *tqParams) {
-  uint64_t rawType = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawDim = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawMetric = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawMulti = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawBits = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawProjections = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawSeed = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawUseRotation = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawM = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawEfConstruction = LoadUnsigned_IOError(rdb, goto fail);
-  uint64_t rawEfRuntime = LoadUnsigned_IOError(rdb, goto fail);
-  double rawEpsilon = LoadDouble_IOError(rdb, goto fail);
+  uint64_t rawType;
+  uint64_t rawDim;
+  uint64_t rawMetric;
+  uint64_t rawMulti;
+  uint64_t rawBits;
+  uint64_t rawProjections;
+  uint64_t rawSeed;
+  uint64_t rawUseRotation;
+  uint64_t rawM;
+  uint64_t rawEfConstruction;
+  uint64_t rawEfRuntime;
+  double rawEpsilon;
+
+  rawType = LoadUnsigned_IOError(rdb, goto fail);
+  rawDim = LoadUnsigned_IOError(rdb, goto fail);
+  rawMetric = LoadUnsigned_IOError(rdb, goto fail);
+  rawMulti = LoadUnsigned_IOError(rdb, goto fail);
+  rawBits = LoadUnsigned_IOError(rdb, goto fail);
+  rawProjections = LoadUnsigned_IOError(rdb, goto fail);
+  rawSeed = LoadUnsigned_IOError(rdb, goto fail);
+  rawUseRotation = LoadUnsigned_IOError(rdb, goto fail);
+  rawM = LoadUnsigned_IOError(rdb, goto fail);
+  rawEfConstruction = LoadUnsigned_IOError(rdb, goto fail);
+  rawEfRuntime = LoadUnsigned_IOError(rdb, goto fail);
+  rawEpsilon = LoadDouble_IOError(rdb, goto fail);
 
   // Validate the serialized domains before narrowing enums, booleans, or size_t. Otherwise values
   // with the same low bits as a supported value could silently select a different configuration.
@@ -792,7 +805,7 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
     vecsimParams->algoParams.bfParams.metric = LoadUnsigned_IOError(rdb, goto fail);
     vecsimParams->algoParams.bfParams.multi = LoadUnsigned_IOError(rdb, goto fail);
     break;
-  case VecSimAlgo_TIERED:
+  case VecSimAlgo_TIERED: {
     VecSim_TieredParams_Init(&vecsimParams->algoParams.tieredParams, sp_ref);
     primaryParams = vecsimParams->algoParams.tieredParams.primaryIndexParams;
     primaryParams->logCtx = vecsimParams->logCtx;
@@ -859,6 +872,7 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
       goto fail; // Unsupported primary algorithm for tiered index
     }
     break;
+  }
   case VecSimAlgo_HNSWLIB:
   case VecSimAlgo_SVS:
   case VecSimAlgo_TQ:
