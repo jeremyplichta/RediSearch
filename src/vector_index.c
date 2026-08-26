@@ -454,6 +454,7 @@ const char *VecSimTqCompression_ToString(size_t bits) {
 
 static const VecSimTqModelIdentity tqDenseReferenceIdentity = {
     .rdbMarker = VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER,
+    .profile = VecSimTqProfile_DenseReferenceV1,
     .codecVersion = 1,
     .payloadLayoutVersion = 1,
     .modelVersion = 1,
@@ -470,10 +471,66 @@ static const VecSimTqModelIdentity tqDenseReferenceIdentity = {
     .metricContractName = "CosineOrInnerProductV1",
 };
 
+static const VecSimTqModelIdentity tqFastStructuredRotationIdentity = {
+    .rdbMarker = VECSIM_TQ_FAST_STRUCTURED_ROTATION_RDB_MARKER,
+    .profile = VecSimTqProfile_FastStructuredRotationV1,
+    .codecVersion = 1,
+    .payloadLayoutVersion = 1,
+    .modelVersion = 2,
+    .rotationVersion = 2,
+    .qjlVersion = 1,
+    .constructionScoreVersion = 1,
+    .constructionScoreMode = 2,
+    .metricContractVersion = 1,
+    .profileName = "FastStructuredRotationV1",
+    .payloadLayoutName = "PaperV1",
+    .rotationName = "FastStructuredRotationV1",
+    .qjlName = "DenseGaussianV1",
+    .constructionScoreName = "CoarseMseV1",
+    .metricContractName = "CosineOrInnerProductV1",
+};
+
+static const VecSimTqModelIdentity tqFastStructuredIdentity = {
+    .rdbMarker = VECSIM_TQ_FAST_STRUCTURED_RDB_MARKER,
+    .profile = VecSimTqProfile_FastStructuredV1,
+    .codecVersion = 1,
+    .payloadLayoutVersion = 1,
+    .modelVersion = 3,
+    .rotationVersion = 2,
+    .qjlVersion = 2,
+    .constructionScoreVersion = 1,
+    .constructionScoreMode = 2,
+    .metricContractVersion = 1,
+    .profileName = "FastStructuredV1",
+    .payloadLayoutName = "PaperV1",
+    .rotationName = "FastStructuredRotationV1",
+    .qjlName = "CirculantGaussianQjlV1",
+    .constructionScoreName = "CoarseMseV1",
+    .metricContractName = "CosineOrInnerProductV1",
+};
+
 const VecSimTqModelIdentity *VecSimTqModelIdentity_FromRdbMarker(uint64_t marker) {
   switch (marker) {
     case VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER:
       return &tqDenseReferenceIdentity;
+    case VECSIM_TQ_FAST_STRUCTURED_ROTATION_RDB_MARKER:
+      return &tqFastStructuredRotationIdentity;
+    case VECSIM_TQ_FAST_STRUCTURED_RDB_MARKER:
+      return &tqFastStructuredIdentity;
+    default:
+      return NULL;
+  }
+}
+
+const VecSimTqModelIdentity *VecSimTqModelIdentity_FromProfile(VecSimTqProfile profile) {
+  switch (profile) {
+    case VecSimTqProfile_Default:
+    case VecSimTqProfile_DenseReferenceV1:
+      return &tqDenseReferenceIdentity;
+    case VecSimTqProfile_FastStructuredRotationV1:
+      return &tqFastStructuredRotationIdentity;
+    case VecSimTqProfile_FastStructuredV1:
+      return &tqFastStructuredIdentity;
     default:
       return NULL;
   }
@@ -500,6 +557,12 @@ bool VecSimTq_CalculatePayloadSize(size_t dim, size_t bits, size_t *payloadSize)
 }
 
 int VecSimTq_ValidateParams(const TQHNSWParams *params, QueryError *status) {
+  const VecSimTqModelIdentity *identity = VecSimTqModelIdentity_FromProfile(params->profile);
+  if (!identity) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                        "TQ compression model profile is unknown or unsupported");
+    return REDISMODULE_ERR;
+  }
   if (params->type != VecSimType_FLOAT32) {
     QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
                         "TQ compression only supports FLOAT32 vectors");
@@ -541,8 +604,12 @@ int VecSimTq_ValidateParams(const TQHNSWParams *params, QueryError *status) {
     return REDISMODULE_ERR;
   }
   if (params->seed != VECSIM_TQ_DENSE_REFERENCE_SEED) {
-    QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
-                        "TQ dense reference profile requires seed 7");
+    if (identity == &tqDenseReferenceIdentity) {
+      QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS,
+                          "TQ dense reference profile requires seed 7");
+    } else {
+      QueryError_SetError(status, QUERY_ERROR_CODE_PARSE_ARGS, "TQ profile requires seed 7");
+    }
     return REDISMODULE_ERR;
   }
   if (params->M == 0 || params->M > SIZE_MAX / (4 * sizeof(idType))) {
@@ -568,10 +635,12 @@ int VecSimTq_ValidateParams(const TQHNSWParams *params, QueryError *status) {
     return REDISMODULE_ERR;
   }
 
-  // Marker 2 rebuilds the dense reference model. Guard its quadratic model-size arithmetic here,
-  // before the C API enters VecSim's checked C++ estimator (which must not throw across C frames).
-  if (params->dim > SIZE_MAX / params->dim ||
-      params->dim * params->dim > SIZE_MAX / (4 * sizeof(float))) {
+  // DenseReferenceV1 and FastStructuredRotationV1 retain at least one dense d-by-d component.
+  // Guard their quadratic model-size arithmetic before entering VecSim's checked C++ estimator
+  // (which must not throw across C frames). FastStructuredV1 has only structured O(d) state.
+  if (params->profile != VecSimTqProfile_FastStructuredV1 &&
+      (params->dim > SIZE_MAX / params->dim ||
+       params->dim * params->dim > SIZE_MAX / (4 * sizeof(float)))) {
     QueryError_SetError(status, QUERY_ERROR_CODE_LIMIT,
                         "TQ compression model size exceeds the supported size");
     return REDISMODULE_ERR;
@@ -614,9 +683,12 @@ void VecSim_RdbSave(RedisModuleIO *rdb, VecSimParams *vecsimParams) {
       RedisModule_SaveUnsigned(rdb, primaryParams->efRuntime);
       RedisModule_SaveDouble(rdb, primaryParams->epsilon);
     } else if (vecsimParams->algoParams.tieredParams.primaryIndexParams->algo == VecSimAlgo_TQ_HNSW) {
-      RedisModule_SaveUnsigned(rdb, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER);
-      RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold);
       TQHNSWParams *primaryParams = &vecsimParams->algoParams.tieredParams.primaryIndexParams->algoParams.tqHnswParams;
+      const VecSimTqModelIdentity *identity =
+          VecSimTqModelIdentity_FromProfile(primaryParams->profile);
+      RS_LOG_ASSERT(identity, "validated TurboQuant profile must have a persistence identity");
+      RedisModule_SaveUnsigned(rdb, identity->rdbMarker);
+      RedisModule_SaveUnsigned(rdb, vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold);
 
       RedisModule_SaveUnsigned(rdb, primaryParams->type);
       RedisModule_SaveUnsigned(rdb, primaryParams->dim);
@@ -680,7 +752,8 @@ static int VecSimTq_validate_Rdb_parameters(RedisModuleIO *rdb, const TQHNSWPara
   return rv;
 }
 
-static int VecSimTq_load_Rdb_parameters(RedisModuleIO *rdb, TQHNSWParams *tqParams) {
+static int VecSimTq_load_Rdb_parameters(RedisModuleIO *rdb, TQHNSWParams *tqParams,
+                                        VecSimTqProfile profile) {
   uint64_t rawType;
   uint64_t rawDim;
   uint64_t rawMetric;
@@ -757,6 +830,7 @@ static int VecSimTq_load_Rdb_parameters(RedisModuleIO *rdb, TQHNSWParams *tqPara
   tqParams->projections = (size_t)rawProjections;
   tqParams->seed = (size_t)rawSeed;
   tqParams->useRotation = (bool)rawUseRotation;
+  tqParams->profile = profile;
   tqParams->M = (size_t)rawM;
   tqParams->efConstruction = (size_t)rawEfConstruction;
   tqParams->efRuntime = (size_t)rawEfRuntime;
@@ -841,7 +915,8 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
         goto fail;
       }
       uint64_t tqRdbMarker = LoadUnsigned_IOError(rdb, goto fail);
-      if (!VecSimTqModelIdentity_FromRdbMarker(tqRdbMarker)) {
+      const VecSimTqModelIdentity *identity = VecSimTqModelIdentity_FromRdbMarker(tqRdbMarker);
+      if (!identity) {
         RedisModule_LogIOError(rdb, REDISMODULE_LOGLEVEL_WARNING,
                                "ERROR: loading TurboQuant vector index failed: unknown or "
                                "unsupported model marker %llu",
@@ -851,7 +926,8 @@ int VecSim_RdbLoad_v4(RedisModuleIO *rdb, VecSimParams *vecsimParams, StrongRef 
       vecsimParams->algoParams.tieredParams.specificParams.tieredHnswParams.swapJobThreshold =
           LoadUnsigned_IOError(rdb, goto fail);
 
-      if (VecSimTq_load_Rdb_parameters(rdb, &primaryParams->algoParams.tqHnswParams) !=
+      if (VecSimTq_load_Rdb_parameters(rdb, &primaryParams->algoParams.tqHnswParams,
+                                      identity->profile) !=
           REDISMODULE_OK) {
         goto fail;
       }

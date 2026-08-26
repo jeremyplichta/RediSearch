@@ -89,7 +89,8 @@ static TqRdbRawParams rawTqRdbParams(const TQHNSWParams &params) {
 static int loadTqRdbRawParams(const TqRdbRawParams &rawParams, uint64_t marker,
                               int encver = INDEX_CURRENT_VERSION, bool truncate = false,
                               uint64_t rawOuterAlgo = VecSimAlgo_TIERED,
-                              uint64_t rawPrimaryAlgo = VecSimAlgo_TQ_HNSW) {
+                              uint64_t rawPrimaryAlgo = VecSimAlgo_TQ_HNSW,
+                              VecSimTqProfile *loadedProfile = nullptr) {
   RedisModuleIO *io = RMCK_CreateRdbIO();
   RMCK_SaveUnsigned(io, rawOuterAlgo);
   RMCK_SaveUnsigned(io, rawPrimaryAlgo);
@@ -115,6 +116,10 @@ static int loadTqRdbRawParams(const TqRdbRawParams &rawParams, uint64_t marker,
   StrongRef spec = StrongRef_New(rm_malloc(1), freeTqRdbTestSpec);
   VecSimParams loaded = {};
   int rv = VecSim_RdbLoad_v4(io, &loaded, spec, "v", encver);
+  if (rv == REDISMODULE_OK && loadedProfile) {
+    *loadedProfile =
+        loaded.algoParams.tieredParams.primaryIndexParams->algoParams.tqHnswParams.profile;
+  }
   VecSimParams_Cleanup(&loaded);
   StrongRef_Release(spec);
   RMCK_FreeRdbIO(io);
@@ -136,6 +141,7 @@ static TQHNSWParams validTqRdbParams() {
   params.projections = params.dim;
   params.seed = VECSIM_TQ_DENSE_REFERENCE_SEED;
   params.useRotation = true;
+  params.profile = VecSimTqProfile_DenseReferenceV1;
   params.M = 16;
   params.efConstruction = 200;
   params.efRuntime = 10;
@@ -148,6 +154,7 @@ TEST(TqPersistenceMetadataTest, DenseReferenceMarkerHasImmutableComponentIdentit
       VecSimTqModelIdentity_FromRdbMarker(VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER);
   ASSERT_NE(identity, nullptr);
   EXPECT_EQ(identity->rdbMarker, 2);
+  EXPECT_EQ(identity->profile, VecSimTqProfile_DenseReferenceV1);
   EXPECT_EQ(identity->codecVersion, 1);
   EXPECT_EQ(identity->payloadLayoutVersion, 1);
   EXPECT_EQ(identity->modelVersion, 1);
@@ -165,8 +172,59 @@ TEST(TqPersistenceMetadataTest, DenseReferenceMarkerHasImmutableComponentIdentit
 
   EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(0), nullptr);
   EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(1), nullptr);
-  EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(3), nullptr);
+  EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(5), nullptr);
   EXPECT_EQ(VecSimTqModelIdentity_FromRdbMarker(UINT64_MAX), nullptr);
+}
+
+TEST(TqPersistenceMetadataTest, FastMarkersHaveImmutableDistinctComponentIdentities) {
+  const VecSimTqModelIdentity *fastRotation =
+      VecSimTqModelIdentity_FromRdbMarker(VECSIM_TQ_FAST_STRUCTURED_ROTATION_RDB_MARKER);
+  ASSERT_NE(fastRotation, nullptr);
+  EXPECT_EQ(fastRotation->rdbMarker, 3);
+  EXPECT_EQ(fastRotation->profile, VecSimTqProfile_FastStructuredRotationV1);
+  EXPECT_EQ(fastRotation->codecVersion, 1);
+  EXPECT_EQ(fastRotation->payloadLayoutVersion, 1);
+  EXPECT_EQ(fastRotation->modelVersion, 2);
+  EXPECT_EQ(fastRotation->rotationVersion, 2);
+  EXPECT_EQ(fastRotation->qjlVersion, 1);
+  EXPECT_EQ(fastRotation->constructionScoreVersion, 1);
+  EXPECT_EQ(fastRotation->constructionScoreMode, 2);
+  EXPECT_EQ(fastRotation->metricContractVersion, 1);
+  EXPECT_STREQ(fastRotation->profileName, "FastStructuredRotationV1");
+  EXPECT_STREQ(fastRotation->payloadLayoutName, "PaperV1");
+  EXPECT_STREQ(fastRotation->rotationName, "FastStructuredRotationV1");
+  EXPECT_STREQ(fastRotation->qjlName, "DenseGaussianV1");
+  EXPECT_STREQ(fastRotation->constructionScoreName, "CoarseMseV1");
+  EXPECT_STREQ(fastRotation->metricContractName, "CosineOrInnerProductV1");
+
+  const VecSimTqModelIdentity *fast =
+      VecSimTqModelIdentity_FromRdbMarker(VECSIM_TQ_FAST_STRUCTURED_RDB_MARKER);
+  ASSERT_NE(fast, nullptr);
+  EXPECT_EQ(fast->rdbMarker, 4);
+  EXPECT_EQ(fast->profile, VecSimTqProfile_FastStructuredV1);
+  EXPECT_EQ(fast->codecVersion, 1);
+  EXPECT_EQ(fast->payloadLayoutVersion, 1);
+  EXPECT_EQ(fast->modelVersion, 3);
+  EXPECT_EQ(fast->rotationVersion, 2);
+  EXPECT_EQ(fast->qjlVersion, 2);
+  EXPECT_EQ(fast->constructionScoreVersion, 1);
+  EXPECT_EQ(fast->constructionScoreMode, 2);
+  EXPECT_EQ(fast->metricContractVersion, 1);
+  EXPECT_STREQ(fast->profileName, "FastStructuredV1");
+  EXPECT_STREQ(fast->payloadLayoutName, "PaperV1");
+  EXPECT_STREQ(fast->rotationName, "FastStructuredRotationV1");
+  EXPECT_STREQ(fast->qjlName, "CirculantGaussianQjlV1");
+  EXPECT_STREQ(fast->constructionScoreName, "CoarseMseV1");
+  EXPECT_STREQ(fast->metricContractName, "CosineOrInnerProductV1");
+
+  EXPECT_EQ(VecSimTqModelIdentity_FromProfile(VecSimTqProfile_Default),
+            VecSimTqModelIdentity_FromRdbMarker(VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER));
+  EXPECT_EQ(VecSimTqModelIdentity_FromProfile(VecSimTqProfile_DenseReferenceV1),
+            VecSimTqModelIdentity_FromRdbMarker(VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER));
+  EXPECT_EQ(VecSimTqModelIdentity_FromProfile(VecSimTqProfile_FastStructuredRotationV1),
+            fastRotation);
+  EXPECT_EQ(VecSimTqModelIdentity_FromProfile(VecSimTqProfile_FastStructuredV1), fast);
+  EXPECT_EQ(VecSimTqModelIdentity_FromProfile(static_cast<VecSimTqProfile>(UINT8_MAX)), nullptr);
 }
 
 TEST(TqPersistenceMetadataTest, PayloadSizeUsesTwoFp32MetadataValues) {
@@ -201,6 +259,14 @@ TEST(TqPersistenceMetadataTest, DenseReferenceParametersRejectInconsistentMetada
   };
 
   expect_validation(valid, REDISMODULE_OK);
+
+  TQHNSWParams defaultProfile = valid;
+  defaultProfile.profile = VecSimTqProfile_Default;
+  expect_validation(defaultProfile, REDISMODULE_OK);
+
+  TQHNSWParams invalidProfile = valid;
+  invalidProfile.profile = static_cast<VecSimTqProfile>(UINT8_MAX);
+  expect_validation(invalidProfile, REDISMODULE_ERR);
 
   TQHNSWParams invalid = valid;
   invalid.bits = 3;
@@ -250,7 +316,7 @@ TEST(TqPersistenceMetadataTest, RdbLoadRejectsUnknownMarkerAndMutatedDenseFields
   RSGlobalConfig.enableUnstableFeatures = false;
   EXPECT_EQ(loadTqRdbParams(valid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_OK);
   RSGlobalConfig.enableUnstableFeatures = unstableFeatures;
-  EXPECT_EQ(loadTqRdbParams(valid, 3), REDISMODULE_ERR);
+  EXPECT_EQ(loadTqRdbParams(valid, 5), REDISMODULE_ERR);
   EXPECT_EQ(
       loadTqRdbParams(valid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER, INDEX_TQ_PAPER_VERSION - 1),
       REDISMODULE_ERR);
@@ -292,6 +358,59 @@ TEST(TqPersistenceMetadataTest, RdbLoadRejectsUnknownMarkerAndMutatedDenseFields
   invalid = valid;
   invalid.epsilon = -0.01;
   EXPECT_EQ(loadTqRdbParams(invalid, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER), REDISMODULE_ERR);
+}
+
+TEST(TqPersistenceMetadataTest, RdbMarkersSelectProfilesWithoutChangingParameterLayout) {
+  const TqRdbRawParams raw = rawTqRdbParams(validTqRdbParams());
+  const struct {
+    uint64_t marker;
+    VecSimTqProfile profile;
+  } cases[] = {
+      {VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER, VecSimTqProfile_DenseReferenceV1},
+      {VECSIM_TQ_FAST_STRUCTURED_ROTATION_RDB_MARKER,
+       VecSimTqProfile_FastStructuredRotationV1},
+      {VECSIM_TQ_FAST_STRUCTURED_RDB_MARKER, VecSimTqProfile_FastStructuredV1},
+  };
+
+  for (const auto &testCase : cases) {
+    VecSimTqProfile loadedProfile = VecSimTqProfile_Default;
+    EXPECT_EQ(loadTqRdbRawParams(raw, testCase.marker, INDEX_CURRENT_VERSION, false,
+                                 VecSimAlgo_TIERED, VecSimAlgo_TQ_HNSW, &loadedProfile),
+              REDISMODULE_OK);
+    EXPECT_EQ(loadedProfile, testCase.profile);
+  }
+}
+
+TEST(TqPersistenceMetadataTest, RdbSaveUsesMarkerForSelectedProfile) {
+  const struct {
+    VecSimTqProfile profile;
+    uint64_t marker;
+  } cases[] = {
+      {VecSimTqProfile_Default, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER},
+      {VecSimTqProfile_DenseReferenceV1, VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER},
+      {VecSimTqProfile_FastStructuredRotationV1,
+       VECSIM_TQ_FAST_STRUCTURED_ROTATION_RDB_MARKER},
+      {VecSimTqProfile_FastStructuredV1, VECSIM_TQ_FAST_STRUCTURED_RDB_MARKER},
+  };
+
+  for (const auto &testCase : cases) {
+    VecSimParams primary = {};
+    primary.algo = VecSimAlgo_TQ_HNSW;
+    primary.algoParams.tqHnswParams = validTqRdbParams();
+    primary.algoParams.tqHnswParams.profile = testCase.profile;
+
+    VecSimParams tiered = {};
+    tiered.algo = VecSimAlgo_TIERED;
+    tiered.algoParams.tieredParams.primaryIndexParams = &primary;
+
+    RedisModuleIO *io = RMCK_CreateRdbIO();
+    VecSim_RdbSave(io, &tiered);
+    io->read_pos = 0;
+    EXPECT_EQ(RMCK_LoadUnsigned(io), VecSimAlgo_TIERED);
+    EXPECT_EQ(RMCK_LoadUnsigned(io), VecSimAlgo_TQ_HNSW);
+    EXPECT_EQ(RMCK_LoadUnsigned(io), testCase.marker);
+    RMCK_FreeRdbIO(io);
+  }
 }
 
 TEST(TqPersistenceMetadataTest, RdbLoadRejectsRawAliasesBeforeNarrowing) {

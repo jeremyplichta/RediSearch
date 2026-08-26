@@ -3,18 +3,21 @@ import json
 from common import *
 
 
-def _tq_schema_params(dim=2, metric="COSINE", compression="TQ8"):
-    return [
+def _tq_schema_params(dim=2, metric="COSINE", compression="TQ8", profile=None):
+    params = [
         "TYPE", "FLOAT32",
         "DIM", dim,
         "DISTANCE_METRIC", metric,
         "COMPRESSION", compression,
     ]
+    if profile is not None:
+        params += ["TQ_PROFILE", profile]
+    return params
 
 
 def _tq_hnsw_schema_params(dim=2, metric="COSINE", compression="TQ8",
-                           m=16, ef_construction=200, ef_runtime=50):
-    return _tq_schema_params(dim, metric, compression) + [
+                           m=16, ef_construction=200, ef_runtime=50, profile=None):
+    return _tq_schema_params(dim, metric, compression, profile) + [
         "M", m,
         "EF_CONSTRUCTION", ef_construction,
         "EF_RUNTIME", ef_runtime,
@@ -41,13 +44,23 @@ def _tq_payload_bytes(dim, bits):
 
 
 def _assert_dense_tq_identity(env, attr, dim, bits):
-    env.assertEqual(attr["tq_rdb_marker"], 2)
+    _assert_tq_identity(env, attr, dim, bits, {
+        "marker": 2,
+        "profile": "DenseReferenceV1",
+        "rotation": "DenseHaarV1",
+        "qjl": "DenseGaussianV1",
+        "construction_score": "FullDecodeReferenceV1",
+    })
+
+
+def _assert_tq_identity(env, attr, dim, bits, expected):
+    env.assertEqual(attr["tq_rdb_marker"], expected["marker"])
     env.assertEqual(attr["tq_codec_version"], 1)
-    env.assertEqual(attr["tq_profile"], "DenseReferenceV1")
+    env.assertEqual(attr["tq_profile"], expected["profile"])
     env.assertEqual(attr["tq_payload_layout"], "PaperV1")
-    env.assertEqual(attr["tq_rotation"], "DenseHaarV1")
-    env.assertEqual(attr["tq_qjl"], "DenseGaussianV1")
-    env.assertEqual(attr["tq_construction_score"], "FullDecodeReferenceV1")
+    env.assertEqual(attr["tq_rotation"], expected["rotation"])
+    env.assertEqual(attr["tq_qjl"], expected["qjl"])
+    env.assertEqual(attr["tq_construction_score"], expected["construction_score"])
     env.assertEqual(attr["tq_metric_contract"], "CosineOrInnerProductV1")
     env.assertEqual(attr["tq_projections"], dim)
     env.assertEqual(attr["tq_seed"], 7)
@@ -522,6 +535,70 @@ def test_tq_rdb_round_trip():
         env.assertEqual(res, before)
 
 
+@skip(cluster=True)
+def test_tq_fast_profile_rdb_round_trip_preserves_identity_and_scores():
+    env = Env(moduleArgs="DEFAULT_DIALECT 2")
+    enable_unstable_features(env)
+    conn = getConnectionByEnv(env)
+    conn.flushall()
+
+    cases = (
+        ("fast_rotation", "FastStructuredRotationV1", {
+            "marker": 3,
+            "profile": "FastStructuredRotationV1",
+            "rotation": "FastStructuredRotationV1",
+            "qjl": "DenseGaussianV1",
+            "construction_score": "CoarseMseV1",
+        }),
+        ("fast_structured", "FastStructuredV1", {
+            "marker": 4,
+            "profile": "FastStructuredV1",
+            "rotation": "FastStructuredRotationV1",
+            "qjl": "CirculantGaussianQjlV1",
+            "construction_score": "CoarseMseV1",
+        }),
+    )
+    query = np.zeros(8, dtype=np.float32)
+    query[0] = 1.0
+    other = np.zeros(8, dtype=np.float32)
+    other[1] = 1.0
+    before = {}
+
+    for suffix, profile, expected in cases:
+        index_name = f"idx_tq_rdb_{suffix}"
+        prefix = f"{index_name}:"
+        params = _tq_hnsw_schema_params(dim=8, profile=profile)
+        env.expect("FT.CREATE", index_name, "PREFIX", 1, prefix, "SCHEMA",
+                   "v", "VECTOR", "HNSW", len(params), *params).ok()
+        conn.execute_command("HSET", f"{prefix}doc:1", "v", query.tobytes())
+        conn.execute_command("HSET", f"{prefix}doc:2", "v", other.tobytes())
+        waitForIndex(env, index_name)
+
+        attr = to_dict(to_dict(env.executeCommand("FT.INFO", index_name))["attributes"][0])
+        _assert_tq_identity(env, attr, dim=8, bits=8, expected=expected)
+        response = env.cmd(
+            "FT.SEARCH", index_name, "*=>[KNN 2 @v $blob AS dist]",
+            "PARAMS", "2", "blob", query.tobytes(),
+            "SORTBY", "dist", "RETURN", "1", "dist", "DIALECT", "2",
+        )
+        env.assertEqual(response[1], f"{prefix}doc:1")
+        before[index_name] = (expected, response)
+
+    # Creation is gated; loading each known immutable marker is not.
+    env.expect(config_cmd(), "SET", "ENABLE_UNSTABLE_FEATURES", "false").ok()
+    for _ in env.reloadingIterator():
+        for index_name, (expected, response) in before.items():
+            waitForIndex(env, index_name)
+            attr = to_dict(to_dict(env.executeCommand("FT.INFO", index_name))["attributes"][0])
+            _assert_tq_identity(env, attr, dim=8, bits=8, expected=expected)
+            after = env.cmd(
+                "FT.SEARCH", index_name, "*=>[KNN 2 @v $blob AS dist]",
+                "PARAMS", "2", "blob", query.tobytes(),
+                "SORTBY", "dist", "RETURN", "1", "dist", "DIALECT", "2",
+            )
+            env.assertEqual(after, response)
+
+
 def test_tq_rejects_non_float32():
     env = Env(moduleArgs="DEFAULT_DIALECT 2")
     enable_unstable_features(env)
@@ -577,12 +654,93 @@ def test_tq_rejects_unknown_compression():
         .error().contains("COMPRESSION")
 
 
-def test_tq_does_not_expose_model_backend_selector():
+def test_tq_profiles_are_selectable_and_report_exact_identity():
+    env = Env(protocol=3, moduleArgs="DEFAULT_DIALECT 2")
+    enable_unstable_features(env)
+    conn = getConnectionByEnv(env)
+    query = np.zeros(8, dtype=np.float32)
+    query[0] = 1.0
+    other = np.zeros(8, dtype=np.float32)
+    other[1] = 1.0
+    cases = (
+        ("omitted", None, {
+            "marker": 2,
+            "profile": "DenseReferenceV1",
+            "rotation": "DenseHaarV1",
+            "qjl": "DenseGaussianV1",
+            "construction_score": "FullDecodeReferenceV1",
+        }),
+        ("dense_explicit", "DenseReferenceV1", {
+            "marker": 2,
+            "profile": "DenseReferenceV1",
+            "rotation": "DenseHaarV1",
+            "qjl": "DenseGaussianV1",
+            "construction_score": "FullDecodeReferenceV1",
+        }),
+        ("fast_rotation_case_insensitive", "fAsTsTrUcTuReDrOtAtIoNv1", {
+            "marker": 3,
+            "profile": "FastStructuredRotationV1",
+            "rotation": "FastStructuredRotationV1",
+            "qjl": "DenseGaussianV1",
+            "construction_score": "CoarseMseV1",
+        }),
+        ("fast_structured", "FastStructuredV1", {
+            "marker": 4,
+            "profile": "FastStructuredV1",
+            "rotation": "FastStructuredRotationV1",
+            "qjl": "CirculantGaussianQjlV1",
+            "construction_score": "CoarseMseV1",
+        }),
+    )
+
+    for suffix, profile, expected in cases:
+        index_name = f"idx_tq_profile_{suffix}"
+        params = _tq_schema_params(dim=8, profile=profile)
+        env.expect("FT.CREATE", index_name, "SCHEMA", "v", "VECTOR", "HNSW",
+                   len(params), *params).ok()
+        info = to_dict(env.executeCommand("FT.INFO", index_name))
+        attr = to_dict(info["attributes"][0])
+        _assert_tq_identity(env, attr, dim=8, bits=8, expected=expected)
+
+        conn.execute_command("HSET", f"{index_name}:doc:1", "v", query.tobytes())
+        conn.execute_command("HSET", f"{index_name}:doc:2", "v", other.tobytes())
+        waitForIndex(env, index_name)
+        result = env.cmd(
+            "FT.SEARCH", index_name, "*=>[KNN 2 @v $blob AS dist]",
+            "PARAMS", "2", "blob", query.tobytes(),
+            "SORTBY", "dist", "RETURN", "1", "dist", "DIALECT", "2",
+        )
+        env.assertEqual(result[0], 2)
+        env.assertEqual(result[1], f"{index_name}:doc:1")
+        conn.execute_command("FT.DROPINDEX", index_name, "DD")
+
+
+def test_tq_rejects_unknown_duplicate_or_irrelevant_profile():
     env = Env(moduleArgs="DEFAULT_DIALECT 2")
     enable_unstable_features(env)
-    params = _tq_schema_params() + ["TQ_PROFILE", "FastStructuredV1"]
-    env.expect("FT.CREATE", "idx_tq_profile", "SCHEMA", "v", "VECTOR", "HNSW",
+
+    params = _tq_schema_params(profile="FastStructuredV2")
+    env.expect("FT.CREATE", "idx_tq_profile_unknown", "SCHEMA", "v", "VECTOR", "HNSW",
                len(params), *params).error().contains("TQ_PROFILE")
+
+    params = _tq_schema_params() + ["TQ_PROFILE"]
+    env.expect("FT.CREATE", "idx_tq_profile_missing", "SCHEMA", "v", "VECTOR", "HNSW",
+               len(params), *params).error().contains("TQ_PROFILE")
+
+    params = _tq_schema_params(profile="DenseReferenceV1") + [
+        "TQ_PROFILE", "FastStructuredV1",
+    ]
+    env.expect("FT.CREATE", "idx_tq_profile_duplicate", "SCHEMA", "v", "VECTOR", "HNSW",
+               len(params), *params).error().contains("Duplicate TQ_PROFILE parameter")
+
+    params = [
+        "TYPE", "FLOAT32",
+        "DIM", 8,
+        "DISTANCE_METRIC", "COSINE",
+        "TQ_PROFILE", "DenseReferenceV1",
+    ]
+    env.expect("FT.CREATE", "idx_tq_profile_irrelevant", "SCHEMA", "v", "VECTOR", "HNSW",
+               len(params), *params).error().contains("TQ_PROFILE requires COMPRESSION")
 
 
 def test_tq_rejects_legacy_algorithm_names():

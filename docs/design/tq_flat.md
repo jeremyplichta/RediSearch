@@ -2,10 +2,10 @@
 
 ## Overview
 
-> **Status (2026-08-24):** the TQ flat backend is internal-only. The dense paper model is
-> retained as a conformance/reference profile while structured production profiles remain gated.
-> New `HNSW ... COMPRESSION TQ8|TQ4|TQ2` schema creation requires the existing
-> `ENABLE_UNSTABLE_FEATURES` flag, which is off by default; marker 2 is not a production default.
+> **Status (2026-08-25):** the TQ flat backend is internal-only. RediSearch exposes immutable
+> model bundles through `HNSW ... COMPRESSION TQ8|TQ4|TQ2 [TQ_PROFILE ...]`; all new TQ schema
+> creation remains behind `ENABLE_UNSTABLE_FEATURES`. Omitting `TQ_PROFILE` preserves dense
+> marker 2, while markers 3 and 4 are explicit fast-profile selections.
 > See [tq_hnsw.md](tq_hnsw.md).
 
 `VecSimAlgo_TQ` is the exhaustive-scan component used by tiered TQ-HNSW. Stored vectors
@@ -89,46 +89,49 @@ for every bit width, odd/tail dimensions, and unaligned candidate storage.
 - seed to `7`;
 - rotation on.
 
+RediSearch also passes an explicit `VecSimTqProfile` selected by the optional `TQ_PROFILE`
+schema token. VecSim keeps value 0 as a dense compatibility default for zero-initialized callers.
+
 Current product constraints are `FLOAT32`, dimension at least 2, COSINE or IP,
 single-value vectors, and no disk-backed index. Odd dimensions are supported.
 
 `DenseReferenceV1` uses a dense Haar rotation and independent dense-Gaussian QJL rows.
-The separately versioned `FastStructuredRotationV1` and `CirculantGaussianQjlV1`
-candidates replace those components without changing payload meaning; circulant QJL rows
-are correlated and have separate statistical/quality gates. Neither candidate is accepted
-as a production profile or persisted default yet.
+`FastStructuredRotationV1` replaces only the rotation; `FastStructuredV1` also replaces QJL with
+`CirculantGaussianQjlV1`. These component swaps do not change payload meaning. Circulant QJL rows
+are correlated and retain separate statistical/quality gates. Dense remains the omitted default;
+the fast profiles must be named explicitly while TQ creation is unstable-gated.
 
-## Tiered Role and HNSW Maintenance
+## Direct Flat Role and HNSW Maintenance
 
-The flat backend is the tiered frontend and uses the same asymmetric query scorer as
-the HNSW backend. The paper does not define a compressed-code-to-compressed-code
-estimator, and this implementation does not invent one. The current dense marker-2
-profile defaults to `FullDecodeReferenceV1`, which decodes both Algorithm 2
-approximations. `CoarseMse` is a separately versioned, allocation-free experiment that
-computes the exact metric on the two Algorithm 1 coarse reconstructions. It is the
-intended Stage-1 construction policy only after its production-dimension graph-quality
-gate passes. Neither mode stores a raw-vector sidecar; see [tq_hnsw.md](tq_hnsw.md).
+The TQ flat backend is an internal direct VecSim/conformance building block; it is not
+the tiered TQ-HNSW staging frontend. Tiered TQ-HNSW uses the ordinary raw FP32
+brute-force frontend, then compresses vectors as background jobs insert them into the
+TQ-HNSW primary. The paper does not define a compressed-code-to-compressed-code
+estimator for that primary, and this implementation does not invent one. Dense marker 2 uses
+`FullDecodeReferenceV1`, which decodes both Algorithm 2 approximations. Fast markers 3 and 4 use
+the separately versioned, allocation-free `CoarseMseV1` metric on the two Algorithm 1 coarse
+reconstructions. Neither mode stores a raw-vector sidecar; see [tq_hnsw.md](tq_hnsw.md).
 
 ## Persistence and Tests
 
 TQ state is persisted only as part of tiered TQ-HNSW. RediSearch encoding version 29
 uses marker `2` for the immutable dense identity: `PaperV1` payload,
 `DenseReferenceV1` model, `DenseHaarV1` rotation, `DenseGaussianV1` QJL,
-`FullDecodeReferenceV1` construction score, and the cosine/IP metric contract. The
+`FullDecodeReferenceV1` construction score, and the cosine/IP metric contract. Marker 3 binds
+fast rotation, dense QJL, and `CoarseMseV1`; marker 4 binds fast rotation,
+`CirculantGaussianQjlV1`, and `CoarseMseV1`. The
 dimension, bits, metric, projections, seed, and required-rotation flag are persisted and
-validated before model estimation. Unknown markers and inconsistent fields fail load.
+validated before profile-aware model estimation. Unknown markers and inconsistent fields fail load.
 Encoding version 28 was the incompatible pairwise-polar prototype and is rejected rather
-than interpreted as the new format. No marker has been assigned to a fast profile.
+than interpreted as the new format. Marker 2's existing parameter bytes are unchanged.
 
-Known marker-2 RDB state remains loadable independently of the unstable-feature creation gate.
-AOF recreates the schema and reindexes source documents, so `ENABLE_UNSTABLE_FEATURES` must be
-enabled during replay. Because the internal seed and dense identity are fixed, the rebuilt model
-configuration is identical; vector bytes are recomputed rather than copied from an old in-memory
-index.
+Known marker-2/3/4 RDB state remains loadable independently of the unstable-feature creation gate.
+RediSearch requires Redis' AOF RDB preamble and disables module command rewriting, so AOF restart
+also restores the profile through its marker rather than reconstructing schema arguments.
 
 VecSim tests derive their reference formulas independently from the paper and cover
 the Lloyd-Max density/codebooks, bit packing, exact byte cost, zero cases, QJL bias,
 residual scaling, IP magnitude, cosine behavior, scalar/SIMD parity, FullDecode and
 CoarseMse HNSW maintenance. RediSearch tests cover parsing, tiering, HASH/JSON
-lifecycle, hybrid paths, GC, score/config-preserving RDB round trips, AOF rebuild, exact
+lifecycle, hybrid paths, GC, score/config-preserving marker-2/3/4 RDB round trips, AOF restart, exact
 payload sizes, and corrupt identity validation.

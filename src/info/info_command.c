@@ -218,8 +218,8 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
             }
           }
         } else if (primary_params->algo == VecSimAlgo_TQ_HNSW) {
-          // TQ-compressed HNSW is exposed to users as an HNSW index with COMPRESSION TQ<bits>;
-          // the immutable model identity is diagnostic-only and is not a backend selector.
+          // TQ-compressed HNSW is exposed to users as HNSW with COMPRESSION TQ<bits>. TQ_PROFILE
+          // selects one immutable, versioned component tuple when the index is created.
           REPLY_KVSTR("algorithm", VECSIM_ALGORITHM_HNSW);
           TQHNSWParams tq_hnsw_params = primary_params->algoParams.tqHnswParams;
           REPLY_KVSTR("data_type", VecSimType_ToString(tq_hnsw_params.type));
@@ -230,8 +230,8 @@ void fillReplyWithIndexInfo(RedisSearchCtx* sctx, RedisModule_Reply *reply, bool
           REPLY_KVINT("ef_runtime", tq_hnsw_params.efRuntime);
           REPLY_KVSTR("compression", VecSimTqCompression_ToString(tq_hnsw_params.bits));
           const VecSimTqModelIdentity *identity =
-              VecSimTqModelIdentity_FromRdbMarker(VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER);
-          RS_LOG_ASSERT(identity, "dense TurboQuant model identity must be registered");
+              VecSimTqModelIdentity_FromProfile(tq_hnsw_params.profile);
+          RS_LOG_ASSERT(identity, "validated TurboQuant profile identity must be registered");
           REPLY_KVINT("tq_rdb_marker", identity->rdbMarker);
           REPLY_KVINT("tq_codec_version", identity->codecVersion);
           REPLY_KVSTR("tq_profile", identity->profileName);

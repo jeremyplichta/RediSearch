@@ -69,11 +69,17 @@
 #define VECSIM_TQ_2 "TQ2"
 #define VECSIM_TQ_4 "TQ4"
 #define VECSIM_TQ_8 "TQ8"
+#define VECSIM_TQ_PROFILE "TQ_PROFILE"
+#define VECSIM_TQ_PROFILE_DENSE_REFERENCE_V1 "DenseReferenceV1"
+#define VECSIM_TQ_PROFILE_FAST_STRUCTURED_ROTATION_V1 "FastStructuredRotationV1"
+#define VECSIM_TQ_PROFILE_FAST_STRUCTURED_V1 "FastStructuredV1"
 
 // Marker 2 is the already-written dense paper-reference profile. It is intentionally not a
-// generic "paper TQ" marker: every component below is part of its persisted identity. A future
-// fast profile must use a different marker rather than changing this mapping.
+// generic "paper TQ" marker: every component below is part of its persisted identity. The fast
+// profiles use distinct markers so marker 2's meaning and serialized bytes never change.
 #define VECSIM_TQ_DENSE_REFERENCE_RDB_MARKER 2
+#define VECSIM_TQ_FAST_STRUCTURED_ROTATION_RDB_MARKER 3
+#define VECSIM_TQ_FAST_STRUCTURED_RDB_MARKER 4
 #define VECSIM_TQ_DENSE_REFERENCE_SEED 7
 #define VECSIM_TQ_METADATA_BYTES 8
 #define VECSIM_TRAINING_THRESHOLD "TRAINING_THRESHOLD"
@@ -92,6 +98,7 @@ typedef enum {
 
 typedef struct {
   uint64_t rdbMarker;
+  VecSimTqProfile profile;
   uint8_t codecVersion;
   uint8_t payloadLayoutVersion;
   uint8_t modelVersion;
@@ -198,6 +205,7 @@ const char *VecSimSearchMode_ToString(VecSearchMode vecsimSearchMode);
 const char *VecSimSvsCompression_ToString(VecSimSvsQuantBits quantBits);
 const char *VecSimTqCompression_ToString(size_t bits);
 const VecSimTqModelIdentity *VecSimTqModelIdentity_FromRdbMarker(uint64_t marker);
+const VecSimTqModelIdentity *VecSimTqModelIdentity_FromProfile(VecSimTqProfile profile);
 bool VecSimTq_CalculatePayloadSize(size_t dim, size_t bits, size_t *payloadSize);
 int VecSimTq_ValidateParams(const TQHNSWParams *params, QueryError *status);
 const char *VecSimSearchHistory_ToString(VecSimOptionMode option);

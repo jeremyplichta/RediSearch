@@ -571,8 +571,7 @@ static int parseVectorField_GetQuantBits(ArgsCursor *ac, VecSimSvsQuantBits *qua
 }
 
 // Parses the COMPRESSION argument of an HNSW vector field. The TQ bit budget is encoded in
-// the compression name (TQ2 / TQ4 / TQ8); the remaining TurboQuant parameters (projections,
-// rotation, seed) are internal and always use their defaults.
+// the compression name (TQ2 / TQ4 / TQ8); projections, rotation, and seed remain internal.
 static int parseVectorField_GetTqCompression(ArgsCursor *ac, size_t *bits) {
   const char *compressionStr;
   size_t len;
@@ -586,6 +585,25 @@ static int parseVectorField_GetTqCompression(ArgsCursor *ac, size_t *bits) {
     *bits = 4;
   } else if (STR_EQCASE(compressionStr, len, VECSIM_TQ_2)) {
     *bits = 2;
+  } else {
+    return AC_ERR_ENOENT;
+  }
+  return AC_OK;
+}
+
+static int parseVectorField_GetTqProfile(ArgsCursor *ac, VecSimTqProfile *profile) {
+  const char *profileStr;
+  size_t len;
+  int rc;
+  if ((rc = AC_GetString(ac, &profileStr, &len, 0)) != AC_OK) {
+    return rc;
+  }
+  if (STR_EQCASE(profileStr, len, VECSIM_TQ_PROFILE_DENSE_REFERENCE_V1)) {
+    *profile = VecSimTqProfile_DenseReferenceV1;
+  } else if (STR_EQCASE(profileStr, len, VECSIM_TQ_PROFILE_FAST_STRUCTURED_ROTATION_V1)) {
+    *profile = VecSimTqProfile_FastStructuredRotationV1;
+  } else if (STR_EQCASE(profileStr, len, VECSIM_TQ_PROFILE_FAST_STRUCTURED_V1)) {
+    *profile = VecSimTqProfile_FastStructuredV1;
   } else {
     return AC_ERR_ENOENT;
   }
@@ -797,6 +815,8 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
   bool rerank_seen = false;
   // TQ compression bit budget; 0 means no compression was requested.
   size_t tqBits = 0;
+  VecSimTqProfile tqProfile = VecSimTqProfile_DenseReferenceV1;
+  bool tqProfileSeen = false;
 
   // Get number of parameters and create a sub-cursor for them
   size_t expNumParam;
@@ -890,6 +910,18 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
         QERR_MKBADARGS_AC(status, VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_HNSW, VECSIM_COMPRESSION), rc);
         return 0;
       }
+    } else if (AC_AdvanceIfMatch(&subAc, VECSIM_TQ_PROFILE)) {
+      if (tqProfileSeen) {
+        QueryError_SetWithoutUserDataFmt(status, QUERY_ERROR_CODE_INVAL,
+                                         "Duplicate " VECSIM_TQ_PROFILE " parameter");
+        return 0;
+      }
+      if ((rc = parseVectorField_GetTqProfile(&subAc, &tqProfile)) != AC_OK) {
+        QERR_MKBADARGS_AC(status,
+                         VECSIM_ALGO_PARAM_MSG(VECSIM_ALGORITHM_HNSW, VECSIM_TQ_PROFILE), rc);
+        return 0;
+      }
+      tqProfileSeen = true;
     } else {
       QueryError_SetWithUserDataFmt(status, QUERY_ERROR_CODE_PARSE_ARGS, "Bad arguments for algorithm", " %s: %s", VECSIM_ALGORITHM_HNSW, AC_GetStringNC(&subAc, NULL));
       return 0;
@@ -905,6 +937,12 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
   }
   if (!mandmetric) {
     VECSIM_ERR_MANDATORY(status, VECSIM_ALGORITHM_HNSW, VECSIM_DISTANCE_METRIC);
+    return 0;
+  }
+
+  if (tqProfileSeen && !tqBits) {
+    QueryError_SetError(status, QUERY_ERROR_CODE_INVAL,
+                        VECSIM_TQ_PROFILE " requires COMPRESSION TQ2, TQ4, or TQ8");
     return 0;
   }
 
@@ -968,8 +1006,7 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
 
   if (tqBits) {
     // COMPRESSION TQ<bits> switches the primary index to the TQ-compressed HNSW variant. The
-    // parsed HNSW params carry over; the remaining TurboQuant parameters (projections, rotation,
-    // seed) are internal and always use their defaults.
+    // parsed HNSW params carry over; projections, rotation, and seed remain fixed internal values.
     HNSWParams hnswParams = params->algoParams.hnswParams;
     TQHNSWParams *tqParams = &params->algoParams.tqHnswParams;
     memset(tqParams, 0, sizeof(*tqParams));
@@ -987,6 +1024,7 @@ static int parseVectorField_hnsw(IndexSpec *sp, FieldSpec *fs, VecSimParams *par
     tqParams->projections = hnswParams.dim;
     tqParams->seed = VECSIM_TQ_DENSE_REFERENCE_SEED;
     tqParams->useRotation = true;
+    tqParams->profile = tqProfile;
     params->algo = VecSimAlgo_TQ_HNSW;
     return parseVectorField_validate_tq_hnsw(params, status);
   }

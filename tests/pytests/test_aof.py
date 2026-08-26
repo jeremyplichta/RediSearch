@@ -41,71 +41,103 @@ def testAofTqRoundTrip():
     env = Env(useAof=True,
               moduleArgs='DEFAULT_DIALECT 2 ENABLE_UNSTABLE_FEATURES true')
     conn = getConnectionByEnv(env)
-    index_name = 'idx_tq_aof'
-    doc_ids = ['tq:aof:doc:1', 'tq:aof:doc:2']
-
     env.cmd('FLUSHALL')
-
-    params = [
-        'TYPE', 'FLOAT32',
-        'DIM', 2,
-        'DISTANCE_METRIC', 'COSINE',
-        'COMPRESSION', 'TQ8',
-    ]
-    env.cmd('FT.CREATE', index_name, 'SCHEMA', 'v', 'VECTOR', 'HNSW', len(params), *params)
-    conn.execute_command('HSET', doc_ids[0], 'v', np.array([1.0, 0.0], dtype=np.float32).tobytes())
-    conn.execute_command('HSET', doc_ids[1], 'v', np.array([0.0, 1.0], dtype=np.float32).tobytes())
-    waitForIndex(env, index_name)
-
-    query = np.array([1.0, 0.0], dtype=np.float32).tobytes()
-    before = env.cmd(
-        'FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
-        'PARAMS', '2', 'blob', query,
-        'SORTBY', 'dist',
-        'RETURN', '1', 'dist',
-        'DIALECT', '2',
+    cases = (
+        ('dense', 'DenseReferenceV1', {
+            'tq_rdb_marker': 2,
+            'tq_codec_version': 1,
+            'tq_profile': 'DenseReferenceV1',
+            'tq_payload_layout': 'PaperV1',
+            'tq_rotation': 'DenseHaarV1',
+            'tq_qjl': 'DenseGaussianV1',
+            'tq_construction_score': 'FullDecodeReferenceV1',
+            'tq_metric_contract': 'CosineOrInnerProductV1',
+            'tq_projections': 2,
+            'tq_seed': 7,
+            'tq_payload_bytes': 11,
+        }),
+        ('fast_rotation', 'FastStructuredRotationV1', {
+            'tq_rdb_marker': 3,
+            'tq_codec_version': 1,
+            'tq_profile': 'FastStructuredRotationV1',
+            'tq_payload_layout': 'PaperV1',
+            'tq_rotation': 'FastStructuredRotationV1',
+            'tq_qjl': 'DenseGaussianV1',
+            'tq_construction_score': 'CoarseMseV1',
+            'tq_metric_contract': 'CosineOrInnerProductV1',
+            'tq_projections': 2,
+            'tq_seed': 7,
+            'tq_payload_bytes': 11,
+        }),
+        ('fast_structured', 'FastStructuredV1', {
+            'tq_rdb_marker': 4,
+            'tq_codec_version': 1,
+            'tq_profile': 'FastStructuredV1',
+            'tq_payload_layout': 'PaperV1',
+            'tq_rotation': 'FastStructuredRotationV1',
+            'tq_qjl': 'CirculantGaussianQjlV1',
+            'tq_construction_score': 'CoarseMseV1',
+            'tq_metric_contract': 'CosineOrInnerProductV1',
+            'tq_projections': 2,
+            'tq_seed': 7,
+            'tq_payload_bytes': 11,
+        }),
     )
-    env.assertEqual(before[1], doc_ids[0])
-    env.assertEqual(before[3], doc_ids[1])
-    before_info = to_dict(env.cmd('FT.INFO', index_name))
-    before_attr = to_dict(before_info['attributes'][0])
+    query = np.array([1.0, 0.0], dtype=np.float32).tobytes()
     identity_keys = (
         'tq_rdb_marker', 'tq_codec_version', 'tq_profile', 'tq_payload_layout',
         'tq_rotation', 'tq_qjl', 'tq_construction_score', 'tq_metric_contract',
         'tq_projections', 'tq_seed', 'tq_payload_bytes',
     )
-    before_identity = {key: before_attr[key] for key in identity_keys}
-    env.assertEqual(before_identity, {
-        'tq_rdb_marker': 2,
-        'tq_codec_version': 1,
-        'tq_profile': 'DenseReferenceV1',
-        'tq_payload_layout': 'PaperV1',
-        'tq_rotation': 'DenseHaarV1',
-        'tq_qjl': 'DenseGaussianV1',
-        'tq_construction_score': 'FullDecodeReferenceV1',
-        'tq_metric_contract': 'CosineOrInnerProductV1',
-        'tq_projections': 2,
-        'tq_seed': 7,
-        'tq_payload_bytes': 11,
-    })
+    before = {}
 
+    for suffix, profile, expected_identity in cases:
+        index_name = f'idx_tq_aof_{suffix}'
+        prefix = f'tq:aof:{suffix}:'
+        doc_ids = [f'{prefix}doc:1', f'{prefix}doc:2']
+        params = [
+            'TYPE', 'FLOAT32',
+            'DIM', 2,
+            'DISTANCE_METRIC', 'COSINE',
+            'COMPRESSION', 'TQ8',
+            'TQ_PROFILE', profile,
+        ]
+        env.cmd('FT.CREATE', index_name, 'PREFIX', 1, prefix,
+                'SCHEMA', 'v', 'VECTOR', 'HNSW', len(params), *params)
+        conn.execute_command('HSET', doc_ids[0], 'v', query)
+        conn.execute_command(
+            'HSET', doc_ids[1], 'v', np.array([0.0, 1.0], dtype=np.float32).tobytes())
+        waitForIndex(env, index_name)
+
+        response = env.cmd(
+            'FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
+            'PARAMS', '2', 'blob', query,
+            'SORTBY', 'dist', 'RETURN', '1', 'dist', 'DIALECT', '2',
+        )
+        env.assertEqual(response[1], doc_ids[0])
+        env.assertEqual(response[3], doc_ids[1])
+        attr = to_dict(to_dict(env.cmd('FT.INFO', index_name))['attributes'][0])
+        identity = {key: attr[key] for key in identity_keys}
+        env.assertEqual(identity, expected_identity)
+        before[index_name] = (identity, response)
+
+    # RediSearch requires Redis' AOF RDB preamble and disables module command rewriting. The
+    # selected profile therefore survives through its immutable RDB marker, not reconstructed
+    # FT.CREATE arguments.
     env.restartAndReload()
-    waitForIndex(env, index_name)
+    for index_name, (before_identity, before_response) in before.items():
+        waitForIndex(env, index_name)
+        attr = to_dict(to_dict(env.cmd('FT.INFO', index_name))['attributes'][0])
+        env.assertEqual(attr['algorithm'], 'HNSW')
+        env.assertEqual(attr['compression'], 'TQ8')
+        env.assertEqual({key: attr[key] for key in identity_keys}, before_identity)
 
-    info = to_dict(env.cmd('FT.INFO', index_name))
-    attr = to_dict(info['attributes'][0])
-    env.assertEqual(attr['algorithm'], 'HNSW')
-    env.assertEqual(attr['compression'], 'TQ8')
-    env.assertEqual({key: attr[key] for key in identity_keys}, before_identity)
-
-    after = env.cmd(
-        'FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
-        'PARAMS', '2', 'blob', query,
-        'SORTBY', 'dist',
-        'RETURN', '1', 'dist',
-        'DIALECT', '2',
-    )
-    env.assertEqual(after, before)
+        after = env.cmd(
+            'FT.SEARCH', index_name, '*=>[KNN 2 @v $blob AS dist]',
+            'PARAMS', '2', 'blob', query,
+            'SORTBY', 'dist', 'RETURN', '1', 'dist', 'DIALECT', '2',
+        )
+        env.assertEqual(after, before_response)
 
 
 def testRewriteAofSortables():
