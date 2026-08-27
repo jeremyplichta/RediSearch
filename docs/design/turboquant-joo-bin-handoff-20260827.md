@@ -15,7 +15,7 @@ The current code is locally committed on dedicated branches and tagged checkpoin
 The smallest useful reading order is:
 
 1. This handoff.
-2. [`HLD-turboquant-vector-quantization.md`](../HLD-turboquant-vector-quantization.md).
+2. [`HLD-TurboQuant-TQ-FLAT-TQ-HNSW.md`](HLD-TurboQuant-TQ-FLAT-TQ-HNSW.md).
 3. [`turboquant-paper-faithful-pivot.md`](../../deps/VectorSimilarity/docs/turboquant-paper-faithful-pivot.md).
 4. The benchmark report and reproduction guide in the benchmark repository:
    `reports/msmarco-local-amd64-emulated-profiles-20260826/{comparison.md,README.md}`.
@@ -59,7 +59,7 @@ Use these exact branches together.
 | Repository | Required branch | Exact handoff revision | Review tag | Role |
 | --- | --- | --- | --- | --- |
 | `jeremyplichta/VectorSimilarity` | `codex/tq-production-20260824` | `17d366571f637b1ed80612efc32bf0df3db627ea` | `codex/tq-production-20260826-swappable-profiles-vecsim` | TQ encoding, scoring, models, HNSW construction metric, persistence, tests, and microbenchmarks |
-| `jeremyplichta/RediSearch` | `codex/tq-production-20260824` | The handoff commit that contains this document; it descends from `645ec77284c408c83caddaf03bb31a6d94c836c2` | `codex/tq-production-20260827-joo-bin-handoff-redisearch` | `FT.CREATE`/`FT.INFO`, RDB integration, hybrid query lifecycle, validation, and integration tests |
+| `jeremyplichta/RediSearch` | `codex/tq-production-20260824` | The handoff commit that contains this document; it descends from `645ec77284c408c83caddaf03bb31a6d94c836c2` | `codex/tq-production-20260827-joo-bin-handoff-redisearch-v2` | `FT.CREATE`/`FT.INFO`, RDB integration, hybrid query lifecycle, validation, and integration tests |
 | `jeremyplichta/redis-turboquant-bench` | `codex/msmarco-compressed-ann-20260825` | `97bb4412e1b469891972d0732ca689c2dbad3a1b` | `codex/msmarco-compressed-ann-20260826-profile-results` | Reproducible MS MARCO loading, evaluation, result capture, and comparison reporting |
 
 The benchmark repository is intentionally independent from the product repositories. It contains committed small-run results and test coverage for the harness, but not the approximately 1 GiB prepared corpus cache.
@@ -426,7 +426,7 @@ Continue the paper-faithful TurboQuant production work for RediSearch.
 
 First read, in order:
 1. docs/design/turboquant-joo-bin-handoff-20260827.md
-2. docs/HLD-turboquant-vector-quantization.md
+2. docs/design/HLD-TurboQuant-TQ-FLAT-TQ-HNSW.md
 3. deps/VectorSimilarity/docs/turboquant-paper-faithful-pivot.md
 4. redis-turboquant-bench/reports/msmarco-local-amd64-emulated-profiles-20260826/comparison.md
 5. the 00-08 specs in the private handoff ZIP, observing its canonical/historical labels
